@@ -1534,7 +1534,7 @@ impl Wallet {
 
         let expected_tx_hex = Self::tx_stripped_hex_from_unsigned(&psbt.unsigned_tx);
         let fascia_json = serde_json::to_string(fascia).map_err(InternalError::from)?;
-        let recipients_digest = Self::recipients_digest(&recipient_map);
+        let recipients_digest = Self::recipients_digest(&recipient_map)?;
 
         // Idempotency / conflict: prove the retry is the same operation by the
         // immutable prepared data (transaction, fascia AND declared recipients),
@@ -1841,10 +1841,12 @@ impl Wallet {
     }
 
     /// Deterministic digest of a declared recipient map (sorted by asset id).
-    fn recipients_digest(recipient_map: &HashMap<String, Vec<Recipient>>) -> String {
+    fn recipients_digest(recipient_map: &HashMap<String, Vec<Recipient>>) -> Result<String, Error> {
         let sorted: BTreeMap<&String, &Vec<Recipient>> = recipient_map.iter().collect();
-        let bytes = serde_json::to_vec(&sorted).unwrap_or_default();
-        <sha256::Hash as bitcoin::hashes::Hash>::hash(&bytes).to_string()
+        // Fail closed: never fall back to a constant digest, which could make two
+        // different recipient declarations look like an idempotent retry.
+        let bytes = serde_json::to_vec(&sorted).map_err(InternalError::from)?;
+        Ok(<sha256::Hash as bitcoin::hashes::Hash>::hash(&bytes).to_string())
     }
 
     /// Finalize a prepared externally constructed RGB send.
