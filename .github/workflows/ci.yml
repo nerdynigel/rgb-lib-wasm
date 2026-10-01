@@ -1,10 +1,9 @@
 name: CI
 
 on:
-  push:
-    branches: [dev, stage, master]
+  workflow_dispatch:
   pull_request:
-    branches: [dev, stage, master]
+    types: [labeled]
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,6 +11,7 @@ env:
 jobs:
   fmt:
     name: Format
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'ci:run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,6 +22,7 @@ jobs:
 
   clippy:
     name: Clippy
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'ci:run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +35,7 @@ jobs:
 
   check:
     name: WASM check
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'ci:run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,6 +47,7 @@ jobs:
 
   doc:
     name: Documentation
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'ci:run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,6 +59,7 @@ jobs:
 
   native-tests:
     name: Native tests
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'ci:run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -65,6 +69,7 @@ jobs:
 
   wasm-tests:
     name: WASM tests (Firefox)
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'ci:run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -81,6 +86,7 @@ jobs:
 
   integration-tests:
     name: Integration tests (Firefox + regtest)
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'ci:run'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
