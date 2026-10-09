@@ -2307,7 +2307,7 @@ impl Wallet {
             .filter(|&c| c.asset_transfer_idx == asset_transfer.idx)
             .cloned();
 
-        let assignments = filtered_coloring
+        let mut assignments = filtered_coloring
             .clone()
             .filter(|c| c.r#type != ColoringType::Input)
             .map(|c| c.assignment)
@@ -2336,6 +2336,34 @@ impl Wallet {
         } else {
             TransferKind::Send
         };
+
+        // Collaborative sends have one recipient-less row. Their non-input
+        // colorings describe wallet-owned change, not the quantity sent.
+        // Derive the net fungible send from durable colorings so snapshots
+        // written by the previous candidate are projected correctly too.
+        if matches!(kind, TransferKind::Send) && transfer.recipient_id.is_none() {
+            let sum = |coloring_type| -> Result<u64, Error> {
+                filtered_coloring
+                    .clone()
+                    .filter(|c| c.r#type == coloring_type)
+                    .try_fold(0u64, |total, c| match c.assignment {
+                        Assignment::Fungible(amount) => {
+                            total.checked_add(amount).ok_or_else(|| Error::Internal {
+                                details: s!("collaborative amount overflow"),
+                            })
+                        }
+                        _ => Err(Error::Internal {
+                            details: s!("collaborative send requires fungible assignments"),
+                        }),
+                    })
+            };
+            let sent = sum(ColoringType::Input)?
+                .checked_sub(sum(ColoringType::Change)?)
+                .ok_or_else(|| Error::Internal {
+                    details: s!("collaborative change exceeds inputs"),
+                })?;
+            assignments = vec![Assignment::Fungible(sent)];
+        }
 
         let txo_ids: Vec<i32> = filtered_coloring.clone().map(|c| c.txo_idx).collect();
         let transfer_txos: Vec<DbTxo> = txos
@@ -3310,6 +3338,10 @@ mod address_reuse_tests {
     /// `THE802_CONTRACT` on `THE802_SOURCE_TXID:0` (the state after the live
     /// issuance in the THE-800 adverse pair).
     fn seed_seller_source(wallet: &Wallet) {
+        seed_seller_source_amount(wallet, 1000);
+    }
+
+    fn seed_seller_source_amount(wallet: &Wallet, amount: u64) {
         use crate::database::memory_db::{
             ActiveValue, DbAssetActMod, DbAssetTransferActMod, DbBatchTransferActMod,
             DbColoringActMod, DbTransferActMod, DbTxoActMod,
@@ -3373,7 +3405,7 @@ mod address_reuse_tests {
                 txo_idx: ActiveValue::Set(src_txo),
                 asset_transfer_idx: ActiveValue::Set(issue_at),
                 r#type: ActiveValue::Set(ColoringType::Receive),
-                assignment: ActiveValue::Set(Assignment::Fungible(1000)),
+                assignment: ActiveValue::Set(Assignment::Fungible(amount)),
                 ..Default::default()
             })
             .unwrap();
@@ -3456,6 +3488,15 @@ mod address_reuse_tests {
             transfers[0].kind
         );
 
+        // THE-803: production list_transfers must report the sent quantity,
+        // while the separate change allocation remains 900.
+        assert_eq!(transfers[0].assignments, vec![Assignment::Fungible(100)]);
+        assert_eq!(transfers[0].change_utxo.as_ref().unwrap().vout, 3);
+        println!(
+            "THE803_TRANSFER_JSON={}",
+            serde_json::to_string(&transfers).unwrap()
+        );
+
         // Idempotent replay: no second batch, no duplicate rows.
         let replay = wallet
             .register_collaborative_outgoing_transfer(
@@ -3475,6 +3516,89 @@ mod address_reuse_tests {
             .filter(|b| b.txid.as_deref() == Some(THE802_COLLAB_TXID))
             .count();
         assert_eq!(collab_batches_after, 1, "replay duplicated the batch row");
+
+        // The real snapshot serialization/restore path used by flush/unlock.
+        // Native tests cannot execute the browser IndexedDB transaction.
+        *wallet.rgb_stock.borrow_mut() = Some(rgbstd::persistence::Stock::in_memory());
+        let snapshot_bytes = serde_json::to_vec(&wallet.snapshot().unwrap()).unwrap();
+        let mut unlocked = make_test_wallet(false);
+        unlocked.wallet_data = wallet.wallet_data.clone();
+        unlocked
+            .restore_from_snapshot(serde_json::from_slice(&snapshot_bytes).unwrap())
+            .unwrap();
+        for _ in 0..3 {
+            let rows = unlocked
+                .list_transfers(
+                    AssetFilter::Id(THE802_CONTRACT.to_string()),
+                    Some(THE802_COLLAB_TXID.to_string()),
+                )
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].idx, transfers[0].idx);
+            assert_eq!(rows[0].batch_transfer_idx, transfers[0].batch_transfer_idx);
+            assert_eq!(rows[0].assignments, vec![Assignment::Fungible(100)]);
+            assert_eq!(rows[0].change_utxo.as_ref().unwrap().vout, 3);
+        }
+        assert!(
+            unlocked
+                .register_collaborative_outgoing_transfer(
+                    THE802_COLLAB_TXID.to_string(),
+                    THE802_CONTRACT.to_string(),
+                    vec![src_outpoint.clone()],
+                    Some((3, 900)),
+                    1,
+                )
+                .unwrap()
+                .is_none()
+        );
+        for (change, confirmations) in [
+            (Some((3, 800)), 1),
+            (Some((4, 900)), 1),
+            (Some((3, 900)), 2),
+        ] {
+            assert!(
+                unlocked
+                    .register_collaborative_outgoing_transfer(
+                        THE802_COLLAB_TXID.to_string(),
+                        THE802_CONTRACT.to_string(),
+                        vec![src_outpoint.clone()],
+                        change,
+                        confirmations,
+                    )
+                    .is_err(),
+                "altered replay must refuse"
+            );
+        }
+        for (asset, inputs) in [
+            (
+                "rgb:unknown-contract-does-not-exist".to_string(),
+                vec![src_outpoint.clone()],
+            ),
+            (
+                THE802_CONTRACT.to_string(),
+                vec![format!("{}:1", THE802_SOURCE_TXID)],
+            ),
+        ] {
+            assert!(
+                unlocked
+                    .register_collaborative_outgoing_transfer(
+                        THE802_COLLAB_TXID.to_string(),
+                        asset,
+                        inputs,
+                        Some((3, 900)),
+                        1,
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            unlocked
+                .database
+                .get_asset_balance(THE802_CONTRACT.to_string(), None, None, None, None, None,)
+                .unwrap()
+                .future,
+            900
+        );
 
         // Fail-closed negatives.
         assert!(
@@ -3514,6 +3638,76 @@ mod address_reuse_tests {
             before.settled as i128 + before.future as i128,
             after.settled as i128 + after.future as i128
         );
+    }
+
+    #[test]
+    fn collaborative_send_projection_checks_exact_fungible_arithmetic() {
+        for (input, change, expected) in [
+            (1000, None, Some(1000)),
+            (u64::MAX, Some(u64::MAX - 100), Some(100)),
+            (1000, Some(1001), None),
+        ] {
+            let wallet = make_test_wallet(false);
+            seed_seller_source_amount(&wallet, input);
+            let registered = wallet.register_collaborative_outgoing_transfer(
+                THE802_COLLAB_TXID.to_string(),
+                THE802_CONTRACT.to_string(),
+                vec![format!("{}:0", THE802_SOURCE_TXID)],
+                change.map(|amount| (3, amount)),
+                1,
+            );
+            if expected.is_none() {
+                assert!(registered.is_err(), "over-change must refuse before writes");
+                assert_eq!(wallet.database.iter_batch_transfers().unwrap().len(), 1);
+                assert_eq!(wallet.database.iter_txos().unwrap().len(), 1);
+                continue;
+            }
+            registered.unwrap();
+            let rows = wallet.list_transfers(
+                AssetFilter::Id(THE802_CONTRACT.to_string()),
+                Some(THE802_COLLAB_TXID.to_string()),
+            );
+            match expected {
+                Some(sent) => assert_eq!(
+                    rows.unwrap()[0].assignments,
+                    vec![Assignment::Fungible(sent)]
+                ),
+                None => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn collaborative_registration_refuses_overflow_without_writes() {
+        let wallet = make_test_wallet(false);
+        seed_seller_source_amount(&wallet, u64::MAX);
+        let original = wallet.database.iter_colorings().unwrap()[0].clone();
+        wallet
+            .database
+            .set_coloring(crate::database::memory_db::DbColoringActMod {
+                txo_idx: crate::database::memory_db::ActiveValue::Set(original.txo_idx),
+                asset_transfer_idx: crate::database::memory_db::ActiveValue::Set(
+                    original.asset_transfer_idx,
+                ),
+                r#type: crate::database::memory_db::ActiveValue::Set(ColoringType::Receive),
+                assignment: crate::database::memory_db::ActiveValue::Set(Assignment::Fungible(1)),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            wallet
+                .register_collaborative_outgoing_transfer(
+                    THE802_COLLAB_TXID.to_string(),
+                    THE802_CONTRACT.to_string(),
+                    vec![format!("{}:0", THE802_SOURCE_TXID)],
+                    Some((3, 900)),
+                    1,
+                )
+                .is_err()
+        );
+        assert_eq!(wallet.database.iter_batch_transfers().unwrap().len(), 1);
+        assert_eq!(wallet.database.iter_txos().unwrap().len(), 1);
+        assert_eq!(wallet.database.iter_transfers().unwrap().len(), 1);
     }
 
     /// (b) persistence: restoring a durable snapshot must not leave the local
