@@ -1175,12 +1175,12 @@ impl Wallet {
         }
 
         // Fail-closed: the contract must be known to this wallet.
-        let db_asset = self
-            .database
-            .get_asset(asset_id.clone())?
-            .ok_or_else(|| Error::Internal {
-                details: format!("unknown asset for outgoing registration: {asset_id}"),
-            })?;
+        let db_asset =
+            self.database
+                .get_asset(asset_id.clone())?
+                .ok_or_else(|| Error::Internal {
+                    details: format!("unknown asset for outgoing registration: {asset_id}"),
+                })?;
         let contract_id = ContractId::from_str(&asset_id).map_err(|e| Error::Internal {
             details: e.to_string(),
         })?;
@@ -1191,11 +1191,12 @@ impl Wallet {
         let db_data = self.database.get_db_data(false)?;
         let mut spent: HashMap<i32, Vec<Assignment>> = HashMap::new();
         for outpoint_str in &spent_outpoints {
-            let (txid_part, vout_part) = outpoint_str.rsplit_once(':').ok_or_else(|| {
-                Error::Internal {
-                    details: format!("spent outpoint must be <txid>:<vout>: {outpoint_str}"),
-                }
-            })?;
+            let (txid_part, vout_part) =
+                outpoint_str
+                    .rsplit_once(':')
+                    .ok_or_else(|| Error::Internal {
+                        details: format!("spent outpoint must be <txid>:<vout>: {outpoint_str}"),
+                    })?;
             let vout = vout_part.parse::<u32>().map_err(|e| Error::Internal {
                 details: format!("invalid spent outpoint vout {outpoint_str}: {e}"),
             })?;
@@ -1203,9 +1204,12 @@ impl Wallet {
                 txid: txid_part.to_string(),
                 vout,
             };
-            let txo = self.database.get_txo(&outpoint)?.ok_or_else(|| Error::Internal {
-                details: format!("unknown spent outpoint {outpoint_str}"),
-            })?;
+            let txo = self
+                .database
+                .get_txo(&outpoint)?
+                .ok_or_else(|| Error::Internal {
+                    details: format!("unknown spent outpoint {outpoint_str}"),
+                })?;
             let mut assignments: Vec<Assignment> = vec![];
             for coloring in db_data.colorings.iter().filter(|c| c.txo_idx == txo.idx) {
                 if let Some(asset_transfer) = db_data
@@ -1285,6 +1289,7 @@ impl Wallet {
             assignments_spent: spent,
             main_transition: TypeOfTransition::Transfer,
         };
+        let asset_id_for_row = asset_id.clone();
         let mut transfer_info_map: BTreeMap<String, InfoAssetTransfer> = BTreeMap::new();
         transfer_info_map.insert(asset_id, transfer_info);
 
@@ -1298,8 +1303,38 @@ impl Wallet {
             min_confirmations,
         )?;
 
-        self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        // Emit the single high-level outgoing transfer row so the durable read
+        // (`list_transfers`) surfaces the collaborative send. The normal send
+        // path emits one row per recipient; this path carries no recipient
+        // metadata, so one outgoing row is registered instead of none.
+        let asset_transfer = self
+            .database
+            .iter_asset_transfers()?
+            .into_iter()
+            .find(|at| {
+                at.batch_transfer_idx == batch_transfer_idx
+                    && at.asset_id.as_deref() == Some(asset_id_for_row.as_str())
+            })
+            .ok_or_else(|| Error::Internal {
+                details: s!("collaborative registration wrote no asset-transfer row"),
+            })?;
+        let db_transfer = DbTransferActMod {
+            asset_transfer_idx: ActiveValue::Set(asset_transfer.idx),
+            requested_assignment: ActiveValue::Set(None),
+            incoming: ActiveValue::Set(false),
+            recipient_id: ActiveValue::Set(None),
+            recipient_type: ActiveValue::Set(None),
+            ..Default::default()
+        };
+        self.database.set_transfer(db_transfer)?;
+
+        // Schedule the IndexedDB auto-backup on wasm. Native builds have no
+        // IndexedDB (`js_sys` is wasm-only); there the caller owns persistence.
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.update_backup_info(false)?;
+            self.trigger_auto_backup();
+        }
 
         info!(
             self.logger,

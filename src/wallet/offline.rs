@@ -1027,9 +1027,7 @@ impl Wallet {
                     details: s!("persisted wallet snapshot is missing RGB stock state"),
                 });
             }
-            wallet
-                .idb_sequence
-                .store(snapshot.sequence, std::sync::atomic::Ordering::SeqCst);
+            // `restore_from_snapshot` adopts the durable sequence itself.
             wallet.restore_from_snapshot(snapshot)?;
         }
         Ok(wallet)
@@ -3069,6 +3067,19 @@ impl Wallet {
         &mut self,
         snapshot: super::idb_store::WalletSnapshot,
     ) -> Result<(), Error> {
+        // Adopt the durable snapshot's monotonic sequence, never lowering the
+        // local counter. `idb_store::save_snapshot` drops any snapshot whose
+        // sequence is not strictly greater than the persisted one, so a fresh
+        // unlock (which starts `idb_sequence` at 0) would otherwise have every
+        // subsequent flush rejected as stale and silently lose the session's
+        // writes.
+        let restored_sequence = snapshot.sequence;
+        let current_sequence = self.idb_sequence.load(std::sync::atomic::Ordering::SeqCst);
+        if restored_sequence > current_sequence {
+            self.idb_sequence
+                .store(restored_sequence, std::sync::atomic::Ordering::SeqCst);
+        }
+
         // Restore the in-memory database
         self.database = Arc::new(snapshot.db);
 
@@ -3276,6 +3287,263 @@ mod address_reuse_tests {
             internal.to_string(),
             internal_after.to_string(),
             "Internal unchanged after External index bump"
+        );
+    }
+
+    // ── THE-802 collaborative outgoing registration (engine-level) ───────────
+    //
+    // Discriminates the three candidate causes from the THE-800 adverse proof
+    // at the frozen revision:
+    //   (a) the registration returning the idempotent `Ok(None)` no-op;
+    //   (b) the snapshot/flush persistence path (durable sequence);
+    //   (c) the high-level transfer read/balance not surfacing the rows.
+
+    const THE802_CONTRACT: &str = "rgb:xMXGw4EA-wicLKqD-8oEHeEJ-doHGW~H-4QJliOj-IO~sD9Q";
+    const THE802_SOURCE_TXID: &str =
+        "e48e5840b8eb84ad470839ab5c4fc55cd8b564ef387570fcb9bfaaa98cdb6860";
+    const THE802_ISSUE_TXID: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    const THE802_COLLAB_TXID: &str =
+        "332e37cc467274da773746dd828c8e805a6a09f978bda56006b13c7ab8c8cd7c";
+
+    /// Seed a seller wallet that holds a single settled 1000-unit allocation of
+    /// `THE802_CONTRACT` on `THE802_SOURCE_TXID:0` (the state after the live
+    /// issuance in the THE-800 adverse pair).
+    fn seed_seller_source(wallet: &Wallet) {
+        use crate::database::memory_db::{
+            ActiveValue, DbAssetActMod, DbAssetTransferActMod, DbBatchTransferActMod,
+            DbColoringActMod, DbTransferActMod, DbTxoActMod,
+        };
+        wallet
+            .database
+            .set_asset(DbAssetActMod {
+                id: ActiveValue::Set(THE802_CONTRACT.to_string()),
+                schema: ActiveValue::Set(AssetSchema::Nia),
+                added_at: ActiveValue::Set(1000),
+                name: ActiveValue::Set("BTCX L1 TEST".to_string()),
+                precision: ActiveValue::Set(0),
+                initial_supply: ActiveValue::Set("1000".to_string()),
+                timestamp: ActiveValue::Set(1000),
+                ..Default::default()
+            })
+            .unwrap();
+        let src_txo = wallet
+            .database
+            .set_txo(DbTxoActMod {
+                txid: ActiveValue::Set(THE802_SOURCE_TXID.to_string()),
+                vout: ActiveValue::Set(0),
+                btc_amount: ActiveValue::Set("20000".to_string()),
+                spent: ActiveValue::Set(false),
+                exists: ActiveValue::Set(true),
+                pending_witness: ActiveValue::Set(false),
+                ..Default::default()
+            })
+            .unwrap();
+        let issue_batch = wallet
+            .database
+            .set_batch_transfer(DbBatchTransferActMod {
+                txid: ActiveValue::Set(Some(THE802_ISSUE_TXID.to_string())),
+                status: ActiveValue::Set(TransferStatus::Settled),
+                expiration: ActiveValue::Set(None),
+                created_at: ActiveValue::Set(1000),
+                min_confirmations: ActiveValue::Set(1),
+                ..Default::default()
+            })
+            .unwrap();
+        let issue_at = wallet
+            .database
+            .set_asset_transfer(DbAssetTransferActMod {
+                user_driven: ActiveValue::Set(false),
+                batch_transfer_idx: ActiveValue::Set(issue_batch),
+                asset_id: ActiveValue::Set(Some(THE802_CONTRACT.to_string())),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .database
+            .set_transfer(DbTransferActMod {
+                asset_transfer_idx: ActiveValue::Set(issue_at),
+                incoming: ActiveValue::Set(true),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .database
+            .set_coloring(DbColoringActMod {
+                txo_idx: ActiveValue::Set(src_txo),
+                asset_transfer_idx: ActiveValue::Set(issue_at),
+                r#type: ActiveValue::Set(ColoringType::Receive),
+                assignment: ActiveValue::Set(Assignment::Fungible(1000)),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    /// (a)+(c): on a clean DB the registration must write rows (not the
+    /// idempotent `Ok(None)`), surface exactly one high-level outgoing transfer
+    /// row, allocate the 900 change, and be idempotent on replay.
+    #[test]
+    fn collaborative_registration_writes_surfaces_and_is_idempotent() {
+        let wallet = make_test_wallet(false);
+        seed_seller_source(&wallet);
+
+        let before = wallet
+            .database
+            .get_asset_balance(THE802_CONTRACT.to_string(), None, None, None, None, None)
+            .unwrap();
+
+        let src_outpoint = format!("{}:0", THE802_SOURCE_TXID);
+        let registered: Option<i32> = wallet
+            .register_collaborative_outgoing_transfer(
+                THE802_COLLAB_TXID.to_string(),
+                THE802_CONTRACT.to_string(),
+                vec![src_outpoint.clone()],
+                Some((3, 900)),
+                1,
+            )
+            .unwrap();
+
+        // (a) NOT the idempotent no-op on a clean DB.
+        assert!(
+            registered.is_some(),
+            "registration on a clean DB returned Ok(None): the idempotent guard fired with no pre-existing batch"
+        );
+
+        // The durable low-level rows exist.
+        let collab_batches = wallet
+            .database
+            .iter_batch_transfers()
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.txid.as_deref() == Some(THE802_COLLAB_TXID))
+            .count();
+        assert_eq!(collab_batches, 1, "exactly one batch transfer row expected");
+        let colorings = wallet.database.iter_colorings().unwrap();
+        assert!(
+            colorings
+                .iter()
+                .any(|c| c.r#type == ColoringType::Input
+                    && c.assignment == Assignment::Fungible(1000)),
+            "consumed input colouring (1000) missing"
+        );
+        assert!(
+            colorings
+                .iter()
+                .any(|c| c.r#type == ColoringType::Change
+                    && c.assignment == Assignment::Fungible(900)),
+            "change colouring (900) missing"
+        );
+
+        // (c) the high-level read must surface the outgoing row.
+        let transfers = wallet
+            .list_transfers(
+                AssetFilter::Id(THE802_CONTRACT.to_string()),
+                Some(THE802_COLLAB_TXID.to_string()),
+            )
+            .unwrap();
+        assert_eq!(
+            transfers.len(),
+            1,
+            "high-level read did not surface the outgoing registration row (kind={:?})",
+            transfers
+                .iter()
+                .map(|t| format!("{:?}", t.kind))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(transfers[0].kind, TransferKind::Send),
+            "surfaced row must be a Send, got {:?}",
+            transfers[0].kind
+        );
+
+        // Idempotent replay: no second batch, no duplicate rows.
+        let replay = wallet
+            .register_collaborative_outgoing_transfer(
+                THE802_COLLAB_TXID.to_string(),
+                THE802_CONTRACT.to_string(),
+                vec![src_outpoint.clone()],
+                Some((3, 900)),
+                1,
+            )
+            .unwrap();
+        assert!(replay.is_none(), "replay must be the idempotent no-op");
+        let collab_batches_after = wallet
+            .database
+            .iter_batch_transfers()
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.txid.as_deref() == Some(THE802_COLLAB_TXID))
+            .count();
+        assert_eq!(collab_batches_after, 1, "replay duplicated the batch row");
+
+        // Fail-closed negatives.
+        assert!(
+            wallet
+                .register_collaborative_outgoing_transfer(
+                    "2222222222222222222222222222222222222222222222222222222222222222".to_string(),
+                    "rgb:unknown-contract-does-not-exist".to_string(),
+                    vec![src_outpoint.clone()],
+                    Some((3, 900)),
+                    1,
+                )
+                .is_err()
+        );
+        assert!(
+            wallet
+                .register_collaborative_outgoing_transfer(
+                    "2222222222222222222222222222222222222222222222222222222222222222".to_string(),
+                    THE802_CONTRACT.to_string(),
+                    vec![
+                        "0000000000000000000000000000000000000000000000000000000000000000:7"
+                            .to_string()
+                    ],
+                    Some((3, 900)),
+                    1,
+                )
+                .is_err()
+        );
+
+        let after = wallet
+            .database
+            .get_asset_balance(THE802_CONTRACT.to_string(), None, None, None, None, None)
+            .unwrap();
+        println!(
+            "THE802_BALANCE before={:?} after={:?} (settled+future before={} after={})",
+            before,
+            after,
+            before.settled as i128 + before.future as i128,
+            after.settled as i128 + after.future as i128
+        );
+    }
+
+    /// (b) persistence: restoring a durable snapshot must not leave the local
+    /// sequence counter behind it, or the next flush is rejected as stale by
+    /// `idb_store::save_snapshot` and the whole session's writes are dropped.
+    #[test]
+    fn restore_from_snapshot_advances_sequence_past_durable() {
+        use crate::wallet::idb_store::WalletSnapshot;
+
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(rgbstd::persistence::Stock::in_memory());
+
+        let snapshot = WalletSnapshot {
+            sequence: 7,
+            db: crate::database::memory_db::InMemoryDb::new(),
+            bdk_changeset: None,
+            transfer_artifacts: Default::default(),
+            received_consignments: Default::default(),
+            stock_stash_b64: None,
+            stock_state_b64: None,
+            stock_index_b64: None,
+            reuse_address_index: Default::default(),
+        };
+        wallet.restore_from_snapshot(snapshot).unwrap();
+
+        let next = wallet.snapshot().unwrap().sequence;
+        assert!(
+            next > 7,
+            "restored durable sequence 7 but next snapshot sequence is {next}; \
+             save_snapshot would reject it as stale and drop the write"
         );
     }
 }

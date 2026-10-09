@@ -515,8 +515,18 @@ pub(crate) fn setup_logger<P: AsRef<Path>>(
 }
 
 pub(crate) fn now() -> OffsetDateTime {
-    let ms = js_sys::Date::now();
-    let secs = (ms / 1000.0).floor() as i64;
+    #[cfg(target_arch = "wasm32")]
+    let secs = {
+        let ms = js_sys::Date::now();
+        (ms / 1000.0).floor() as i64
+    };
+    // Native builds (the `cargo test --lib` job) have no `js_sys`; use the host
+    // clock so engine-level native tests can exercise the DB mutation paths.
+    #[cfg(not(target_arch = "wasm32"))]
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     OffsetDateTime::from_unix_timestamp(secs).unwrap_or(OffsetDateTime::UNIX_EPOCH)
 }
 
