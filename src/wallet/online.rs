@@ -1132,6 +1132,139 @@ impl Wallet {
         Ok(batch_transfer_idx)
     }
 
+    /// THE-756/THE-792 additive seam: register the high-level outgoing-transfer
+    /// rows for an **already-coloured collaborative transfer** whose transaction
+    /// this wallet did not build or broadcast (the BTCX collaborative-swap path).
+    /// `color_psbt_and_consume` colours and consumes the fascia but persists no
+    /// high-level rows, so the seller's consumed input / RGB change never
+    /// reconcile; this method closes that gap by reusing `_save_transfers`.
+    ///
+    /// - **Idempotent by txid**: if a batch transfer for `txid` already exists it
+    ///   is a no-op returning `Ok(None)`, so repeated calls never duplicate rows.
+    /// - **Fail-closed**: refuses unknown assets and change amounts without an
+    ///   output, writing nothing.
+    ///
+    /// `spent` maps each consumed RGB txo idx to the fungible assignments
+    /// consumed; `change` is the seller's RGB change output `(vout, fungible)`
+    /// in the collaborative transaction (created if not yet known).
+    pub fn register_collaborative_outgoing_transfer(
+        &self,
+        txid: String,
+        asset_id: String,
+        spent: HashMap<i32, Vec<Assignment>>,
+        change: Option<(u32, u64)>,
+        min_confirmations: u8,
+    ) -> Result<Option<i32>, Error> {
+        let change_amount = change.map(|(_, amount)| amount).unwrap_or(0);
+        if spent.is_empty() && change_amount == 0 {
+            return Err(Error::Internal {
+                details: s!("nothing to register: no spent assignments and no change"),
+            });
+        }
+
+        // Idempotent: rows already exist for this txid -> no-op.
+        if self
+            .database
+            .iter_batch_transfers()?
+            .iter()
+            .any(|batch| batch.txid.as_deref() == Some(txid.as_str()))
+        {
+            return Ok(None);
+        }
+
+        // Fail-closed: the contract must be known to this wallet.
+        let db_asset = self
+            .database
+            .get_asset(asset_id.clone())?
+            .ok_or_else(|| Error::Internal {
+                details: format!("unknown asset for outgoing registration: {asset_id}"),
+            })?;
+        let contract_id = ContractId::from_str(&asset_id).map_err(|e| Error::Internal {
+            details: e.to_string(),
+        })?;
+
+        let change_utxo_idx = if let Some((vout, _amount)) = change {
+            Some(
+                match self.database.get_txo(&Outpoint {
+                    txid: txid.clone(),
+                    vout,
+                })? {
+                    Some(txo) => txo.idx,
+                    None => {
+                        let db_utxo = DbTxoActMod {
+                            txid: ActiveValue::Set(txid.clone()),
+                            vout: ActiveValue::Set(vout),
+                            btc_amount: ActiveValue::Set(s!("0")),
+                            spent: ActiveValue::Set(false),
+                            exists: ActiveValue::Set(false),
+                            pending_witness: ActiveValue::Set(false),
+                            ..Default::default()
+                        };
+                        self.database.set_txo(db_utxo)?
+                    }
+                },
+            )
+        } else {
+            None
+        };
+        if change_amount > 0 && change_utxo_idx.is_none() {
+            return Err(Error::Internal {
+                details: s!("change amount set without a change output"),
+            });
+        }
+
+        let mut assignments_collected = AssignmentsCollection::default();
+        for assignments in spent.values() {
+            for assignment in assignments {
+                if let Assignment::Fungible(amount) = assignment {
+                    assignments_collected.add_fungible(*amount);
+                }
+            }
+        }
+        let asset_spend = AssetSpend {
+            txo_map: HashMap::new(),
+            assignments_collected,
+            input_btc_amt: 0,
+        };
+        let mut change_collection = AssignmentsCollection::default();
+        change_collection.fungible = change_amount;
+
+        let transfer_info = InfoAssetTransfer {
+            asset_info: AssetInfo {
+                contract_id,
+                reject_list_url: db_asset.reject_list_url,
+            },
+            recipients: vec![],
+            asset_spend,
+            change: change_collection,
+            original_assignments_needed: AssignmentsCollection::default(),
+            assignments_needed: AssignmentsCollection::default(),
+            assignments_spent: spent,
+            main_transition: TypeOfTransition::Transfer,
+        };
+        let mut transfer_info_map: BTreeMap<String, InfoAssetTransfer> = BTreeMap::new();
+        transfer_info_map.insert(asset_id, transfer_info);
+
+        let batch_transfer_idx = self._save_transfers(
+            txid,
+            &transfer_info_map,
+            HashMap::new(),
+            change_utxo_idx,
+            None,
+            TransferStatus::WaitingConfirmations,
+            min_confirmations,
+        )?;
+
+        self.update_backup_info(false)?;
+        self.trigger_auto_backup();
+
+        info!(
+            self.logger,
+            "Collaborative outgoing transfer registered (batch {batch_transfer_idx})"
+        );
+        Ok(Some(batch_transfer_idx))
+    }
+
     pub(crate) fn get_input_unspents(
         &self,
         unspents: &[LocalUnspent],
