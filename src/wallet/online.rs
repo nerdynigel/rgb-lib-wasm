@@ -1144,21 +1144,23 @@ impl Wallet {
     /// - **Fail-closed**: refuses unknown assets and change amounts without an
     ///   output, writing nothing.
     ///
-    /// `spent` maps each consumed RGB txo idx to the fungible assignments
-    /// consumed; `change` is the seller's RGB change output `(vout, fungible)`
-    /// in the collaborative transaction (created if not yet known).
+    /// `spent_outpoints` are the wallet's own RGB funding outpoints consumed by
+    /// the collaborative transaction (`"<txid>:<vout>"`); the consumed txo idx /
+    /// assignments are derived from this wallet's durable state (the JS layer has
+    /// no txo idx). `change` is the seller's RGB change output `(vout, fungible)`
+    /// in the collaborative transaction (its txo is created if not yet known).
     pub fn register_collaborative_outgoing_transfer(
         &self,
         txid: String,
         asset_id: String,
-        spent: HashMap<i32, Vec<Assignment>>,
+        spent_outpoints: Vec<String>,
         change: Option<(u32, u64)>,
         min_confirmations: u8,
     ) -> Result<Option<i32>, Error> {
         let change_amount = change.map(|(_, amount)| amount).unwrap_or(0);
-        if spent.is_empty() && change_amount == 0 {
+        if spent_outpoints.is_empty() && change_amount == 0 {
             return Err(Error::Internal {
-                details: s!("nothing to register: no spent assignments and no change"),
+                details: s!("nothing to register: no spent outpoints and no change"),
             });
         }
 
@@ -1182,6 +1184,47 @@ impl Wallet {
         let contract_id = ContractId::from_str(&asset_id).map_err(|e| Error::Internal {
             details: e.to_string(),
         })?;
+
+        // Derive the consumed txo idx -> assignments from this wallet's own
+        // durable state; fail closed on any unknown outpoint or missing
+        // allocation rather than writing partial rows.
+        let db_data = self.database.get_db_data(false)?;
+        let mut spent: HashMap<i32, Vec<Assignment>> = HashMap::new();
+        for outpoint_str in &spent_outpoints {
+            let (txid_part, vout_part) = outpoint_str.rsplit_once(':').ok_or_else(|| {
+                Error::Internal {
+                    details: format!("spent outpoint must be <txid>:<vout>: {outpoint_str}"),
+                }
+            })?;
+            let vout = vout_part.parse::<u32>().map_err(|e| Error::Internal {
+                details: format!("invalid spent outpoint vout {outpoint_str}: {e}"),
+            })?;
+            let outpoint = Outpoint {
+                txid: txid_part.to_string(),
+                vout,
+            };
+            let txo = self.database.get_txo(&outpoint)?.ok_or_else(|| Error::Internal {
+                details: format!("unknown spent outpoint {outpoint_str}"),
+            })?;
+            let mut assignments: Vec<Assignment> = vec![];
+            for coloring in db_data.colorings.iter().filter(|c| c.txo_idx == txo.idx) {
+                if let Some(asset_transfer) = db_data
+                    .asset_transfers
+                    .iter()
+                    .find(|a| a.idx == coloring.asset_transfer_idx)
+                {
+                    if asset_transfer.asset_id.as_deref() == Some(asset_id.as_str()) {
+                        assignments.push(coloring.assignment.clone());
+                    }
+                }
+            }
+            if assignments.is_empty() {
+                return Err(Error::Internal {
+                    details: format!("no RGB allocation of {asset_id} at {outpoint_str}"),
+                });
+            }
+            spent.insert(txo.idx, assignments);
+        }
 
         let change_utxo_idx = if let Some((vout, _amount)) = change {
             Some(
