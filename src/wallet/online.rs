@@ -1537,6 +1537,29 @@ impl Wallet {
             })?;
         self.bdk_wallet.persist(&mut self.bdk_database)?;
 
+        self.reconcile_bdk_txos()
+    }
+
+    /// Reconcile RGB TXOs with the canonical BDK graph after an indexer update.
+    pub(crate) fn reconcile_bdk_txos(&self) -> Result<(), Error> {
+        // Only a canonical BDK output proves its spent state. Absence from a
+        // thin/restored graph is not evidence of a spend. This also restores
+        // unspent state when BDK resolves an eviction/reorg back to the source.
+        for output in self
+            .bdk_wallet
+            .list_output()
+            .filter(|u| u.keychain == KeychainKind::External)
+        {
+            if let Some(txo) = self.database.get_txo(&Outpoint {
+                txid: output.outpoint.txid.to_string(),
+                vout: output.outpoint.vout,
+            })? {
+                let mut updated: DbTxoActMod = txo.into();
+                updated.spent = ActiveValue::Set(output.is_spent);
+                self.database.update_txo(updated)?;
+            }
+        }
+
         let db_txos = self.database.iter_txos()?;
 
         let db_outpoints: HashSet<String> = db_txos

@@ -3342,6 +3342,10 @@ mod address_reuse_tests {
     }
 
     fn seed_seller_source_amount(wallet: &Wallet, amount: u64) {
+        seed_seller_source_at(wallet, amount, THE802_SOURCE_TXID);
+    }
+
+    fn seed_seller_source_at(wallet: &Wallet, amount: u64, source_txid: &str) {
         use crate::database::memory_db::{
             ActiveValue, DbAssetActMod, DbAssetTransferActMod, DbBatchTransferActMod,
             DbColoringActMod, DbTransferActMod, DbTxoActMod,
@@ -3362,7 +3366,7 @@ mod address_reuse_tests {
         let src_txo = wallet
             .database
             .set_txo(DbTxoActMod {
-                txid: ActiveValue::Set(THE802_SOURCE_TXID.to_string()),
+                txid: ActiveValue::Set(source_txid.to_string()),
                 vout: ActiveValue::Set(0),
                 btc_amount: ActiveValue::Set("20000".to_string()),
                 spent: ActiveValue::Set(false),
@@ -3637,6 +3641,251 @@ mod address_reuse_tests {
             after,
             before.settled as i128 + before.future as i128,
             after.settled as i128 + after.future as i128
+        );
+    }
+
+    #[test]
+    fn collaborative_confirmed_accounting_reconciles_spent_input() {
+        use crate::database::memory_db::{ActiveValue, DbBatchTransferActMod};
+        use bdk_wallet::bitcoin::{
+            Amount, BlockHash, Transaction, TxIn, TxOut, absolute, transaction,
+        };
+        use bdk_wallet::chain::{BlockId, ConfirmationBlockTime};
+        use std::sync::Arc;
+
+        let mut wallet = make_test_wallet(false);
+        let script = wallet
+            .bdk_wallet
+            .reveal_next_address(KeychainKind::External)
+            .address
+            .script_pubkey();
+        let source = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: BdkOutPoint {
+                    txid: bdk_wallet::bitcoin::Txid::from_str(THE802_ISSUE_TXID).unwrap(),
+                    vout: 0,
+                },
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(20000),
+                script_pubkey: script.clone(),
+            }],
+        };
+        let source_id = source.compute_txid();
+        seed_seller_source_at(&wallet, 1000, &source_id.to_string());
+        // A thin BDK graph does not prove this known source spent.
+        wallet.reconcile_bdk_txos().unwrap();
+        assert!(!wallet.database.iter_txos().unwrap()[0].spent);
+
+        let spend = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: BdkOutPoint {
+                    txid: source_id,
+                    vout: 0,
+                },
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(19000),
+                script_pubkey: script,
+            }],
+        };
+        let spend_id = spend.compute_txid();
+        let input = format!("{source_id}:0");
+        let batch = wallet
+            .register_collaborative_outgoing_transfer(
+                spend_id.to_string(),
+                THE802_CONTRACT.to_string(),
+                vec![input.clone()],
+                Some((0, 900)),
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        let pending = wallet
+            .get_asset_balance(THE802_CONTRACT.to_string())
+            .unwrap();
+        assert_eq!(
+            (pending.settled, pending.future, pending.spendable),
+            (1000, 900, 0)
+        );
+        wallet
+            .bdk_wallet
+            .apply_unconfirmed_txs([(source.clone(), 1), (spend.clone(), 2)]);
+        wallet.reconcile_bdk_txos().unwrap();
+        let pending = wallet
+            .get_asset_balance(THE802_CONTRACT.to_string())
+            .unwrap();
+        assert_eq!(
+            (pending.settled, pending.future, pending.spendable),
+            (1000, 900, 0)
+        );
+
+        assert!(
+            wallet
+                .database
+                .get_txo(&Outpoint {
+                    txid: source_id.to_string(),
+                    vout: 0
+                })
+                .unwrap()
+                .unwrap()
+                .spent
+        );
+        // Canonical eviction restores the source; absence alone never does.
+        wallet.bdk_wallet.apply_evicted_txs([(spend_id, 3)]);
+        wallet.reconcile_bdk_txos().unwrap();
+        assert!(
+            !wallet
+                .database
+                .get_txo(&Outpoint {
+                    txid: source_id.to_string(),
+                    vout: 0
+                })
+                .unwrap()
+                .unwrap()
+                .spent
+        );
+        let pending = wallet
+            .get_asset_balance(THE802_CONTRACT.to_string())
+            .unwrap();
+        assert_eq!(
+            (pending.settled, pending.future, pending.spendable),
+            (1000, 900, 0)
+        );
+        wallet
+            .bdk_wallet
+            .apply_unconfirmed_txs([(spend.clone(), 4)]);
+        wallet.reconcile_bdk_txos().unwrap();
+
+        // Supply a disposable indexer-equivalent confirmed graph update. No network,
+        // signing or broadcast; the refresh confirmation threshold is supplied here.
+        let block = BlockId {
+            height: 1,
+            hash: BlockHash::from_str(THE802_ISSUE_TXID).unwrap(),
+        };
+        let mut update = bdk_wallet::Update::default();
+        update.chain = Some(wallet.bdk_wallet.latest_checkpoint().push(block).unwrap());
+        for tx in [source, spend] {
+            update.tx_update.anchors.insert((
+                ConfirmationBlockTime {
+                    block_id: block,
+                    confirmation_time: 1000,
+                },
+                tx.compute_txid(),
+            ));
+            update.tx_update.txs.push(Arc::new(tx));
+        }
+        wallet.bdk_wallet.apply_update(update).unwrap();
+        wallet.bdk_wallet.persist(&mut wallet.bdk_database).unwrap();
+        wallet.reconcile_bdk_txos().unwrap();
+        let mut settled: DbBatchTransferActMod = wallet
+            .database
+            .iter_batch_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|b| b.idx == batch)
+            .unwrap()
+            .into();
+        settled.status = ActiveValue::Set(TransferStatus::Settled);
+        wallet.database.update_batch_transfer(&mut settled).unwrap();
+        let balance = wallet
+            .get_asset_balance(THE802_CONTRACT.to_string())
+            .unwrap();
+        println!("THE803_CONFIRMED_BALANCE={balance:?}");
+        println!(
+            "THE803_CONFIRMED_BALANCE_JSON={}",
+            serde_json::to_string(&balance).unwrap()
+        );
+        assert_eq!(
+            (balance.settled, balance.future, balance.spendable),
+            (900, 900, 900)
+        );
+        let btc = wallet.get_btc_balance(None, true).unwrap();
+        assert_eq!(
+            (
+                btc.colored.settled,
+                btc.colored.future,
+                btc.colored.spendable
+            ),
+            (19000, 19000, 19000)
+        );
+        let rows = wallet
+            .list_transfers(
+                AssetFilter::Id(THE802_CONTRACT.to_string()),
+                Some(spend_id.to_string()),
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].assignments, vec![Assignment::Fungible(100)]);
+        assert_eq!(rows[0].status, TransferStatus::Settled);
+        let unspents = wallet.list_unspents(None, true, true).unwrap();
+        assert!(
+            !unspents
+                .iter()
+                .any(|u| u.utxo.outpoint.txid == source_id.to_string())
+        );
+        assert_eq!(unspents.len(), 1);
+        assert_eq!(
+            unspents[0].rgb_allocations[0].assignment,
+            Assignment::Fungible(900)
+        );
+        *wallet.rgb_stock.borrow_mut() = Some(rgbstd::persistence::Stock::in_memory());
+        let bytes = serde_json::to_vec(&wallet.snapshot().unwrap()).unwrap();
+        let mut restored = make_test_wallet(false);
+        restored.wallet_data = wallet.wallet_data.clone();
+        restored
+            .restore_from_snapshot(serde_json::from_slice(&bytes).unwrap())
+            .unwrap();
+        for _ in 0..3 {
+            let b = restored
+                .get_asset_balance(THE802_CONTRACT.to_string())
+                .unwrap();
+            assert_eq!((b.settled, b.future, b.spendable), (900, 900, 900));
+            let r = restored
+                .list_transfers(
+                    AssetFilter::Id(THE802_CONTRACT.to_string()),
+                    Some(spend_id.to_string()),
+                )
+                .unwrap();
+            assert_eq!(r.len(), 1);
+            assert_eq!(r[0].idx, rows[0].idx);
+            assert_eq!(r[0].batch_transfer_idx, rows[0].batch_transfer_idx);
+            assert_eq!(r[0].assignments, rows[0].assignments);
+            let b = restored.get_btc_balance(None, true).unwrap();
+            assert_eq!(b.colored.settled, 19000);
+        }
+        assert!(
+            restored
+                .register_collaborative_outgoing_transfer(
+                    spend_id.to_string(),
+                    THE802_CONTRACT.to_string(),
+                    vec![input.clone()],
+                    Some((0, 900)),
+                    1
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            restored
+                .register_collaborative_outgoing_transfer(
+                    spend_id.to_string(),
+                    THE802_CONTRACT.to_string(),
+                    vec![input],
+                    Some((0, 800)),
+                    1
+                )
+                .is_err()
+        );
+        println!(
+            "THE803_CONFIRMED_TRANSFER_JSON={}",
+            serde_json::to_string(&rows).unwrap()
         );
     }
 
