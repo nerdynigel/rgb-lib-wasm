@@ -1164,13 +1164,63 @@ impl Wallet {
             });
         }
 
-        // Idempotent: rows already exist for this txid -> no-op.
-        if self
+        // Exact replay is a no-op; a txid must not hide altered terms.
+        if let Some(batch) = self
             .database
             .iter_batch_transfers()?
             .iter()
-            .any(|batch| batch.txid.as_deref() == Some(txid.as_str()))
+            .find(|batch| batch.txid.as_deref() == Some(txid.as_str()))
         {
+            let data = self.database.get_db_data(false)?;
+            let asset_transfers: Vec<_> = data
+                .asset_transfers
+                .iter()
+                .filter(|a| a.batch_transfer_idx == batch.idx)
+                .collect();
+            let matches = if asset_transfers.len() == 1
+                && asset_transfers[0].asset_id.as_deref() == Some(asset_id.as_str())
+                && batch.min_confirmations == min_confirmations
+            {
+                let colorings: Vec<_> = data
+                    .colorings
+                    .iter()
+                    .filter(|c| c.asset_transfer_idx == asset_transfers[0].idx)
+                    .collect();
+                let mut inputs: Vec<_> = colorings
+                    .iter()
+                    .filter(|c| c.r#type == ColoringType::Input)
+                    .filter_map(|c| data.txos.iter().find(|t| t.idx == c.txo_idx))
+                    .map(|t| format!("{}:{}", t.txid, t.vout))
+                    .collect();
+                inputs.sort();
+                inputs.dedup();
+                let mut requested = spent_outpoints.clone();
+                requested.sort();
+                requested.dedup();
+                let changes: Vec<_> = colorings
+                    .iter()
+                    .filter(|c| c.r#type == ColoringType::Change)
+                    .collect();
+                let change_matches = match (change, changes.as_slice()) {
+                    (None, []) => true,
+                    (Some((vout, amount)), [c]) => {
+                        c.assignment == Assignment::Fungible(amount)
+                            && data
+                                .txos
+                                .iter()
+                                .any(|t| t.idx == c.txo_idx && t.txid == txid && t.vout == vout)
+                    }
+                    _ => false,
+                };
+                inputs == requested && change_matches
+            } else {
+                false
+            };
+            if !matches {
+                return Err(Error::Internal {
+                    details: s!("collaborative replay terms differ"),
+                });
+            }
             return Ok(None);
         }
 
@@ -1230,6 +1280,29 @@ impl Wallet {
             spent.insert(txo.idx, assignments);
         }
 
+        // Validate exact fungible arithmetic before creating any durable rows.
+        let input_amount =
+            spent
+                .values()
+                .flatten()
+                .try_fold(0u64, |sum, assignment| match assignment {
+                    Assignment::Fungible(amount) => {
+                        sum.checked_add(*amount).ok_or_else(|| Error::Internal {
+                            details: s!("collaborative amount overflow"),
+                        })
+                    }
+                    _ => Err(Error::Internal {
+                        details: s!("collaborative send requires fungible assignments"),
+                    }),
+                })?;
+        input_amount
+            .checked_sub(change_amount)
+            .ok_or_else(|| Error::Internal {
+                details: s!("collaborative change exceeds inputs"),
+            })?;
+        let mut assignments_collected = AssignmentsCollection::default();
+        assignments_collected.fungible = input_amount;
+
         let change_utxo_idx = if let Some((vout, _amount)) = change {
             Some(
                 match self.database.get_txo(&Outpoint {
@@ -1260,14 +1333,6 @@ impl Wallet {
             });
         }
 
-        let mut assignments_collected = AssignmentsCollection::default();
-        for assignments in spent.values() {
-            for assignment in assignments {
-                if let Assignment::Fungible(amount) = assignment {
-                    assignments_collected.add_fungible(*amount);
-                }
-            }
-        }
         let asset_spend = AssetSpend {
             txo_map: HashMap::new(),
             assignments_collected,
@@ -1471,6 +1536,29 @@ impl Wallet {
                 details: e.to_string(),
             })?;
         self.bdk_wallet.persist(&mut self.bdk_database)?;
+
+        self.reconcile_bdk_txos()
+    }
+
+    /// Reconcile RGB TXOs with the canonical BDK graph after an indexer update.
+    pub(crate) fn reconcile_bdk_txos(&self) -> Result<(), Error> {
+        // Only a canonical BDK output proves its spent state. Absence from a
+        // thin/restored graph is not evidence of a spend. This also restores
+        // unspent state when BDK resolves an eviction/reorg back to the source.
+        for output in self
+            .bdk_wallet
+            .list_output()
+            .filter(|u| u.keychain == KeychainKind::External)
+        {
+            if let Some(txo) = self.database.get_txo(&Outpoint {
+                txid: output.outpoint.txid.to_string(),
+                vout: output.outpoint.vout,
+            })? {
+                let mut updated: DbTxoActMod = txo.into();
+                updated.spent = ActiveValue::Set(output.is_spent);
+                self.database.update_txo(updated)?;
+            }
+        }
 
         let db_txos = self.database.iter_txos()?;
 
