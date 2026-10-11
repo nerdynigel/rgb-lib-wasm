@@ -191,6 +191,12 @@ pub async fn load_snapshot(key: &str) -> Result<Option<WalletSnapshot>, String> 
 
 #[cfg(test)]
 mod tests {
+    mod state_bytes {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/state_bytes.rs"
+        ));
+    }
     use super::*;
     use rgbstd::containers::ConsignmentExt;
     use rgbstd::contract::IssuerWrapper;
@@ -214,6 +220,7 @@ mod tests {
         use rgbstd::{Amount, ChainNet, Identity, Txid as RgbTxid};
 
         let mut stock = Stock::in_memory();
+        let empty_bytes = state_bytes::strict_stock_bytes(&serialize_stock(&stock).unwrap());
 
         let spec = AssetSpec {
             ticker: crate::Ticker::try_from("TEST".to_string()).unwrap(),
@@ -260,6 +267,13 @@ mod tests {
 
         // Serialize → JSON round-trip (simulates IndexedDB save/load)
         let (s, st, i) = serialize_stock(&stock).expect("serialize stock with contract");
+        let stock_bytes = state_bytes::strict_stock_bytes(&(s.clone(), st.clone(), i.clone()));
+        for (before, after) in empty_bytes.iter().zip(&stock_bytes) {
+            assert_ne!(
+                before, after,
+                "import must change each strict stock component"
+            );
+        }
 
         let mut transfer_artifact = crate::wallet::online::TransferArtifacts::default();
         transfer_artifact
@@ -301,6 +315,26 @@ mod tests {
             restored_snapshot.stock_index_b64.as_ref().unwrap(),
         )
         .expect("deserialize stock");
+
+        let restored_bytes = state_bytes::strict_stock_bytes(&serialize_stock(&restored).unwrap());
+        assert_eq!(
+            restored_bytes, stock_bytes,
+            "strict stock bytes must survive snapshot restore"
+        );
+        let snapshot_value = serde_json::to_value(&restored_snapshot).unwrap();
+        assert_eq!(
+            state_bytes::snapshot_stock_bytes(&snapshot_value),
+            stock_bytes
+        );
+        println!(
+            "THE876_BYTE_STATE {}",
+            serde_json::json!({
+                "boundary": "synthetic-contract-stock-round-trip",
+                "stock": stock_bytes.each_ref().map(|b| state_bytes::receipt(b)),
+                "snapshot_state": state_bytes::receipt(&state_bytes::snapshot_state_bytes(snapshot_value)),
+                "serialized_snapshot": state_bytes::receipt(json.as_bytes())
+            })
+        );
 
         // Contract must survive the round-trip
         assert!(

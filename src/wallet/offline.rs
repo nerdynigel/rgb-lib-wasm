@@ -3341,6 +3341,74 @@ mod address_reuse_tests {
         assert_eq!(psbt.serialize(), original);
     }
 
+    mod state_bytes {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/state_bytes.rs"
+        ));
+    }
+
+    #[test]
+    fn byte_state_runtime_checkout_drop_and_snapshot_restore() {
+        use state_bytes::*;
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let stock_before = strict_stock_bytes(
+            &super::super::idb_store::serialize_stock(wallet.rgb_stock.borrow().as_ref().unwrap())
+                .unwrap(),
+        );
+        let snapshot = wallet.snapshot().unwrap();
+        let snapshot_value = serde_json::to_value(&snapshot).unwrap();
+        let state_before = snapshot_state_bytes(snapshot_value.clone());
+        assert_eq!(snapshot_stock_bytes(&snapshot_value), stock_before);
+        let sequence = wallet
+            .idb_sequence
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let runtime = wallet.rgb_runtime().unwrap();
+        assert!(wallet.rgb_stock.borrow().is_none());
+        assert_eq!(
+            strict_stock_bytes(&super::super::idb_store::serialize_stock(&runtime.stock).unwrap()),
+            stock_before
+        );
+        assert!(matches!(wallet.snapshot(), Err(Error::Persistence { .. })));
+        assert_eq!(
+            wallet
+                .idb_sequence
+                .load(std::sync::atomic::Ordering::SeqCst),
+            sequence
+        );
+        drop(runtime);
+        assert_eq!(
+            strict_stock_bytes(
+                &super::super::idb_store::serialize_stock(
+                    wallet.rgb_stock.borrow().as_ref().unwrap()
+                )
+                .unwrap()
+            ),
+            stock_before
+        );
+        let restored_bytes = serde_json::to_vec(&snapshot).unwrap();
+        wallet
+            .restore_from_snapshot(serde_json::from_slice(&restored_bytes).unwrap())
+            .unwrap();
+        let after = serde_json::to_value(wallet.snapshot().unwrap()).unwrap();
+        assert_eq!(snapshot_stock_bytes(&after), stock_before);
+        assert_eq!(snapshot_state_bytes(after.clone()), state_before);
+        // Sensitivity control: actual BDK derivation changes snapshot state, not stock.
+        wallet._get_new_address(KeychainKind::Internal).unwrap();
+        let changed = serde_json::to_value(wallet.snapshot().unwrap()).unwrap();
+        assert_ne!(snapshot_state_bytes(changed.clone()), state_before);
+        assert_eq!(snapshot_stock_bytes(&changed), stock_before);
+        println!(
+            "THE876_BYTE_STATE {}",
+            serde_json::json!({
+                "boundary": "internal-runtime-snapshot", "stock": stock_before.each_ref().map(|b| receipt(b)),
+                "snapshot_state": receipt(&state_before), "serialized_snapshot": receipt(&restored_bytes),
+                "sequence_before": sequence, "sequence_after_restore_snapshot": after["sequence"]
+            })
+        );
+    }
+
     #[test]
     fn reuse_returns_same_address() {
         let mut wallet = make_test_wallet(true);
