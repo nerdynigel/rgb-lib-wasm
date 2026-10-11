@@ -71,6 +71,16 @@ async fn test_color_export_fresh_wallet_refusal() {
         nonce: Some(1),
     };
     assert!(wallet.color_psbt_and_export(&mut psbt, info).is_err());
+    // Pure inspection refuses malformed bytes without accessing or persisting this wallet.
+    assert!(
+        rgb_lib_wasm::wallet::rust_only::inspect_transfer_offchain(
+            b"invalid consignment",
+            b"invalid colored transaction",
+            BitcoinNetwork::Regtest,
+        )
+        .is_err()
+    );
+
     assert_eq!(psbt.serialize(), original);
     assert_eq!(
         serde_json::to_value(wallet.list_transfers(AssetFilter::Any, None).unwrap()).unwrap(),

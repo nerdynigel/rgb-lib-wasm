@@ -898,3 +898,23 @@ pub fn validate_consignment_offchain(
     .map_err(|e| JsValue::from_str(&e.to_string()))?;
     to_js(&result)
 }
+
+/// Inspect validated canonical transfer bytes against the exact colored transaction.
+/// Returns facts only; does not authorize spending or access wallet state.
+#[wasm_bindgen(js_name = "inspectTransferOffchain")]
+pub fn inspect_transfer_offchain(
+    consignment_bytes: &[u8],
+    colored_transaction: &[u8],
+    network: &str,
+) -> Result<JsValue, JsValue> {
+    let network = network
+        .parse::<rgb_lib_wasm::BitcoinNetwork>()
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let facts = rgb_lib_wasm::wallet::rust_only::inspect_transfer_offchain(
+        consignment_bytes,
+        colored_transaction,
+        network,
+    )
+    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    to_js(&facts)
+}

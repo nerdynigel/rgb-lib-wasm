@@ -765,9 +765,331 @@ pub fn validate_consignment_offchain(
     }
 }
 
+/// Facts derived only from validated immutable transfer bytes. Not spending authorization.
+#[cfg(feature = "esplora")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InspectedTransfer {
+    /// SHA256 of the complete canonical file bytes.
+    pub bytes_sha256: String,
+    /// Contract committed by the validated genesis.
+    pub contract_id: String,
+    /// Exact consensus-encoded colored witness transaction.
+    pub witness_transaction: Vec<u8>,
+    /// Witness transaction ID.
+    pub witness_txid: String,
+    /// Committed bundle ID.
+    pub bundle_id: String,
+    /// Validated anchor proof, bound by bytes_sha256.
+    pub anchor_json: String,
+    /// Single complete transition operation ID.
+    pub transition_id: String,
+    /// Every revealed fungible asset output, including change and fees.
+    pub allocations: Vec<InspectedAllocation>,
+}
+
+/// A revealed allocation from the validated terminal transition.
+#[cfg(feature = "esplora")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InspectedAllocation {
+    /// Assignment index in the committed transition.
+    pub assignment_index: u16,
+    /// Witness output index.
+    pub vout: u32,
+    /// Exact integer RGB amount as decimal text (safe for JS).
+    pub amount: String,
+    /// Complete revealed seal, bound by bytes_sha256.
+    pub seal: String,
+    /// Output script from the exact colored witness transaction.
+    pub script_pubkey: String,
+}
+
+/// Inspect a prospective, single-transition fungible transfer without accessing wallet state.
+///
+/// Validates the same canonical strict bytes with the established offchain validator.
+/// Requires a complete witness exactly equal to the caller's colored transaction, a
+/// fully revealed bundle and only nonzero fungible asset assignments. History may contain
+/// other witnesses; only the requested witness's terminal bundle is inspected. Concealed,
+/// missing, extra, duplicate or unsupported facts are refused. Returned facts grant no
+/// ownership, chain authenticity, policy, consent or signing authority.
+#[cfg(feature = "esplora")]
+pub fn inspect_transfer_offchain(
+    consignment_bytes: &[u8],
+    colored_transaction: &[u8],
+    bitcoin_network: BitcoinNetwork,
+) -> Result<InspectedTransfer, Error> {
+    let refuse = |details: &str| Error::InvalidColoringInfo {
+        details: details.to_owned(),
+    };
+    if consignment_bytes.len() > 8_000_000 || colored_transaction.len() > 400_000 {
+        return Err(refuse("inspection byte limit exceeded"));
+    }
+    let tx: bdk_wallet::bitcoin::Transaction =
+        bdk_wallet::bitcoin::consensus::deserialize(colored_transaction)
+            .map_err(|_| refuse("invalid colored transaction bytes"))?;
+    let consignment = RgbTransfer::load(consignment_bytes).map_err(|e| Error::Internal {
+        details: format!("Failed to load consignment: {e}"),
+    })?;
+    let mut canonical = vec![];
+    consignment
+        .save(&mut canonical)
+        .map_err(InternalError::from)?;
+    if canonical != consignment_bytes {
+        return Err(refuse("noncanonical or trailing consignment bytes"));
+    }
+    let witness_id =
+        RgbTxid::from_str(&tx.compute_txid().to_string()).map_err(|_| Error::InvalidTxid)?;
+    let chain_net = bitcoin_network.into();
+    let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
+    let fallback = crate::utils::WasmResolver::from_consignment(&consignment, chain_net);
+    let resolver = crate::utils::OffchainResolverWasm {
+        witness_id,
+        consignment: &consignment,
+        fallback: &fallback,
+    };
+    let config = ValidationConfig {
+        chain_net,
+        trusted_typesystem: asset_schema.types(),
+        ..Default::default()
+    };
+    let valid = consignment
+        .clone()
+        .validate(&resolver, &config)
+        .map_err(|_| refuse("consignment validation failed"))?;
+    let matching: Vec<_> = valid
+        .bundles
+        .iter()
+        .filter(|b| b.pub_witness.txid() == witness_id)
+        .collect();
+    if matching.len() != 1 {
+        return Err(refuse("missing or ambiguous witness bundle"));
+    }
+    let witness = matching[0];
+    let witness_bytes = inspect_exact_witness(&witness.pub_witness, colored_transaction)?;
+    let bundle = &witness.bundle;
+    if bundle.known_transitions.len() != 1
+        || bundle.known_transitions_opids() != bundle.input_map_opids()
+    {
+        return Err(refuse("concealed or ambiguous terminal transitions"));
+    }
+    let known = &bundle.known_transitions[0];
+    let transition = &known.transition;
+    if transition.id() != known.opid
+        || transition.contract_id != valid.contract_id()
+        || transition.assignments.len() != 1
+    {
+        return Err(refuse("unsupported or extra transition assignments"));
+    }
+    let assigned = transition
+        .assignments
+        .get(&OS_ASSET)
+        .ok_or_else(|| refuse("missing fungible asset assignments"))?;
+    let allocations = inspect_revealed_allocations(assigned, &tx)?;
+    // A prospective revealed-output export has no secret terminals. Refuse other modes.
+    if !valid.terminals.is_empty() {
+        return Err(refuse("unsupported secret terminal allocations"));
+    }
+    Ok(InspectedTransfer {
+        bytes_sha256: <sha256::Hash as Sha256Hash>::hash(consignment_bytes).to_string(),
+        contract_id: valid.contract_id().to_string(),
+        witness_transaction: witness_bytes,
+        witness_txid: witness_id.to_string(),
+        bundle_id: bundle.bundle_id().to_string(),
+        anchor_json: serde_json::to_string(&witness.anchor).map_err(InternalError::from)?,
+        transition_id: known.opid.to_string(),
+        allocations,
+    })
+}
+
+#[cfg(feature = "esplora")]
+fn inspect_exact_witness(witness: &PubWitness, colored: &[u8]) -> Result<Vec<u8>, Error> {
+    let refuse = |details: &str| Error::InvalidColoringInfo {
+        details: details.to_owned(),
+    };
+    let tx = witness
+        .tx()
+        .ok_or_else(|| refuse("concealed witness transaction"))?;
+    let bytes = bdk_wallet::bitcoin::consensus::serialize(tx);
+    if bytes != colored {
+        return Err(refuse("colored transaction substitution"));
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "esplora")]
+fn inspect_revealed_allocations(
+    assigned: &rgbstd::TypedAssigns<GraphSeal>,
+    tx: &bdk_wallet::bitcoin::Transaction,
+) -> Result<Vec<InspectedAllocation>, Error> {
+    let refuse = |details: &str| Error::InvalidColoringInfo {
+        details: details.to_owned(),
+    };
+    if !matches!(assigned, rgbstd::TypedAssigns::Fungible(_)) {
+        return Err(refuse("unsupported non-fungible assignments"));
+    }
+    let mut allocations = vec![];
+    let mut vouts = HashSet::new();
+    for (index, assignment) in assigned.as_fungible().iter().enumerate() {
+        let (seal, amount) = assignment
+            .as_revealed()
+            .ok_or_else(|| refuse("concealed recipient seal"))?;
+        if !matches!(seal.txid, rgbstd::txout::TxPtr::WitnessTx) {
+            return Err(refuse("recipient seal targets another transaction"));
+        }
+        let vout = seal.vout.to_u32();
+        let output = tx
+            .output
+            .get(vout as usize)
+            .ok_or_else(|| refuse("recipient vout outside colored transaction"))?;
+        if amount.as_u64() == 0 || !vouts.insert(vout) || output.script_pubkey.is_op_return() {
+            return Err(refuse(
+                "zero, duplicate or unspendable recipient allocation",
+            ));
+        }
+        allocations.push(InspectedAllocation {
+            assignment_index: index as u16,
+            vout,
+            amount: amount.as_u64().to_string(),
+            seal: seal.to_string(),
+            script_pubkey: output.script_pubkey.to_hex_string(),
+        });
+    }
+    if allocations.is_empty() {
+        return Err(refuse("missing recipient allocations"));
+    }
+    Ok(allocations)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn inspection_transaction() -> Vec<u8> {
+        bdk_wallet::bitcoin::consensus::serialize(&bdk_wallet::bitcoin::Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![bdk_wallet::bitcoin::TxIn::default()],
+            output: vec![TxOut {
+                value: BdkAmount::ZERO,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        })
+    }
+
+    #[test]
+    fn inspect_transfer_exact_witness_substitution() {
+        let bytes = inspection_transaction();
+        let tx: bdk_wallet::bitcoin::Transaction =
+            bdk_wallet::bitcoin::consensus::deserialize(&bytes).unwrap();
+        let witness = PubWitness::Tx(tx.clone());
+        assert_eq!(inspect_exact_witness(&witness, &bytes).unwrap(), bytes);
+        let mut other = tx.clone();
+        other.output[0].value = BdkAmount::from_sat(1);
+        assert!(
+            inspect_exact_witness(&witness, &bdk_wallet::bitcoin::consensus::serialize(&other))
+                .is_err()
+        );
+        // Txid equality alone does not bind witness data: compare full consensus bytes.
+        other = tx;
+        other.input[0].witness.push([1]);
+        assert_eq!(other.compute_txid().to_string(), witness.txid().to_string());
+        assert!(
+            inspect_exact_witness(&witness, &bdk_wallet::bitcoin::consensus::serialize(&other))
+                .is_err()
+        );
+        assert!(inspect_exact_witness(&PubWitness::Txid(witness.txid()), &bytes).is_err());
+    }
+
+    #[test]
+    fn inspect_transfer_allocation_structural_refusals() {
+        use rgbstd::{RevealedValue, TypedAssigns};
+        use strict_encoding::StrictDumb;
+        // Structural vectors only: no valid RGB consignment or funded fixture is claimed.
+        let tx: bdk_wallet::bitcoin::Transaction =
+            bdk_wallet::bitcoin::consensus::deserialize(&inspection_transaction()).unwrap();
+        let seal = GraphSeal::strict_dumb();
+        let make = |assignments: Vec<Assign<RevealedValue, GraphSeal>>| {
+            serde_json::from_value::<TypedAssigns<GraphSeal>>(
+                serde_json::json!({"type": "fungible", "items": assignments}),
+            )
+            .unwrap()
+        };
+        let mut seal = seal;
+        seal.txid = rgbstd::txout::TxPtr::WitnessTx;
+        seal.vout = 0.into();
+        let revealed = Assign::revealed(seal, RevealedValue::from(1));
+        let facts = inspect_revealed_allocations(&make(vec![revealed.clone()]), &tx).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].amount, "1");
+        assert_eq!(facts[0].vout, 0);
+        assert!(
+            inspect_revealed_allocations(&make(vec![revealed.clone(), revealed]), &tx).is_err()
+        );
+        assert!(
+            inspect_revealed_allocations(&make(vec![Assign::revealed(seal, 0.into())]), &tx)
+                .is_err()
+        );
+        assert!(
+            inspect_revealed_allocations(
+                &make(vec![Assign::ConfidentialSeal {
+                    seal: seal.conceal(),
+                    state: 1.into(),
+                }]),
+                &tx
+            )
+            .is_err()
+        );
+        seal.vout = 1.into();
+        assert!(
+            inspect_revealed_allocations(&make(vec![Assign::revealed(seal, 1.into())]), &tx)
+                .is_err()
+        );
+        seal.vout = 0.into();
+        seal.txid = rgbstd::txout::TxPtr::Txid(RgbTxid::strict_dumb());
+        assert!(
+            inspect_revealed_allocations(&make(vec![Assign::revealed(seal, 1.into())]), &tx)
+                .is_err()
+        );
+        seal.txid = rgbstd::txout::TxPtr::WitnessTx;
+        let mut opreturn = tx;
+        opreturn.output[0].script_pubkey = ScriptBuf::new_op_return([]);
+        assert!(
+            inspect_revealed_allocations(&make(vec![Assign::revealed(seal, 1.into())]), &opreturn)
+                .is_err()
+        );
+        let unsupported: TypedAssigns<GraphSeal> = TypedAssigns::strict_dumb();
+        assert!(inspect_revealed_allocations(&unsupported, &opreturn).is_err());
+    }
+
+    #[test]
+    fn inspect_transfer_malformed_transaction_and_consignment() {
+        assert!(matches!(
+            inspect_transfer_offchain(b"bad", b"bad", BitcoinNetwork::Regtest),
+            Err(Error::InvalidColoringInfo { .. })
+        ));
+        assert!(matches!(
+            inspect_transfer_offchain(b"bad", &inspection_transaction(), BitcoinNetwork::Regtest),
+            Err(Error::Internal { .. })
+        ));
+    }
+
+    #[test]
+    fn inspect_transfer_rejects_trailing_bytes_before_schema_validation() {
+        use strict_encoding::StrictDumb;
+        let transfer = RgbTransfer::strict_dumb();
+        let mut bytes = vec![];
+        transfer.save(&mut bytes).unwrap();
+        bytes.push(42);
+        assert!(
+            matches!(inspect_transfer_offchain(&bytes, &inspection_transaction(), BitcoinNetwork::Regtest),
+            Err(Error::InvalidColoringInfo { details }) if details.contains("trailing"))
+        );
+        bytes.pop();
+        // Strict-decodable synthetic data is not validated RGB evidence.
+        assert!(
+            inspect_transfer_offchain(&bytes, &inspection_transaction(), BitcoinNetwork::Regtest)
+                .is_err()
+        );
+    }
 
     #[test]
     fn validate_consignment_offchain_invalid_bytes() {
