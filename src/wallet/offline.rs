@@ -3267,6 +3267,81 @@ mod address_reuse_tests {
     }
 
     #[test]
+    fn color_export_unfunded_refusals_preserve_stock_and_records() {
+        use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
+        let wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let before_stock =
+            super::super::idb_store::serialize_stock(wallet.rgb_stock.borrow().as_ref().unwrap())
+                .unwrap();
+        let before_db = serde_json::to_value(wallet.database.as_ref()).unwrap();
+        let mut psbt = Psbt::from_unsigned_tx(BdkTransaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: BdkAmount::ZERO,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        })
+        .unwrap();
+        let original = psbt.serialize();
+        let empty = ColoringInfo {
+            asset_info_map: HashMap::new(),
+            static_blinding: Some(1),
+            nonce: Some(1),
+        };
+        assert!(matches!(
+            wallet.color_psbt_and_export(&mut psbt, empty.clone()),
+            Err(Error::InvalidColoringInfo { .. })
+        ));
+        // A syntactically valid but unowned contract must fail without changing stock or PSBT.
+        let contract_id =
+            ContractId::from_str("rgb:qFuT6DN8-9AuO95M-7R8R8Mc-AZvs7zG-obum1Va-BRnweKk").unwrap();
+        let info = ColoringInfo {
+            asset_info_map: HashMap::from([(
+                contract_id,
+                AssetColoringInfo {
+                    output_map: HashMap::from([(0, 1)]),
+                    static_blinding: Some(1),
+                },
+            )]),
+            ..empty
+        };
+        assert!(
+            wallet
+                .color_psbt_and_export(&mut psbt, info.clone())
+                .is_err()
+        );
+        assert_eq!(psbt.serialize(), original);
+        assert_eq!(
+            serde_json::to_value(wallet.database.as_ref()).unwrap(),
+            before_db
+        );
+        assert_eq!(
+            super::super::idb_store::serialize_stock(wallet.rgb_stock.borrow().as_ref().unwrap())
+                .unwrap(),
+            before_stock
+        );
+        assert_eq!(
+            wallet
+                .idb_sequence
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let held = wallet.rgb_runtime().unwrap();
+        assert!(wallet.color_psbt_and_export(&mut psbt, info).is_err());
+        assert!(wallet.rgb_stock.borrow().is_none());
+        drop(held);
+        assert_eq!(
+            super::super::idb_store::serialize_stock(wallet.rgb_stock.borrow().as_ref().unwrap())
+                .unwrap(),
+            before_stock
+        );
+        assert_eq!(psbt.serialize(), original);
+    }
+
+    #[test]
     fn reuse_returns_same_address() {
         let mut wallet = make_test_wallet(true);
         let addr1 = wallet._get_new_address(KeychainKind::Internal).unwrap();

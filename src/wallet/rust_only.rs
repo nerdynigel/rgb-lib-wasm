@@ -5,7 +5,7 @@
 use super::*;
 
 /// RGB asset-specific information to color a transaction
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AssetColoringInfo {
     /// Map of vouts and asset amounts to color the transaction outputs
     pub output_map: HashMap<u32, u64>,
@@ -14,7 +14,7 @@ pub struct AssetColoringInfo {
 }
 
 /// RGB information to color a transaction
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ColoringInfo {
     /// Asset-specific information
     pub asset_info_map: HashMap<ContractId, AssetColoringInfo>,
@@ -143,7 +143,7 @@ impl Wallet {
                     vout += 1;
                 }
                 sending_amt += amount;
-                if vout as usize > psbt.outputs.len() {
+                if vout as usize >= psbt.outputs.len() {
                     return Err(Error::InvalidColoringInfo {
                         details: s!("invalid vout in output_map, does not exist in the given PSBT"),
                     });
@@ -216,6 +216,71 @@ impl Wallet {
 
         info!(self.logger, "Color PSBT completed");
         Ok((fascia, asset_beneficiaries))
+    }
+
+    /// Color a prospective PSBT and export its transfers without consuming RGB state.
+    ///
+    /// Uses the wallet's existing stock and the engine's `transfer_from_fascia` derivation.
+    /// All nonzero beneficiaries (including change and fees) are exported from the same
+    /// committed fascia. Does not consume, flush, or register high-level transfers.
+    /// Runtime acquisition/drop temporarily moves stock through the shared wallet slot;
+    /// wallet construction and caller persistence remain separate operations.
+    ///
+    /// This is not approval or ownership-policy validation: callers must validate every
+    /// allocation against their immutable reviewed transaction and resolve foreign prevouts.
+    /// On error the caller's PSBT remains unchanged. No signing or broadcast is performed.
+    pub fn color_psbt_and_export(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+    ) -> Result<Vec<RgbTransfer>, Error> {
+        if coloring_info.asset_info_map.is_empty() {
+            return Err(Error::InvalidColoringInfo {
+                details: s!("no assets requested for transfer export"),
+            });
+        }
+        // Refuse an active runtime instead of initializing a replacement empty stock.
+        // This synchronous path cannot yield between this check and runtime acquisition.
+        let stock = self.rgb_stock.try_borrow().map_err(|_| Error::Internal {
+            details: s!("RGB runtime already in use"),
+        })?;
+        if stock.is_none() {
+            return Err(Error::Internal {
+                details: s!(
+                    "RGB stock unavailable; prospective export requires initialized wallet stock"
+                ),
+            });
+        }
+        drop(stock);
+        let mut candidate = psbt.clone();
+        let (fascia, asset_beneficiaries) = self.color_psbt(&mut candidate, coloring_info)?;
+        let runtime = self.rgb_runtime()?;
+        let mut transfers = vec![];
+        for (contract_id, beneficiaries) in asset_beneficiaries {
+            let mut outputs = vec![];
+            let mut secret_seals = vec![];
+            for beneficiary in beneficiaries {
+                match beneficiary {
+                    BuilderSeal::Revealed(seal) => {
+                        outputs.push(OutputSeal::with(fascia.witness_id(), seal.vout));
+                    }
+                    BuilderSeal::Concealed(seal) => secret_seals.push(seal),
+                }
+            }
+            if outputs.is_empty() && secret_seals.is_empty() {
+                return Err(Error::InvalidColoringInfo {
+                    details: s!("no nonzero beneficiaries requested for transfer export"),
+                });
+            }
+            transfers.push(runtime.transfer_from_fascia(
+                contract_id,
+                outputs,
+                secret_seals,
+                &fascia,
+            )?);
+        }
+        *psbt = candidate;
+        Ok(transfers)
     }
 
     /// Color a PSBT, consume the RGB fascia and return the related consignment.

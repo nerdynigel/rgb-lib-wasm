@@ -30,6 +30,49 @@ fn test_wallet_new_signing() {
 }
 
 #[wasm_bindgen_test]
+fn test_color_export_fresh_wallet_refusal() {
+    use rgb_lib_wasm::bitcoin::{
+        Amount, ScriptBuf, Transaction, TxOut, absolute, psbt::Psbt, transaction,
+    };
+    use rgb_lib_wasm::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
+    use std::collections::HashMap;
+    let wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let before =
+        serde_json::to_value(wallet.list_transfers(AssetFilter::Any, None).unwrap()).unwrap();
+    let mut psbt = Psbt::from_unsigned_tx(Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new(),
+        }],
+    })
+    .unwrap();
+    let original = psbt.serialize();
+    let info = ColoringInfo {
+        asset_info_map: HashMap::from([(
+            "rgb:qFuT6DN8-9AuO95M-7R8R8Mc-AZvs7zG-obum1Va-BRnweKk"
+                .parse()
+                .unwrap(),
+            AssetColoringInfo {
+                output_map: HashMap::from([(0, 1)]),
+                static_blinding: Some(1),
+            },
+        )]),
+        static_blinding: Some(1),
+        nonce: Some(1),
+    };
+    assert!(wallet.color_psbt_and_export(&mut psbt, info).is_err());
+    assert_eq!(psbt.serialize(), original);
+    assert_eq!(
+        serde_json::to_value(wallet.list_transfers(AssetFilter::Any, None).unwrap()).unwrap(),
+        before
+    );
+    assert!(wallet.rgb_contract_ids().unwrap().is_empty());
+}
+
+#[wasm_bindgen_test]
 fn test_wallet_new_watch_only() {
     let keys = generate_keys(BitcoinNetwork::Regtest);
     let wd = WalletData {
