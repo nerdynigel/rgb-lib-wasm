@@ -30,13 +30,20 @@ fn test_wallet_new_signing() {
 }
 
 #[wasm_bindgen_test]
-fn test_color_export_fresh_wallet_refusal() {
+async fn test_color_export_fresh_wallet_refusal() {
     use rgb_lib_wasm::bitcoin::{
         Amount, ScriptBuf, Transaction, TxOut, absolute, psbt::Psbt, transaction,
     };
+    use rgb_lib_wasm::wallet::idb_store::load_snapshot;
     use rgb_lib_wasm::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
     use std::collections::HashMap;
-    let wallet = Wallet::new(test_wallet_data(vec![AssetSchema::Nia])).unwrap();
+    let wd = test_wallet_data(vec![AssetSchema::Nia]);
+    let wallet = Wallet::new(wd.clone()).unwrap();
+    let key = wallet.idb_key();
+    // Fresh keys isolate this unfunded wallet from every other test/profile.
+    assert!(load_snapshot(&key).await.unwrap().is_none());
+    wallet.flush().await.unwrap();
+    let durable_before = serde_json::to_value(load_snapshot(&key).await.unwrap().unwrap()).unwrap();
     let before =
         serde_json::to_value(wallet.list_transfers(AssetFilter::Any, None).unwrap()).unwrap();
     let mut psbt = Psbt::from_unsigned_tx(Transaction {
@@ -70,6 +77,41 @@ fn test_color_export_fresh_wallet_refusal() {
         before
     );
     assert!(wallet.rgb_contract_ids().unwrap().is_empty());
+    assert_eq!(
+        serde_json::to_value(load_snapshot(&key).await.unwrap().unwrap()).unwrap(),
+        durable_before,
+        "refusal must not persist or advance the durable sequence"
+    );
+    // Explicit caller persistence must retain stock, records and BDK state;
+    // only the caller-requested snapshot sequence advances.
+    wallet.flush().await.unwrap();
+    let durable_after = serde_json::to_value(load_snapshot(&key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(
+        durable_after["sequence"],
+        durable_before["sequence"].as_u64().unwrap() + 1
+    );
+    let mut state_before = durable_before.clone();
+    let mut state_after = durable_after.clone();
+    state_before.as_object_mut().unwrap().remove("sequence");
+    state_after.as_object_mut().unwrap().remove("sequence");
+    assert_eq!(state_after, state_before);
+    drop(wallet);
+    assert_eq!(
+        serde_json::to_value(load_snapshot(&key).await.unwrap().unwrap()).unwrap(),
+        durable_after,
+        "wallet drop must not write a snapshot"
+    );
+    let restored = Wallet::restore(wd).await.unwrap();
+    assert!(restored.rgb_contract_ids().unwrap().is_empty());
+    assert_eq!(
+        serde_json::to_value(restored.list_transfers(AssetFilter::Any, None).unwrap()).unwrap(),
+        before
+    );
+    assert_eq!(
+        serde_json::to_value(load_snapshot(&key).await.unwrap().unwrap()).unwrap(),
+        durable_after,
+        "restoration must not write a snapshot"
+    );
 }
 
 #[wasm_bindgen_test]

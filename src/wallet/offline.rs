@@ -3275,7 +3275,7 @@ mod address_reuse_tests {
             super::super::idb_store::serialize_stock(wallet.rgb_stock.borrow().as_ref().unwrap())
                 .unwrap();
         let before_db = serde_json::to_value(wallet.database.as_ref()).unwrap();
-        let mut psbt = Psbt::from_unsigned_tx(BdkTransaction {
+        let mut psbt = Psbt::from_unsigned_tx(bdk_wallet::bitcoin::Transaction {
             version: bdk_wallet::bitcoin::transaction::Version::TWO,
             lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
             input: vec![],
