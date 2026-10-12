@@ -224,3 +224,75 @@ async fn strict_existing_snapshot_real_idb() {
     // Runner destroys this disposable browser profile. The legacy setup flush
     // keeps a Rexie connection open; do not change that unrelated default path.
 }
+
+#[wasm_bindgen(inline_js = r#"
+let originalPut;
+export function abortEncodedPut(enable) {
+  if (!enable) { IDBObjectStore.prototype.put = originalPut; return; }
+  originalPut = IDBObjectStore.prototype.put;
+  IDBObjectStore.prototype.put = function(...args) {
+    const request = originalPut.apply(this, args);
+    // Proves a successful put request does not mean durable commit.
+    request.addEventListener('success', () => this.transaction.abort());
+    return request;
+  };
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen(js_name = abortEncodedPut)]
+    fn abort_put(enable: bool);
+}
+
+#[wasm_bindgen_test]
+async fn encoded_snapshot_commit_real_idb() {
+    use rgb_lib_wasm::wallet::idb_store::{read_existing_snapshot_bytes, save_encoded_snapshot};
+    let d = data();
+    let wallet = Wallet::new(d.clone()).unwrap();
+    let key = wallet.idb_key();
+    let snapshot = wallet.snapshot_for_persistence().unwrap();
+    let raw = serde_json::to_string(&snapshot).unwrap();
+    let restored = Wallet::restore_existing_snapshot(d, snapshot).unwrap();
+    assert_eq!(
+        restored
+            .list_transfers(AssetFilter::Any, None)
+            .unwrap()
+            .len(),
+        0
+    );
+    // The seam itself never creates storage or schedules a background save.
+    assert_eq!(schema().await.unwrap().as_string().unwrap(), "absent");
+    save_encoded_snapshot(&key, None, &raw).await.unwrap();
+    assert_eq!(read_existing_snapshot_bytes(&key).await.unwrap(), raw);
+    assert!(
+        save_encoded_snapshot(&key, None, "replacement")
+            .await
+            .is_err()
+    );
+    assert!(
+        save_encoded_snapshot(&key, Some("foreign"), "replacement")
+            .await
+            .is_err()
+    );
+    assert_eq!(read_existing_snapshot_bytes(&key).await.unwrap(), raw);
+    abort_put(true);
+    let failed = save_encoded_snapshot(&key, Some(&raw), "aborted").await;
+    abort_put(false);
+    assert!(failed.is_err());
+    assert_eq!(read_existing_snapshot_bytes(&key).await.unwrap(), raw);
+    save_encoded_snapshot(&key, Some(&raw), "committed")
+        .await
+        .unwrap();
+    assert_eq!(
+        read_existing_snapshot_bytes(&key).await.unwrap(),
+        "committed"
+    );
+    reset_db(1, "sentinel").await.unwrap();
+    assert!(save_encoded_snapshot(&key, None, "new").await.is_err());
+    assert_eq!(schema().await.unwrap().as_string().unwrap(), "1:sentinel");
+    reset_db(2, "sentinel").await.unwrap();
+    assert!(save_encoded_snapshot(&key, None, "new").await.is_err());
+    assert_eq!(schema().await.unwrap().as_string().unwrap(), "2:sentinel");
+    console_log!(
+        "ENCODED_SNAPSHOT actual engine serialization/restore and real-IDB commit/CAS/abort/schema PASS; unfunded only"
+    );
+}

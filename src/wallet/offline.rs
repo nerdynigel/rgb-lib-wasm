@@ -3122,6 +3122,13 @@ impl Wallet {
         self.save_to_idb();
     }
 
+    /// Explicit consumer persistence seam. Produces the same complete snapshot
+    /// as flush, advancing its sequence in memory without writing or scheduling
+    /// a backup. Consumers must authenticate/encode and commit it separately.
+    pub fn snapshot_for_persistence(&self) -> Result<super::idb_store::WalletSnapshot, Error> {
+        self.snapshot()
+    }
+
     fn snapshot(&self) -> Result<super::idb_store::WalletSnapshot, Error> {
         let stock = self
             .rgb_stock

@@ -425,3 +425,78 @@ mod tests {
         );
     }
 }
+
+// Explicit encoded consumer persistence. Authentication/sequence checks belong
+// to the consumer codec; exact old-record comparison prevents stale replacement.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+export function commitEncodedSnapshot(databaseName, storeName, key, expected, encoded, version) {
+  return new Promise((resolve, reject) => {
+    let request, blocked = false;
+    try { request = indexedDB.open(databaseName, version); }
+    catch (_) { reject('IndexedDB encoded open failed'); return; }
+    request.onupgradeneeded = event => {
+      // Only explicit fresh setup may create a schema; never upgrade an existing one.
+      if (event.oldVersion !== 0) { request.transaction.abort(); return; }
+      request.result.createObjectStore(storeName);
+    };
+    request.onerror = () => reject('IndexedDB encoded open failed');
+    request.onblocked = () => { blocked = true; reject('IndexedDB encoded open blocked'); };
+    request.onsuccess = () => {
+      const db = request.result;
+      if (blocked) { db.close(); return; }
+      if (db.version !== version || !db.objectStoreNames.contains(storeName)) {
+        db.close(); reject('IndexedDB encoded schema invalid'); return;
+      }
+      let tx, failed = 'IndexedDB encoded transaction aborted';
+      try {
+        tx = db.transaction([storeName], 'readwrite');
+        tx.onabort = () => { db.close(); reject(failed); };
+        tx.onerror = () => { /* abort is terminal; do not report request success */ };
+        tx.oncomplete = () => { db.close(); resolve(); };
+        const store = tx.objectStore(storeName), get = store.get(key);
+        get.onsuccess = () => {
+          if (get.result !== (expected === null ? undefined : expected)) {
+            failed = 'IndexedDB encoded record changed'; tx.abort(); return;
+          }
+          try { store.put(encoded, key); }
+          catch (_) { failed = 'IndexedDB encoded put failed'; tx.abort(); }
+        };
+      } catch (_) {
+        if (tx) { try { tx.abort(); } catch (_) {} }
+        db.close(); reject('IndexedDB encoded transaction failed');
+      }
+    };
+  });
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(catch, js_name = commitEncodedSnapshot)]
+    async fn commit_encoded_snapshot(
+        database_name: &str,
+        store_name: &str,
+        key: &str,
+        expected: JsValue,
+        encoded: &str,
+        version: u32,
+    ) -> Result<JsValue, JsValue>;
+}
+
+/// Explicit codec-owned write, resolved only on transaction completion. None
+/// means insert-only; Some requires byte-exact current-record equality inside
+/// the SAME transaction as put. Never accepts arbitrary JS snapshot objects.
+#[cfg(target_arch = "wasm32")]
+pub async fn save_encoded_snapshot(
+    key: &str,
+    expected: Option<&str>,
+    encoded: &str,
+) -> Result<(), String> {
+    let expected = expected.map(JsValue::from_str).unwrap_or(JsValue::NULL);
+    commit_encoded_snapshot(DB_NAME, STORE_NAME, key, expected, encoded, DB_VERSION)
+        .await
+        .map_err(|e| {
+            e.as_string()
+                .unwrap_or_else(|| "IndexedDB encoded write failed".into())
+        })?;
+    Ok(())
+}
