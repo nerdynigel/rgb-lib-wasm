@@ -421,3 +421,60 @@ async fn memory_only_pending_refusals_real_idb() {
         "encrypted-sentinel"
     );
 }
+
+/// UNFUNDED producer seams: real address state/restore and NIA refusal only.
+#[wasm_bindgen_test]
+async fn memory_only_producer_real_idb() {
+    let d = data();
+    let mut wallet = Wallet::new(d.clone()).unwrap();
+    let key = wallet.idb_key();
+    reset_db(1, "snapshots").await.unwrap();
+    record(&key, JsValue::from_str("encrypted-producer-sentinel"), true)
+        .await
+        .unwrap();
+    let original_schema = schema().await.unwrap();
+    observe("");
+    let colored = wallet.reveal_funding_address_in_memory(true).unwrap();
+    let vanilla = wallet.reveal_funding_address_in_memory(false).unwrap();
+    assert_ne!(colored, vanilla);
+    let before = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+    assert!(
+        wallet
+            .issue_asset_nia_in_memory("TEST".into(), "Producer".into(), 0, vec![])
+            .is_err()
+    );
+    assert!(
+        wallet
+            .issue_asset_nia_in_memory("TEST".into(), "Producer".into(), 0, vec![1])
+            .is_err()
+    );
+    let mut after = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+    after["sequence"] = before["sequence"].clone();
+    assert_eq!(before, after);
+    let snapshot = wallet.snapshot_for_persistence().unwrap();
+    let mut restored = Wallet::restore_existing_snapshot(d, snapshot).unwrap();
+    assert_eq!(
+        wallet.reveal_funding_address_in_memory(true).unwrap(),
+        restored.reveal_funding_address_in_memory(true).unwrap()
+    );
+    assert_eq!(
+        wallet.reveal_funding_address_in_memory(false).unwrap(),
+        restored.reveal_funding_address_in_memory(false).unwrap()
+    );
+    backup_turn().await;
+    let counts: serde_json::Value = serde_json::from_str(&unobserve()).unwrap();
+    assert_eq!(counts["reads"], 0);
+    assert_eq!(counts["writes"], 0);
+    assert_eq!(schema().await.unwrap(), original_schema);
+    assert_eq!(
+        record(&key, JsValue::NULL, false)
+            .await
+            .unwrap()
+            .as_string()
+            .unwrap(),
+        "encrypted-producer-sentinel"
+    );
+    console_log!(
+        "PRODUCER address state/restore, unfunded NIA refusal, real-IDB bytes/schema and delayed writes0 PASS; successful issuance untested"
+    );
+}

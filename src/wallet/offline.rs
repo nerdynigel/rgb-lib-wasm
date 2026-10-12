@@ -1676,6 +1676,23 @@ impl Wallet {
         precision: u8,
         amounts: Vec<u64>,
     ) -> Result<AssetNIA, Error> {
+        let asset = self.issue_asset_nia_in_memory(ticker, name, precision, amounts)?;
+        self.update_backup_info(false)?;
+        self.trigger_auto_backup();
+        info!(self.logger, "Issue asset NIA completed");
+        Ok(asset)
+    }
+
+    /// Established NIA issuance without scheduling persistence or backup.
+    /// For isolated encrypted snapshot producers only. Later failures may leave
+    /// partial state; callers must discard/poison the handle, never retry.
+    pub fn issue_asset_nia_in_memory(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        amounts: Vec<u64>,
+    ) -> Result<AssetNIA, Error> {
         info!(
             self.logger,
             "Issuing NIA asset with ticker '{}' name '{}' precision '{}' amounts '{:?}'...",
@@ -1805,10 +1822,6 @@ impl Wallet {
 
         let asset = AssetNIA::get_asset_details(self, &asset, None, None, None, None, None, None)?;
 
-        self.update_backup_info(false)?;
-        self.trigger_auto_backup();
-
-        info!(self.logger, "Issue asset NIA completed");
         Ok(asset)
     }
 
@@ -3015,6 +3028,18 @@ impl Wallet {
     /// This Rust-only query does not authenticate a caller or chain state.
     pub fn is_local_script(&self, script: &bitcoin::Script) -> bool {
         self.bdk_wallet.is_mine(script.into())
+    }
+
+    /// Reveal a funding address into the in-memory BDK changeset only.
+    /// No wallet snapshot write/backup or signing. The encrypted consumer must
+    /// commit this state explicitly before funding the returned address.
+    pub fn reveal_funding_address_in_memory(&mut self, colored: bool) -> Result<String, Error> {
+        let keychain = if colored {
+            KeychainKind::External
+        } else {
+            KeychainKind::Internal
+        };
+        Ok(self._get_new_address(keychain)?.to_string())
     }
 
     /// Return a new Bitcoin address from the vanilla wallet.
