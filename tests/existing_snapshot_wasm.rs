@@ -478,3 +478,78 @@ async fn memory_only_producer_real_idb() {
         "PRODUCER address state/restore, unfunded NIA refusal, real-IDB bytes/schema and delayed writes0 PASS; successful issuance untested"
     );
 }
+
+/// Real recipient rows survive complete snapshot restoration; no financial
+/// consignment, indexer, settlement or snapshot persistence is exercised.
+#[wasm_bindgen_test]
+async fn memory_only_recipient_real_idb() {
+    use rgb_lib_wasm::Assignment;
+    let d = data();
+    let mut wallet = Wallet::new(d.clone()).unwrap();
+    let key = wallet.idb_key();
+    reset_db(1, "snapshots").await.unwrap();
+    record(&key, JsValue::from_str("recipient-sentinel"), true)
+        .await
+        .unwrap();
+    let original_schema = schema().await.unwrap();
+    observe("");
+    let received = wallet
+        .witness_receive_in_memory(
+            None,
+            Assignment::Fungible(7),
+            Some(0),
+            vec!["rpc://127.0.0.1:1".into()],
+            1,
+        )
+        .unwrap();
+    let rows = wallet.list_transfers(AssetFilter::Any, None).unwrap();
+    assert_eq!(rows.len(), 1);
+    let snapshot = wallet.snapshot_for_persistence().unwrap();
+    let mut restored = Wallet::restore_existing_snapshot(d.clone(), snapshot).unwrap();
+    assert_eq!(
+        serde_json::to_value(restored.list_transfers(AssetFilter::Any, None).unwrap()).unwrap(),
+        serde_json::to_value(rows).unwrap()
+    );
+    // New receive/address reveal is not a fabricated financial transfer.
+    let next = restored
+        .witness_receive_in_memory(
+            None,
+            Assignment::Fungible(1),
+            Some(0),
+            vec!["rpc://127.0.0.1:1".into()],
+            1,
+        )
+        .unwrap();
+    assert_ne!(received.recipient_id, next.recipient_id);
+    // Each failure uses a distinct restored handle and is discarded immediately.
+    let frozen = serde_json::to_string(&wallet.snapshot_for_persistence().unwrap()).unwrap();
+    for (recipient, bytes) in [
+        ("foreign".to_string(), "AA=="),
+        (received.recipient_id.clone(), "!invalid"),
+        (received.recipient_id, "AA=="),
+    ] {
+        let mut candidate =
+            Wallet::restore_existing_snapshot(d.clone(), serde_json::from_str(&frozen).unwrap())
+                .unwrap();
+        assert!(
+            candidate
+                .import_witness_consignment_in_memory(recipient, bytes.into(), "00".repeat(32), 0)
+                .await
+                .is_err()
+        );
+        drop(candidate);
+    }
+    drop(wallet);
+    drop(restored);
+    backup_turn().await;
+    assert_eq!(unobserve(), r#"{"writes":0,"reads":0}"#);
+    assert_eq!(schema().await.unwrap(), original_schema);
+    assert_eq!(
+        record(&key, JsValue::NULL, false)
+            .await
+            .unwrap()
+            .as_string()
+            .unwrap(),
+        "recipient-sentinel"
+    );
+}

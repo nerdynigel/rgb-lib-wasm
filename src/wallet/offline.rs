@@ -2962,6 +2962,28 @@ impl Wallet {
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
     ) -> Result<ReceiveData, Error> {
+        let received = self.witness_receive_in_memory(
+            asset_id,
+            assignment,
+            duration_seconds,
+            transport_endpoints,
+            min_confirmations,
+        )?;
+        self.update_backup_info(false)?;
+        self.trigger_auto_backup();
+        Ok(received)
+    }
+
+    /// Establish the ordinary witness recipient and pending rows in memory.
+    /// No snapshot/backup. Errors may mutate memory: isolated callers must discard.
+    pub fn witness_receive_in_memory(
+        &mut self,
+        asset_id: Option<String>,
+        assignment: Assignment,
+        duration_seconds: Option<u32>,
+        transport_endpoints: Vec<String>,
+        min_confirmations: u8,
+    ) -> Result<ReceiveData, Error> {
         info!(
             self.logger,
             "Receiving via witness TX for asset '{:?}' with duration '{:?}'...",
@@ -2987,9 +3009,6 @@ impl Wallet {
                 script: ActiveValue::Set(script_pubkey.to_hex_string()),
                 ..Default::default()
             })?;
-
-        self.update_backup_info(false)?;
-        self.trigger_auto_backup();
 
         info!(self.logger, "Witness receive completed");
         Ok(ReceiveData {

@@ -2325,7 +2325,11 @@ impl Wallet {
         proxy_url: String,
         recipient_id: String,
         updated_batch_transfer: &mut DbBatchTransferActMod,
+        local_only: bool,
     ) -> Result<Option<DbBatchTransfer>, Error> {
+        if local_only {
+            return Err(Error::InvalidConsignment);
+        }
         debug!(
             self.logger,
             "Refusing invalid consignment for {recipient_id}"
@@ -2451,6 +2455,32 @@ impl Wallet {
             return Ok(None);
         };
 
+        self.receive_consignment_core(
+            batch_transfer,
+            &asset_transfer,
+            &transfer,
+            recipient_id,
+            consignment,
+            proxy_url,
+            txid,
+            vout,
+            false,
+        )
+        .await
+    }
+
+    async fn receive_consignment_core(
+        &mut self,
+        batch_transfer: &DbBatchTransfer,
+        asset_transfer: &DbAssetTransfer,
+        transfer: &DbTransfer,
+        recipient_id: String,
+        consignment: String,
+        proxy_url: String,
+        txid: String,
+        vout: Option<u32>,
+        local_only: bool,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
 
         // decode consignment bytes
@@ -2459,7 +2489,12 @@ impl Wallet {
             Err(e) => {
                 error!(self.logger, "Failed to decode consignment bytes: {e}");
                 return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    ._refuse_consignment_async(
+                        proxy_url,
+                        recipient_id,
+                        &mut updated_batch_transfer,
+                        local_only,
+                    )
                     .await;
             }
         };
@@ -2474,12 +2509,23 @@ impl Wallet {
             Err(e) => {
                 error!(self.logger, "Failed to deserialize consignment: {e}");
                 return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    ._refuse_consignment_async(
+                        proxy_url,
+                        recipient_id,
+                        &mut updated_batch_transfer,
+                        local_only,
+                    )
                     .await;
             }
         };
         let contract_id = consignment.contract_id();
         let asset_id = contract_id.to_string();
+
+        // Direct isolated import supports only the existing NIA path without media.
+        // No remote reject-list or media fetch is permitted in the memory-only API.
+        if local_only && AssetSchema::try_from(consignment.schema_id())? != AssetSchema::Nia {
+            return Err(Error::InvalidConsignment);
+        }
 
         // validate consignment
         if let Some(aid) = asset_transfer.asset_id.clone() {
@@ -2489,7 +2535,12 @@ impl Wallet {
                     "Received a different asset than the expected one"
                 );
                 return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    ._refuse_consignment_async(
+                        proxy_url,
+                        recipient_id,
+                        &mut updated_batch_transfer,
+                        local_only,
+                    )
                     .await;
             }
         }
@@ -2499,7 +2550,12 @@ impl Wallet {
             Err(_) => {
                 error!(self.logger, "Received an invalid TXID from the proxy");
                 return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    ._refuse_consignment_async(
+                        proxy_url,
+                        recipient_id,
+                        &mut updated_batch_transfer,
+                        local_only,
+                    )
                     .await;
             }
         };
@@ -2525,7 +2581,12 @@ impl Wallet {
             Err(ValidationError::InvalidConsignment(e)) => {
                 error!(self.logger, "Consignment is invalid: {}", e);
                 return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    ._refuse_consignment_async(
+                        proxy_url,
+                        recipient_id,
+                        &mut updated_batch_transfer,
+                        local_only,
+                    )
                     .await;
             }
             Err(ValidationError::ResolverError(e)) => {
@@ -2561,6 +2622,7 @@ impl Wallet {
                                         proxy_url,
                                         recipient_id,
                                         &mut updated_batch_transfer,
+                                        local_only,
                                     )
                                     .await;
                             }
@@ -2571,6 +2633,7 @@ impl Wallet {
                                     proxy_url,
                                     recipient_id,
                                     &mut updated_batch_transfer,
+                                    local_only,
                                 )
                                 .await;
                         }
@@ -2581,6 +2644,7 @@ impl Wallet {
                                 proxy_url,
                                 recipient_id,
                                 &mut updated_batch_transfer,
+                                local_only,
                             )
                             .await;
                     }
@@ -2594,6 +2658,7 @@ impl Wallet {
                             proxy_url,
                             recipient_id,
                             &mut updated_batch_transfer,
+                            local_only,
                         )
                         .await;
                 }
@@ -2604,7 +2669,12 @@ impl Wallet {
                 "Cannot find the provided TXID in the consignment"
             );
             return self
-                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                ._refuse_consignment_async(
+                    proxy_url,
+                    recipient_id,
+                    &mut updated_batch_transfer,
+                    local_only,
+                )
                 .await;
         }
 
@@ -2614,7 +2684,12 @@ impl Wallet {
                 "The wallet doesn't support the provided schema: {}", asset_schema
             );
             return self
-                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                ._refuse_consignment_async(
+                    proxy_url,
+                    recipient_id,
+                    &mut updated_batch_transfer,
+                    local_only,
+                )
                 .await;
         }
 
@@ -2634,7 +2709,12 @@ impl Wallet {
         if received.is_empty() {
             error!(self.logger, "Cannot find any receiving assignment");
             return self
-                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                ._refuse_consignment_async(
+                    proxy_url,
+                    recipient_id,
+                    &mut updated_batch_transfer,
+                    local_only,
+                )
                 .await;
         };
 
@@ -2669,6 +2749,7 @@ impl Wallet {
                             proxy_url,
                             recipient_id,
                             &mut updated_batch_transfer,
+                            local_only,
                         )
                         .await;
                 } else {
@@ -2705,6 +2786,9 @@ impl Wallet {
                         }
                     }
                 };
+                if local_only && !attachments.is_empty() {
+                    return Err(Error::InvalidConsignment);
+                }
                 for attachment in attachments {
                     let digest = hex::encode(attachment.digest);
                     // on wasm32, skip media file download/storage (no filesystem)
@@ -2729,6 +2813,7 @@ impl Wallet {
                                     proxy_url,
                                     recipient_id,
                                     &mut updated_batch_transfer,
+                                    local_only,
                                 )
                                 .await;
                         }
@@ -2743,6 +2828,7 @@ impl Wallet {
                                 proxy_url,
                                 recipient_id,
                                 &mut updated_batch_transfer,
+                                local_only,
                             )
                             .await;
                     }
@@ -2750,9 +2836,13 @@ impl Wallet {
 
                 let wasm_resolver_import =
                     WasmResolver::from_consignment(&consignment, self.chain_net());
-                runtime
-                    .import_contract(valid_contract.clone(), &wasm_resolver_import)
-                    .expect("failure importing received contract");
+                let imported =
+                    runtime.import_contract(valid_contract.clone(), &wasm_resolver_import);
+                if local_only {
+                    imported.map_err(InternalError::from)?;
+                } else {
+                    imported.expect("failure importing received contract");
+                }
                 debug!(self.logger, "Contract registered");
                 self.save_new_asset_internal(
                     &runtime,
@@ -2774,22 +2864,24 @@ impl Wallet {
             "Consignment is valid. Received '{:?}' of contract '{}'", received, asset_id
         );
 
-        match self
-            .wasm_proxy_client
-            .post_ack(&proxy_url, recipient_id, true)
-            .await
-        {
-            Ok(r) => {
-                debug!(self.logger, "Consignment ACK response: {:?}", r);
-            }
-            Err(e) if e.to_string().contains("Cannot change ACK") => {
-                warn!(self.logger, "Found an NACK when trying ACK");
-            }
-            Err(e) => {
-                error!(self.logger, "Failed to post ACK: {e}");
-                return Err(e);
-            }
-        };
+        if !local_only {
+            match self
+                .wasm_proxy_client
+                .post_ack(&proxy_url, recipient_id, true)
+                .await
+            {
+                Ok(r) => {
+                    debug!(self.logger, "Consignment ACK response: {:?}", r);
+                }
+                Err(e) if e.to_string().contains("Cannot change ACK") => {
+                    warn!(self.logger, "Found an NACK when trying ACK");
+                }
+                Err(e) => {
+                    error!(self.logger, "Failed to post ACK: {e}");
+                    return Err(e);
+                }
+            };
+        }
 
         let utxo_idx = match transfer.recipient_type {
             Some(RecipientTypeFull::Blind { ref unblinded_utxo }) => {
@@ -2834,6 +2926,99 @@ impl Wallet {
             self.database
                 .update_batch_transfer(&mut updated_batch_transfer)?,
         ))
+    }
+
+    /// Import exact caller-supplied NIA consignment into an established witness
+    /// receive, preserving ordinary asset/transfer/coloring rows. No proxy ACK,
+    /// network, flush or backup. Validation failure requires discard by caller.
+    pub async fn import_witness_consignment_in_memory(
+        &mut self,
+        recipient_id: String,
+        consignment: String,
+        txid: String,
+        vout: u32,
+    ) -> Result<(), Error> {
+        let db = self.database.get_db_data(false)?;
+        let transfer = db
+            .transfers
+            .iter()
+            .find(|t| t.recipient_id.as_ref() == Some(&recipient_id))
+            .ok_or(Error::InvalidConsignment)?;
+        if !matches!(
+            transfer.recipient_type,
+            Some(RecipientTypeFull::Witness { vout: None })
+        ) {
+            return Err(Error::InvalidConsignment);
+        }
+        let asset = db
+            .asset_transfers
+            .iter()
+            .find(|a| a.idx == transfer.asset_transfer_idx)
+            .ok_or(Error::InvalidConsignment)?;
+        let batch = db
+            .batch_transfers
+            .iter()
+            .find(|b| b.idx == asset.batch_transfer_idx)
+            .ok_or(Error::InvalidConsignment)?;
+        if !batch.waiting_counterparty() || !batch.incoming(&db.asset_transfers, &db.transfers)? {
+            return Err(Error::InvalidConsignment);
+        }
+        self.receive_consignment_core(
+            batch,
+            asset,
+            transfer,
+            recipient_id,
+            consignment,
+            String::new(),
+            txid,
+            Some(vout),
+            true,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Reconcile only incoming WaitingConfirmations rows using the established
+    /// indexer/stock path. Explicit network read/sync; no send/ACK/broadcast,
+    /// wallet snapshot or backup. Any error must discard the isolated handle.
+    pub async fn settle_witness_receives_in_memory(
+        &mut self,
+        online: Online,
+    ) -> Result<RefreshResult, Error> {
+        self.check_online(online)?;
+        let db = self.database.get_db_data(false)?;
+        let mut result = HashMap::new();
+        for batch in &db.batch_transfers {
+            if !batch.waiting_confirmations()
+                || !batch.incoming(&db.asset_transfers, &db.transfers)?
+            {
+                continue;
+            }
+            let batch_data = batch.get_transfers(&db.asset_transfers, &db.transfers)?;
+            let (asset, transfer) = self.database.get_incoming_transfer(&batch_data)?;
+            if !matches!(
+                transfer.recipient_type,
+                Some(RecipientTypeFull::Witness { vout: Some(_) })
+            ) || self
+                .database
+                .check_asset_exists(asset.asset_id.ok_or(Error::InvalidConsignment)?)?
+                .schema
+                != AssetSchema::Nia
+            {
+                return Err(Error::InvalidConsignment);
+            }
+            let updated = self
+                ._wait_confirmations_async(batch, &db, true, false)
+                .await?;
+            result.insert(
+                batch.idx,
+                RefreshedTransfer {
+                    updated_status: updated.map(|b| b.status),
+                    failure: None,
+                },
+            );
+        }
+        Ok(result)
     }
 
     async fn _wait_ack_async(
