@@ -1141,24 +1141,6 @@ impl InMemoryDb {
             .filter(|a| a.asset_id == Some(asset_id.clone()))
             .collect();
 
-        // Deduplicate: an incoming Witness receive can be counted both via its
-        // pending txo allocation (`ass_pending_incoming`) and via the transfer's
-        // `requested_assignment` (`witness_pending`), doubling the amount while
-        // the batch waits for confirmations. Collect the receive outpoints that
-        // already carry a pending incoming allocation so the transfer path can
-        // skip them (same receive counted exactly once).
-        let pending_incoming_outpoints: std::collections::HashSet<Outpoint> = txos_allocations
-            .iter()
-            .filter(|u| {
-                u.rgb_allocations.iter().any(|a| {
-                    a.asset_id.as_deref() == Some(asset_id.as_str())
-                        && a.incoming
-                        && a.status.pending()
-                })
-            })
-            .map(|u| u.utxo.outpoint())
-            .collect();
-
         let settled: u64 = ass_allocations
             .iter()
             .filter(|a| a.settled())
@@ -1175,14 +1157,16 @@ impl InMemoryDb {
             .filter(|t| {
                 t.incoming && matches!(t.recipient_type, Some(RecipientTypeFull::Witness { .. }))
             })
-            .filter(|t| match t.receive_utxo {
-                Some(op) => !pending_incoming_outpoints.contains(&op),
-                None => true,
-            })
             .filter_map(
                 |t| match t.related_transfers(&asset_transfers, &batch_transfers) {
                     Ok((at, bt)) => {
-                        if bt.status.waiting_confirmations() {
+                        // Count the invoice's requested assignment only BEFORE the
+                        // consignment is imported (waiting counterparty). Once
+                        // imported (waiting confirmations) the receive is already
+                        // counted via its pending txo allocation in
+                        // `ass_pending_incoming`; counting the requested
+                        // assignment here too would double the amount.
+                        if bt.status.waiting_counterparty() {
                             if at.asset_id.as_deref() != Some(asset_id.as_str()) {
                                 return None;
                             }
