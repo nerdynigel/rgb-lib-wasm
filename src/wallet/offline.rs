@@ -1033,6 +1033,106 @@ impl Wallet {
         Ok(wallet)
     }
 
+    /// Strictly restore an existing durable snapshot; never bootstrap a wallet.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn load_existing_snapshot(wallet_data: WalletData) -> Result<Self, Error> {
+        let key = PathBuf::from(&wallet_data.data_dir)
+            .join(&wallet_data.master_fingerprint)
+            .to_string_lossy()
+            .to_string();
+        let snapshot = super::idb_store::load_existing_snapshot(&key)
+            .await
+            .map_err(|details| Error::Persistence { details })?;
+        Self::restore_existing_snapshot(wallet_data, snapshot)
+    }
+
+    /// Construct only from complete persisted state. No schema imports, new BDK
+    /// wallet, receipt reconciliation, snapshot/flush or implicit persistence.
+    /// Consumers using encrypted envelopes authenticate/decrypt before this call.
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn restore_existing_snapshot(
+        wallet_data: WalletData,
+        snapshot: super::idb_store::WalletSnapshot,
+    ) -> Result<Self, Error> {
+        let invalid = || Error::Persistence {
+            details: s!("existing snapshot restore failed"),
+        };
+        let (Some(stash), Some(state), Some(index)) = (
+            snapshot.stock_stash_b64.as_ref(),
+            snapshot.stock_state_b64.as_ref(),
+            snapshot.stock_index_b64.as_ref(),
+        ) else {
+            return Err(invalid());
+        };
+        let stock =
+            super::idb_store::deserialize_stock(stash, state, index).map_err(|_| invalid())?;
+        let changeset = snapshot.bdk_changeset.ok_or_else(invalid)?;
+        let wdata = &wallet_data;
+        let network = BdkNetwork::from(wdata.bitcoin_network);
+        let xpub_rgb = str_to_xpub(&wdata.account_xpub_colored, network)?;
+        let xpub_btc = str_to_xpub(&wdata.account_xpub_vanilla, network)?;
+        let (colored, vanilla, watch_only) = if let Some(mnemonic) = &wdata.mnemonic {
+            let (c, v) = get_descriptors(
+                wdata.bitcoin_network,
+                mnemonic,
+                wdata.vanilla_keychain,
+                xpub_btc,
+                xpub_rgb,
+            )?;
+            (c, v, false)
+        } else {
+            let (c, v) = get_descriptors_from_xpubs(
+                wdata.bitcoin_network,
+                &wdata.master_fingerprint,
+                xpub_rgb,
+                xpub_btc,
+                wdata.vanilla_keychain,
+            )?;
+            (c, v, true)
+        };
+        let chain_net: ChainNet = wdata.bitcoin_network.into();
+        let mut params = BdkWallet::load()
+            .descriptor(KeychainKind::External, Some(colored))
+            .descriptor(KeychainKind::Internal, Some(vanilla))
+            .check_genesis_hash(BlockHash::from_byte_array(
+                chain_net.chain_hash().to_bytes(),
+            ));
+        if !watch_only {
+            params = params.extract_keys();
+        }
+        let mut bdk_database = super::memory_store::MemoryStore::new();
+        bdk_database.set_data(Some(changeset));
+        let bdk_wallet = params
+            .load_wallet(&mut bdk_database)
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?;
+        let wallet_dir = PathBuf::from(&wdata.data_dir).join(&wdata.master_fingerprint);
+        Ok(Self {
+            wallet_data,
+            logger: Logger::root(slog::Discard, o!()),
+            _logger_guard: (),
+            watch_only,
+            database: Arc::new(snapshot.db),
+            wallet_dir,
+            bdk_wallet,
+            bdk_database,
+            reuse_address_index: snapshot.reuse_address_index,
+            #[cfg(feature = "esplora")]
+            wasm_proxy_client: crate::api::proxy::WasmProxyClient::new()?,
+            #[cfg(feature = "esplora")]
+            online_data: None,
+            #[cfg(feature = "esplora")]
+            transfer_artifacts: snapshot.transfer_artifacts,
+            #[cfg(feature = "esplora")]
+            received_consignments: snapshot.received_consignments,
+            idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(snapshot.sequence)),
+            rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(Some(stock))),
+            vss_client: None,
+            last_vss_backup_error: std::cell::RefCell::new(None),
+        })
+    }
+
     /// Create a new RGB wallet based on the provided [`WalletData`].
     #[allow(clippy::arc_with_non_send_sync)] // wasm32 is single-threaded; Arc matches native API
     pub fn new(wallet_data: WalletData) -> Result<Self, Error> {

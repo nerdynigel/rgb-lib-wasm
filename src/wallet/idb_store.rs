@@ -160,6 +160,88 @@ pub fn deserialize_stock(
     Ok(rgbstd::persistence::Stock::with(stash, state, index))
 }
 
+// The ordinary Rexie builder is deliberately excluded: it installs an upgrade
+// handler which creates stores. This request uses one connection and aborts any
+// versionchange transaction before it can commit even an empty database.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+export function readExistingSnapshot(databaseName, storeName, key, expectedVersion) {
+  return new Promise((resolve, reject) => {
+    let request;
+    let blocked = false;
+    try { request = globalThis.indexedDB.open(databaseName, expectedVersion); }
+    catch (_) { reject('IndexedDB open failed'); return; }
+    request.onupgradeneeded = () => {
+      try { request.transaction.abort(); }
+      catch (_) { reject('IndexedDB upgrade abort failed'); }
+    };
+    request.onerror = () => reject('IndexedDB existing database open failed');
+    request.onblocked = () => { blocked = true; reject('IndexedDB existing database open blocked'); };
+    request.onsuccess = () => {
+      const db = request.result;
+      if (blocked) { db.close(); return; }
+      // A blocked request can eventually succeed; Promise settlement alone does
+      // not cancel it. Still close it without opening a transaction.
+      if (db.version !== expectedVersion || !db.objectStoreNames.contains(storeName)) {
+        db.close(); reject('IndexedDB existing schema invalid'); return;
+      }
+      let tx;
+      try {
+        tx = db.transaction([storeName], 'readonly');
+        let value;
+        const get = tx.objectStore(storeName).get(key);
+        get.onsuccess = () => { value = get.result; };
+        get.onerror = () => { /* transaction abort supplies the failure */ };
+        tx.onabort = () => { db.close(); reject('IndexedDB snapshot read aborted'); };
+        tx.onerror = () => { db.close(); reject('IndexedDB snapshot read failed'); };
+        tx.oncomplete = () => {
+          db.close();
+          if (typeof value !== 'string') reject('IndexedDB snapshot missing or invalid');
+          else resolve(value);
+        };
+      } catch (_) {
+        if (tx) { try { tx.abort(); } catch (_) {} }
+        db.close(); reject('IndexedDB snapshot read failed');
+      }
+    };
+  });
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(catch, js_name = readExistingSnapshot)]
+    async fn read_existing_snapshot(
+        database_name: &str,
+        store_name: &str,
+        key: &str,
+        expected_version: u32,
+    ) -> Result<JsValue, JsValue>;
+}
+
+/// Read one existing record without creating/upgrading the database or writing.
+/// This engine's snapshot format is JSON; encrypted consumer envelopes must be
+/// authenticated by that consumer before calling `restore_existing_snapshot`.
+#[cfg(target_arch = "wasm32")]
+pub async fn read_existing_snapshot_bytes(key: &str) -> Result<String, String> {
+    let value = read_existing_snapshot(DB_NAME, STORE_NAME, key, DB_VERSION)
+        .await
+        .map_err(|e| {
+            e.as_string()
+                .unwrap_or_else(|| "IndexedDB snapshot read failed".into())
+        })?;
+    value
+        .as_string()
+        .ok_or_else(|| "IndexedDB snapshot invalid".into())
+}
+
+/// Decode the engine's JSON format with strict storage semantics. Encrypted
+/// consumers use `read_existing_snapshot_bytes`, authenticate their envelope,
+/// deserialize, then call `Wallet::restore_existing_snapshot`.
+#[cfg(target_arch = "wasm32")]
+pub async fn load_existing_snapshot(key: &str) -> Result<WalletSnapshot, String> {
+    let json = read_existing_snapshot_bytes(key).await?;
+    serde_json::from_str(&json).map_err(|_| "Snapshot deserialization failed".into())
+}
+
 /// Load a wallet snapshot from IndexedDB for the given key.
 pub async fn load_snapshot(key: &str) -> Result<Option<WalletSnapshot>, String> {
     let db = open_db().await?;
