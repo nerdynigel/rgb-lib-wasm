@@ -263,6 +263,21 @@ async fn encoded_snapshot_commit_real_idb() {
     assert_eq!(schema().await.unwrap().as_string().unwrap(), "absent");
     save_encoded_snapshot(&key, None, &raw).await.unwrap();
     assert_eq!(read_existing_snapshot_bytes(&key).await.unwrap(), raw);
+    // A committed stored undefined is an existing corrupt record, not absence.
+    record("undefined-record", JsValue::UNDEFINED, true)
+        .await
+        .unwrap();
+    assert!(
+        save_encoded_snapshot("undefined-record", None, "replacement")
+            .await
+            .is_err()
+    );
+    assert!(
+        record("undefined-record", JsValue::NULL, false)
+            .await
+            .unwrap()
+            .is_undefined()
+    );
     assert!(
         save_encoded_snapshot(&key, None, "replacement")
             .await

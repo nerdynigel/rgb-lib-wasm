@@ -58,8 +58,15 @@ Source review found that IDB get alone conflates absent keys with stored
 undefined. The explicit writer now issues count(key) BEFORE get in the same
 readwrite transaction, requires count0 for insert and count1 plus exact bytes
 for replacement. Undefined/corrupt existing records cannot be silently replaced.
-Affected actual Firefox engine test rerun PASS, now including native stored
-undefined collision refusal; profilee8935efc-bc6c-4bfe-bcf0-3f176f628770 retained.
+Correction to initial e2fd4f6 receipt: the test insertion did not apply, so that
+rerun covered EXISTING cases only, not undefined collision. Profilee8935efc-bc6c-4bfe-bcf0-3f176f628770 retained. The explicit new regression is added and
+executed below; do not attribute undefined proof to the preceding rerun.
 Prior profile and initial source receipt preserved; neither result is financial
 acceptance. Test compile/scoped fmt/diff PASS. Follow-up wallet release-artifact
 regression reproduces the prior defect before the corrected candidate rebuild.
+
+Explicit new undefined-record regression compiled and actually ran PASS in
+fresh retained profile74a76e50-0a7b-45f6-bd45-66543c87b229. Test commits native
+undefined, requires insert refusal and reads unchanged undefined afterwards.
+Wallet old release artifact31371eaf separately reproduced FAIL (producerError
+empty; before/after setup hash changed) on fresh retained profiledaf8c1da-0251-4662-b448-49fad5220e2e; corrected release wallet proof follows downstream.
