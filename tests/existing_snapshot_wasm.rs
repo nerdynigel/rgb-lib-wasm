@@ -61,6 +61,7 @@ export function observe(mode) {
     return r;
   };
 }
+export async function backupTurn() { await new Promise(resolve => setTimeout(resolve, 50)); }
 export function unobserve() {
   IDBObjectStore.prototype.get = getOriginal;
   IDBDatabase.prototype.transaction = txOriginal;
@@ -74,6 +75,8 @@ extern "C" {
     async fn record(key: &str, value: JsValue, write: bool) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(catch)]
     async fn schema() -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(js_name = backupTurn)]
+    async fn backup_turn();
     fn observe(mode: &str);
     fn unobserve() -> String;
 }
@@ -309,5 +312,112 @@ async fn encoded_snapshot_commit_real_idb() {
     assert_eq!(schema().await.unwrap().as_string().unwrap(), "2:sentinel");
     console_log!(
         "ENCODED_SNAPSHOT actual engine serialization/restore and real-IDB commit/CAS/abort/schema PASS; unfunded only"
+    );
+}
+
+/// Refusal proof only: no financial mutation or successful consumption claim.
+#[wasm_bindgen_test]
+async fn memory_only_pending_refusals_real_idb() {
+    use rgb_lib_wasm::bitcoin::{Psbt, Transaction, absolute, transaction};
+    use rgb_lib_wasm::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
+    use std::collections::HashMap;
+    use std::str::FromStr;
+    let d = data();
+    let key = format!("{}/{}", d.data_dir, d.master_fingerprint);
+    reset_db(1, "snapshots").await.unwrap();
+    let wallet = Wallet::new(d).unwrap();
+    let mut baseline = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+    let first_sequence = baseline["sequence"].as_u64().unwrap();
+    baseline.as_object_mut().unwrap().remove("sequence");
+    record(&key, JsValue::from_str("encrypted-sentinel"), true)
+        .await
+        .unwrap();
+    let original_schema = schema().await.unwrap();
+    let mut psbt = Psbt::from_unsigned_tx(Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![],
+    })
+    .unwrap();
+    let original_psbt = psbt.clone();
+    observe("");
+    assert!(
+        wallet
+            .color_psbt_and_consume_in_memory(
+                &mut psbt,
+                ColoringInfo {
+                    asset_info_map: HashMap::new(),
+                    static_blinding: None,
+                    nonce: None,
+                }
+            )
+            .is_err()
+    );
+    assert_eq!(psbt, original_psbt);
+    // Nonempty unknown contract reaches the shared coloring path, which adds
+    // OP_RETURN to its candidate before refusing stock lookup. Caller PSBT and
+    // complete stock/database state must still remain unchanged.
+    let unknown =
+        rgb_lib_wasm::ContractId::from_str("rgb:qFuT6DN8-9AuO95M-7R8R8Mc-AZvs7zG-obum1Va-BRnweKk")
+            .unwrap();
+    assert!(
+        wallet
+            .color_psbt_and_consume_in_memory(
+                &mut psbt,
+                ColoringInfo {
+                    asset_info_map: HashMap::from([(
+                        unknown,
+                        AssetColoringInfo {
+                            output_map: HashMap::from([(0, 1)]),
+                            static_blinding: Some(1),
+                        }
+                    )]),
+                    static_blinding: Some(1),
+                    nonce: Some(1),
+                }
+            )
+            .is_err()
+    );
+    assert_eq!(psbt, original_psbt);
+    assert!(
+        wallet
+            .register_collaborative_outgoing_transfer_in_memory(
+                "00".repeat(32),
+                "unknown".into(),
+                vec![],
+                None,
+                1,
+            )
+            .is_err()
+    );
+    assert!(
+        wallet
+            .register_collaborative_outgoing_transfer_in_memory(
+                "00".repeat(32),
+                "unknown".into(),
+                vec![format!("{}:0", "00".repeat(32))],
+                None,
+                1,
+            )
+            .is_err()
+    );
+    // Let scheduled backup run, if either new seam accidentally queued it.
+    backup_turn().await;
+    let counts: serde_json::Value = serde_json::from_str(&unobserve()).unwrap();
+    assert_eq!(counts["writes"], 0);
+    assert_eq!(counts["reads"], 0);
+    let mut after = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+    assert_eq!(after["sequence"].as_u64().unwrap(), first_sequence + 1);
+    after.as_object_mut().unwrap().remove("sequence");
+    assert_eq!(after, baseline);
+    assert_eq!(schema().await.unwrap(), original_schema);
+    assert_eq!(
+        record(&key, JsValue::NULL, false)
+            .await
+            .unwrap()
+            .as_string()
+            .unwrap(),
+        "encrypted-sentinel"
     );
 }

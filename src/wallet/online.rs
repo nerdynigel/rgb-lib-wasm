@@ -1157,6 +1157,35 @@ impl Wallet {
         change: Option<(u32, u64)>,
         min_confirmations: u8,
     ) -> Result<Option<i32>, Error> {
+        let result = self.register_collaborative_outgoing_transfer_in_memory(
+            txid,
+            asset_id,
+            spent_outpoints,
+            change,
+            min_confirmations,
+        )?;
+        if result.is_some() {
+            #[cfg(target_arch = "wasm32")]
+            {
+                self.update_backup_info(false)?;
+                self.trigger_auto_backup();
+            }
+        }
+        Ok(result)
+    }
+
+    /// Register the same real outgoing rows as the ordinary collaborative path,
+    /// without scheduling backup or writing IndexedDB. This is not authorization.
+    /// Caller owns exact transaction/recipient validation and complete snapshot
+    /// commit; discard its isolated wallet on any mutation or commit error.
+    pub fn register_collaborative_outgoing_transfer_in_memory(
+        &self,
+        txid: String,
+        asset_id: String,
+        spent_outpoints: Vec<String>,
+        change: Option<(u32, u64)>,
+        min_confirmations: u8,
+    ) -> Result<Option<i32>, Error> {
         let change_amount = change.map(|(_, amount)| amount).unwrap_or(0);
         if spent_outpoints.is_empty() && change_amount == 0 {
             return Err(Error::Internal {
@@ -1392,14 +1421,6 @@ impl Wallet {
             ..Default::default()
         };
         self.database.set_transfer(db_transfer)?;
-
-        // Schedule the IndexedDB auto-backup on wasm. Native builds have no
-        // IndexedDB (`js_sys` is wasm-only); there the caller owns persistence.
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.update_backup_info(false)?;
-            self.trigger_auto_backup();
-        }
 
         info!(
             self.logger,

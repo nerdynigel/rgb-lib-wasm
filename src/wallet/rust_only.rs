@@ -292,6 +292,49 @@ impl Wallet {
         psbt: &mut Psbt,
         coloring_info: ColoringInfo,
     ) -> Result<Vec<RgbTransfer>, Error> {
+        let transfers = self.color_psbt_and_consume_inner(psbt, coloring_info)?;
+        self.flush().await?;
+        info!(self.logger, "Color PSBT and consume completed");
+        Ok(transfers)
+    }
+
+    /// Color and consume using the established engine path, without persistence.
+    ///
+    /// The caller must validate immutable consent and every recipient BEFORE calling,
+    /// then register outgoing rows and explicitly commit the complete snapshot. This
+    /// method supplies neither authorization nor durable accounting. Any error may
+    /// leave stock partially mutated: discard the isolated wallet, never retry it.
+    /// The caller's PSBT is replaced only on success. No backup is scheduled.
+    pub fn color_psbt_and_consume_in_memory(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+    ) -> Result<Vec<RgbTransfer>, Error> {
+        if coloring_info.asset_info_map.is_empty() {
+            return Err(Error::InvalidColoringInfo {
+                details: s!("no assets requested for in-memory consumption"),
+            });
+        }
+        let stock = self.rgb_stock.try_borrow().map_err(|_| Error::Internal {
+            details: s!("RGB runtime already in use"),
+        })?;
+        if stock.is_none() {
+            return Err(Error::Internal {
+                details: s!("RGB stock unavailable for in-memory consumption"),
+            });
+        }
+        drop(stock);
+        let mut candidate = psbt.clone();
+        let transfers = self.color_psbt_and_consume_inner(&mut candidate, coloring_info)?;
+        *psbt = candidate;
+        Ok(transfers)
+    }
+
+    fn color_psbt_and_consume_inner(
+        &self,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+    ) -> Result<Vec<RgbTransfer>, Error> {
         info!(self.logger, "Coloring PSBT and consuming...");
         let (fascia, asset_beneficiaries) = self.color_psbt(psbt, coloring_info.clone())?;
 
@@ -323,9 +366,6 @@ impl Wallet {
             )?);
         }
         drop(runtime);
-        self.flush().await?;
-
-        info!(self.logger, "Color PSBT and consume completed");
         Ok(transfers)
     }
 

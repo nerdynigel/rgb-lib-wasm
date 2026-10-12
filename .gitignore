@@ -16,3 +16,5 @@ target
 
 # Retained disposable unfunded browser profiles; never publish profile contents
 .state/the876-encoded-writer/
+
+.state/the876-memory-only/
