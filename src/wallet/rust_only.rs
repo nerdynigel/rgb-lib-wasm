@@ -85,6 +85,10 @@ impl Wallet {
             opreturn_first = true;
         }
 
+        // Only shift the caller's allocation vouts when THIS function inserts the
+        // OP_RETURN at index 0 (no OP_RETURN present). If the caller already
+        // supplied an OP_RETURN, no output is inserted and no vout shift applies.
+        let mut inserted_opreturn_front = false;
         if !transaction
             .output
             .iter()
@@ -96,6 +100,7 @@ impl Wallet {
             };
             if opreturn_first {
                 transaction.output.insert(0, opreturn_output);
+                inserted_opreturn_front = true;
             } else {
                 transaction.output.push(opreturn_output);
             }
@@ -139,7 +144,7 @@ impl Wallet {
                 if amount == 0 {
                     continue;
                 }
-                if opreturn_first {
+                if inserted_opreturn_front {
                     vout += 1;
                 }
                 sending_amt += amount;
