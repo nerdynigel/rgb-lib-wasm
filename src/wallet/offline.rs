@@ -2909,6 +2909,14 @@ impl Wallet {
         self._get_new_address(KeychainKind::External)
     }
 
+    /// Query the live BDK wallet's indexed script membership without deriving,
+    /// revealing, syncing or persisting any address. A false result must refuse
+    /// local-output authorization; it is not evidence of foreign ownership.
+    /// This Rust-only query does not authenticate a caller or chain state.
+    pub fn is_local_script(&self, script: &bitcoin::Script) -> bool {
+        self.bdk_wallet.is_mine(script.into())
+    }
+
     /// Return a new Bitcoin address from the vanilla wallet.
     pub fn get_address(&mut self) -> Result<String, Error> {
         info!(self.logger, "Getting address...");
@@ -3264,6 +3272,70 @@ mod address_reuse_tests {
             vss_client: None,
             last_vss_backup_error: std::cell::RefCell::new(None),
         }
+    }
+
+    #[test]
+    fn local_script_membership_is_read_only() {
+        let wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let external = wallet
+            .bdk_wallet
+            .peek_address(KeychainKind::External, 0)
+            .address
+            .script_pubkey();
+        let internal = wallet
+            .bdk_wallet
+            .peek_address(KeychainKind::Internal, 0)
+            .address
+            .script_pubkey();
+        let foreign = make_test_wallet(false)
+            .bdk_wallet
+            .peek_address(KeychainKind::External, 0)
+            .address
+            .script_pubkey();
+        let unknown = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+        let empty = bitcoin::ScriptBuf::new();
+        let before_store = serde_json::to_vec(wallet.bdk_database.get_data()).unwrap();
+        let before_stage = serde_json::to_vec(&wallet.bdk_wallet.staged()).unwrap();
+        let before_db = serde_json::to_vec(wallet.database.as_ref()).unwrap();
+        let before_stock =
+            super::super::idb_store::serialize_stock(wallet.rgb_stock.borrow().as_ref().unwrap())
+                .unwrap();
+        let before_reuse = wallet.reuse_address_index.clone();
+        let before_sequence = wallet
+            .idb_sequence
+            .load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..3 {
+            assert!(wallet.is_local_script(&external));
+            assert!(wallet.is_local_script(&internal));
+            assert!(!wallet.is_local_script(&foreign));
+            assert!(!wallet.is_local_script(&unknown));
+            assert!(!wallet.is_local_script(&empty));
+        }
+        assert_eq!(
+            serde_json::to_vec(wallet.bdk_database.get_data()).unwrap(),
+            before_store
+        );
+        assert_eq!(
+            serde_json::to_vec(&wallet.bdk_wallet.staged()).unwrap(),
+            before_stage
+        );
+        assert_eq!(
+            serde_json::to_vec(wallet.database.as_ref()).unwrap(),
+            before_db
+        );
+        assert_eq!(
+            super::super::idb_store::serialize_stock(wallet.rgb_stock.borrow().as_ref().unwrap())
+                .unwrap(),
+            before_stock
+        );
+        assert_eq!(wallet.reuse_address_index, before_reuse);
+        assert_eq!(
+            wallet
+                .idb_sequence
+                .load(std::sync::atomic::Ordering::SeqCst),
+            before_sequence
+        );
     }
 
     #[test]
