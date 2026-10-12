@@ -51,3 +51,15 @@ Compatibility:
 - rust-lightning:0939f7751fb876e02caec9cd0a778794b81eee9e unchanged
 - breaking protocol change:NO
 - peer repo update required:YES isolated facade/wallet candidate adoption
+
+## Insert-only undefined-record correction
+
+Source review found that IDB get alone conflates absent keys with stored
+undefined. The explicit writer now issues count(key) BEFORE get in the same
+readwrite transaction, requires count0 for insert and count1 plus exact bytes
+for replacement. Undefined/corrupt existing records cannot be silently replaced.
+Affected actual Firefox engine test rerun PASS, now including native stored
+undefined collision refusal; profilee8935efc-bc6c-4bfe-bcf0-3f176f628770 retained.
+Prior profile and initial source receipt preserved; neither result is financial
+acceptance. Test compile/scoped fmt/diff PASS. Follow-up wallet release-artifact
+regression reproduces the prior defect before the corrected candidate rebuild.

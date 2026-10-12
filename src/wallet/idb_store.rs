@@ -454,9 +454,9 @@ export function commitEncodedSnapshot(databaseName, storeName, key, expected, en
         tx.onabort = () => { db.close(); reject(failed); };
         tx.onerror = () => { /* abort is terminal; do not report request success */ };
         tx.oncomplete = () => { db.close(); resolve(); };
-        const store = tx.objectStore(storeName), get = store.get(key);
+        const store = tx.objectStore(storeName), count = store.count(key), get = store.get(key);
         get.onsuccess = () => {
-          if (get.result !== (expected === null ? undefined : expected)) {
+          if (expected === null ? count.result !== 0 : count.result !== 1 || get.result !== expected) {
             failed = 'IndexedDB encoded record changed'; tx.abort(); return;
           }
           try { store.put(encoded, key); }
