@@ -1,0 +1,20 @@
+{
+  "case": "19dc4dc3-f077-4e94-9074-c0dc8fd1445e",
+  "command": [
+    "/home/nigel/.cache/.wasm-pack/wasm-bindgen-ef34ece7d857f713/wasm-bindgen-test-runner",
+    "target/wasm32-unknown-unknown/debug/deps/existing_snapshot_wasm-024f3a2beba96ecc.wasm",
+    "memory_only_recipient_real_idb",
+    "--exact",
+    "--nocapture"
+  ],
+  "exit": 0,
+  "log": "Set timeout to 60 seconds...\nRunning headless tests in Firefox on `http://127.0.0.1:38705/`\nTry find `webdriver.json` for configure browser's capabilities:\nOk\nLoading Wasm module...\nusing deprecated parameters for the initialization function; pass a single object instead\n\nrunning 1 test\nInvoking test: memory_only_recipient_real_idb\ntest memory_only_recipient_real_idb ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 4 filtered out; finished in 0.89s\n\n",
+  "wasmSha256": "a6803b25612212c8b5c89be80f64d6f08b4989a20e45b644acf033e2f3a1d78e",
+  "sourceRevision": "3536e8a6d0f4e350fb18f909ce9d26b50609bc59",
+  "sourceHashes": {
+    "src/wallet/offline.rs": "f187a928567b23e701009932f8f9415bdb966de0833e35f103a4f423802b0924",
+    "src/wallet/online.rs": "ab1bf47d0866f6155d5963a6d6391521399566e72f970f8184088e40ae7cb1e8",
+    "tests/existing_snapshot_wasm.rs": "035c164becd5f9d52cb588e053adb4c90cc7eea18ee284e3fe82d2cf263b77d7",
+    "Cargo.lock": "6287c1b3bebd571efc5a78f325f52ca0274c87d77ed35d10f40d72408125014c"
+  }
+}
