@@ -1329,8 +1329,10 @@ impl Wallet {
             .ok_or_else(|| Error::Internal {
                 details: s!("collaborative change exceeds inputs"),
             })?;
-        let mut assignments_collected = AssignmentsCollection::default();
-        assignments_collected.fungible = input_amount;
+        let assignments_collected = AssignmentsCollection {
+            fungible: input_amount,
+            ..Default::default()
+        };
 
         let change_utxo_idx = if let Some((vout, _amount)) = change {
             Some(
@@ -1367,8 +1369,10 @@ impl Wallet {
             assignments_collected,
             input_btc_amt: 0,
         };
-        let mut change_collection = AssignmentsCollection::default();
-        change_collection.fungible = change_amount;
+        let change_collection = AssignmentsCollection {
+            fungible: change_amount,
+            ..Default::default()
+        };
 
         let transfer_info = InfoAssetTransfer {
             asset_info: AssetInfo {
@@ -2839,7 +2843,7 @@ impl Wallet {
                 let imported =
                     runtime.import_contract(valid_contract.clone(), &wasm_resolver_import);
                 if local_only {
-                    imported.map_err(InternalError::from)?;
+                    imported?;
                 } else {
                     imported.expect("failure importing received contract");
                 }

@@ -3193,10 +3193,7 @@ impl Wallet {
 
         Ok(super::idb_store::WalletSnapshot {
             btcx_pending_fill_v1: self.btcx_pending_fill_v1.clone(),
-            sequence: self
-                .idb_sequence
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                + 1,
+            sequence: next_snapshot_sequence(&self.idb_sequence)?,
             db: self.database.as_ref().clone(),
             bdk_changeset: self.bdk_database.get_data().clone(),
             transfer_artifacts: self.transfer_artifacts.clone(),
@@ -3212,7 +3209,9 @@ impl Wallet {
     ///
     /// This method resolves only after the IndexedDB read-write transaction commits. Callers must
     /// not persist dependent application state until this method succeeds. A failure leaves the
-    /// current in-memory wallet state intact and may be retried.
+    /// current in-memory wallet state intact. A stale-sequence refusal requires
+    /// durable-state reconciliation; incrementing the sequence and blindly
+    /// retrying an old writer is not safe.
     pub async fn flush(&self) -> Result<(), Error> {
         let snapshot = self.snapshot()?;
         super::idb_store::save_snapshot(&self.idb_key(), &snapshot)
@@ -4419,5 +4418,32 @@ pub(super) mod address_reuse_tests {
             "restored durable sequence 7 but next snapshot sequence is {next}; \
              save_snapshot would reject it as stale and drop the write"
         );
+    }
+}
+
+// Snapshot sequence exhaustion must not wrap to an apparently fresh writer.
+fn next_snapshot_sequence(sequence: &std::sync::atomic::AtomicU64) -> Result<u64, Error> {
+    use std::sync::atomic::Ordering;
+    sequence
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            current.checked_add(1)
+        })
+        .map(|previous| previous + 1)
+        .map_err(|_| Error::Persistence {
+            details: "wallet snapshot sequence exhausted".to_owned(),
+        })
+}
+
+#[cfg(test)]
+mod snapshot_sequence_tests {
+    use super::next_snapshot_sequence;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn sequence_exhaustion_refuses_without_wrapping() {
+        let sequence = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(next_snapshot_sequence(&sequence).unwrap(), u64::MAX);
+        assert!(next_snapshot_sequence(&sequence).is_err());
+        assert_eq!(sequence.load(Ordering::SeqCst), u64::MAX);
     }
 }

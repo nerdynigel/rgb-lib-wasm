@@ -59,7 +59,17 @@ async fn open_db() -> Result<Rexie, String> {
     Ok(rexie)
 }
 
+// A skipped stale write is a persistence failure, never an acknowledgement.
+fn require_newer_snapshot(existing: u64, proposed: u64) -> Result<(), String> {
+    if proposed <= existing {
+        return Err("IndexedDB stale snapshot refused".to_owned());
+    }
+    Ok(())
+}
+
 /// Save a wallet snapshot to IndexedDB under the given key.
+/// Resolves successfully only after this snapshot is committed. Equal/older
+/// sequences refuse; callers must reconcile using authenticated durable state.
 pub async fn save_snapshot(key: &str, snapshot: &WalletSnapshot) -> Result<(), String> {
     let db = open_db().await?;
     let tx = db
@@ -81,12 +91,7 @@ pub async fn save_snapshot(key: &str, snapshot: &WalletSnapshot) -> Result<(), S
             .ok_or_else(|| "IndexedDB value is not a string".to_string())?;
         let existing: WalletSnapshot =
             serde_json::from_str(&json).map_err(|e| format!("Deserialize error: {e}"))?;
-        if existing.sequence >= snapshot.sequence {
-            tx.done()
-                .await
-                .map_err(|e| format!("IndexedDB commit error: {e:?}"))?;
-            return Ok(());
-        }
+        require_newer_snapshot(existing.sequence, snapshot.sequence)?;
     }
     let js_val = JsValue::from_str(&json_str);
 
@@ -508,4 +513,18 @@ pub async fn save_encoded_snapshot(
                 .unwrap_or_else(|| "IndexedDB encoded write failed".into())
         })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod stale_snapshot_tests {
+    use super::require_newer_snapshot;
+
+    #[test]
+    fn stale_and_equal_snapshots_never_acknowledge_persistence() {
+        for proposed in [0, 1, 40, 41] {
+            assert!(require_newer_snapshot(41, proposed).is_err());
+        }
+        assert!(require_newer_snapshot(41, 42).is_ok());
+        assert!(require_newer_snapshot(u64::MAX, u64::MAX).is_err());
+    }
 }
