@@ -28,7 +28,11 @@ pub(crate) struct BackupPubData {
 /// The serializable wallet state that gets encrypted.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct WalletBackupPayload {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::pending_fill::deserialize_optional"
+    )]
     pub(crate) btcx_pending_fill_v1: Option<super::pending_fill::PendingFill>,
     pub(crate) db: crate::database::memory_db::InMemoryDb,
     pub(crate) bdk_changeset: Option<bdk_wallet::ChangeSet>,

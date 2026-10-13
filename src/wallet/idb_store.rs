@@ -18,7 +18,11 @@ const STORE_NAME: &str = "snapshots";
 pub struct WalletSnapshot {
     /// Exact immutable candidate intent/consent, persisted with RGB state.
     /// No signing authority is inferred from this record.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::pending_fill::deserialize_optional"
+    )]
     pub btcx_pending_fill_v1: Option<super::pending_fill::PendingFill>,
     /// Monotonic wallet-local snapshot sequence used to reject stale writes.
     pub sequence: u64,

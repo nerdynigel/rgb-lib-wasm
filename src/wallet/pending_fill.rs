@@ -86,6 +86,14 @@ impl<'de> Deserialize<'de> for PendingFill {
     }
 }
 
+// Absence is legacy-compatible, but an explicitly present malformed/null record
+// must never become absence and erase an ambiguous financial intent.
+pub(crate) fn deserialize_optional<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PendingFill>, D::Error> {
+    PendingFill::deserialize(deserializer).map(Some)
+}
+
 #[cfg(test)]
 pub(crate) fn storage_fixture() -> PendingFill {
     // Synthetic storage-only fixture. Never a valid RGB transfer or approval.

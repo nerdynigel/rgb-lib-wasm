@@ -3482,6 +3482,11 @@ pub(super) mod address_reuse_tests {
         let decoded: super::super::idb_store::WalletSnapshot =
             serde_json::from_value(legacy).unwrap();
         assert!(decoded.btcx_pending_fill_v1.is_none());
+        let mut malformed = serde_json::to_value(decoded).unwrap();
+        malformed["btcx_pending_fill_v1"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<super::super::idb_store::WalletSnapshot>(malformed).is_err()
+        );
     }
 
     #[test]

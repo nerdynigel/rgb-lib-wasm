@@ -25,7 +25,8 @@ The existing facade record encoding (btcx_pending_fill_v1) is preserved: exact
 request, inspected facts, colored PSBT, existing btcx-accounting-consent-v1 SHA256
 digest and Consented/Applied state. Established Bitcoin hashes are reused.
 Decode refuses changed digest/preimage, invalid enum, unknown record/request/facts
-fields and normalization that changes the object. Old snapshots/backups without
+fields and normalization that changes the object. Explicit null is refused rather
+than decoded as absence; only a missing field is legacy-compatible. Old snapshots/backups without
 this optional field remain readable. Expired records remain available for
 reconciliation; execution expiry enforcement stays at the guarded use boundary.
 The record has private fields and grants NO ownership, policy, consent, signing or
@@ -41,6 +42,7 @@ storage-only records, never valid RGB construction or approval evidence.
 
 From this repository, /home/nigel/.cargo/bin/cargo:
 
+- test --lib --locked --offline: PASS126/126 (final grouped source).
 - test --lib pending_fill --locked --offline: PASS5/5 at published baseline + delta.
   Exact ordinary/strict restore and snapshot preserve the record; changed terms,
   digest, unknown shape/state refuse; encrypted production backup payload and
