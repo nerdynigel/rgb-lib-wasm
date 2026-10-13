@@ -1049,6 +1049,20 @@ impl Wallet {
         Self::restore_existing_snapshot(wallet_data, snapshot)
     }
 
+    /// Restore one complete, consumer-authenticated snapshot and hand persistence
+    /// to that consumer before exposing the wallet to any runtime user. This is
+    /// the SAME active engine, never a second accounting writer. The caller must
+    /// authenticate the exact stored ciphertext before calling and retain it for
+    /// CAS; this constructor neither reads storage nor acknowledges a commit.
+    pub fn restore_consumer_owned_snapshot(
+        wallet_data: WalletData,
+        snapshot: super::idb_store::WalletSnapshot,
+    ) -> Result<Self, Error> {
+        let mut wallet = Self::restore_existing_snapshot(wallet_data, snapshot)?;
+        wallet.use_consumer_owned_persistence()?;
+        Ok(wallet)
+    }
+
     /// Construct only from complete persisted state. No schema imports, new BDK
     /// wallet, receipt reconciliation, snapshot/flush or implicit persistence.
     /// Consumers using encrypted envelopes authenticate/decrypt before this call.
@@ -3351,6 +3365,23 @@ impl Wallet {
         &mut self,
         snapshot: super::idb_store::WalletSnapshot,
     ) -> Result<(), Error> {
+        // An authenticated consumer restore must be a complete financial state,
+        // never a merge of incoming rows with this handle's old BDK/RGB state.
+        // A detached runtime is still using this wallet's stock; restoring over
+        // it would leave two divergent owners. Refuse before any adoption.
+        if self.consumer_owned_persistence {
+            self.use_consumer_owned_persistence()?;
+            if snapshot.bdk_changeset.is_none()
+                || snapshot.stock_stash_b64.is_none()
+                || snapshot.stock_state_b64.is_none()
+                || snapshot.stock_index_b64.is_none()
+            {
+                return Err(Error::Persistence {
+                    details: s!("consumer restore requires complete financial state"),
+                });
+            }
+        }
+
         // Refuse before changing sequence, database, BDK or RGB state. A valid
         // digest alone cannot authorize erasure/replacement of ambiguous intent.
         super::pending_fill::require_preserved_on_restore(
@@ -3360,15 +3391,15 @@ impl Wallet {
         .map_err(|details| Error::Persistence { details })?;
 
         // Exact pending terms do not make old financial state current. Once
-        // intent is active, refuse rollback before decoding/adopting any state.
+        // intent or consumer persistence is active, refuse rollback before adoption.
         // This local guard is not authentication or cross-writer CAS; the
         // encrypted consumer still owns those checks. Legacy backup restoration
         // without an active pending fill retains its existing semantics.
-        if self.btcx_pending_fill_v1.is_some()
+        if (self.consumer_owned_persistence || self.btcx_pending_fill_v1.is_some())
             && snapshot.sequence < self.idb_sequence.load(std::sync::atomic::Ordering::SeqCst)
         {
             return Err(Error::Persistence {
-                details: s!("active pending fill snapshot rollback refused"),
+                details: s!("active financial snapshot rollback refused"),
             });
         }
 
@@ -3702,6 +3733,80 @@ pub(super) mod address_reuse_tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             sequence
         );
+    }
+
+    #[test]
+    fn consumer_restore_constructor_preserves_exact_state_without_legacy_writer() {
+        use std::sync::atomic::Ordering;
+        let mut source = make_test_wallet(false);
+        *source.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        source.use_consumer_owned_persistence().unwrap();
+        source
+            .install_consented_pending_fill(super::super::pending_fill::storage_fixture())
+            .unwrap();
+        let snapshot = source.snapshot_for_persistence().unwrap();
+        let mut expected = serde_json::to_value(&snapshot).unwrap();
+        let restored =
+            Wallet::restore_consumer_owned_snapshot(source.wallet_data.clone(), snapshot).unwrap();
+        assert!(restored.require_legacy_persistence().is_err());
+        assert_eq!(restored.idb_sequence.load(Ordering::SeqCst), 1);
+        restored.save_to_idb(); // any native scheduling would panic
+        assert_eq!(restored.idb_sequence.load(Ordering::SeqCst), 1);
+        assert!(!restored.idb_save_in_progress.load(Ordering::SeqCst));
+        expected["sequence"] = 2.into();
+        assert_eq!(
+            serde_json::to_value(restored.snapshot_for_persistence().unwrap()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn consumer_restore_refuses_partial_rollback_and_detached_runtime() {
+        use std::sync::atomic::Ordering;
+        for failure in ["missing-bdk", "missing-rgb", "rollback", "detached-runtime"] {
+            let mut wallet = make_test_wallet(false);
+            *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+            wallet.use_consumer_owned_persistence().unwrap();
+            let mut before =
+                serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+            let mut incoming = before.clone();
+            incoming["sequence"] = 100.into();
+            incoming["db"]["next_txo_idx"] = 20.into();
+            match failure {
+                "missing-bdk" => incoming["bdk_changeset"] = serde_json::Value::Null,
+                "missing-rgb" => {
+                    for field in ["stock_stash_b64", "stock_state_b64", "stock_index_b64"] {
+                        incoming[field] = serde_json::Value::Null;
+                    }
+                }
+                "rollback" => incoming["sequence"] = 0.into(),
+                "detached-runtime" => {}
+                _ => unreachable!(),
+            }
+            let detached = if failure == "detached-runtime" {
+                wallet.rgb_stock.borrow_mut().take()
+            } else {
+                None
+            };
+            assert!(
+                wallet
+                    .restore_from_snapshot(serde_json::from_value(incoming).unwrap())
+                    .is_err(),
+                "{failure}"
+            );
+            if let Some(stock) = detached {
+                assert!(wallet.rgb_stock.borrow().is_none());
+                *wallet.rgb_stock.borrow_mut() = Some(stock);
+            }
+            assert_eq!(wallet.idb_sequence.load(Ordering::SeqCst), 1, "{failure}");
+            before["sequence"] = 2.into();
+            assert_eq!(
+                serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap(),
+                before,
+                "{failure}"
+            );
+            assert!(wallet.require_legacy_persistence().is_err());
+        }
     }
 
     #[test]
