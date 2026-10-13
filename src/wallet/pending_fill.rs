@@ -44,6 +44,7 @@ pub struct PendingFill {
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 enum State {
     Consented,
+    Applying,
     Applied,
 }
 
@@ -98,6 +99,229 @@ impl PendingFill {
             return Err("pending fill must enter through consented state".to_owned());
         }
         Ok(())
+    }
+}
+
+/// SAME-engine, memory-only application of the retained exact intent. This is a
+/// Rust embedding seam, NOT approval or persistence. The authenticated consumer
+/// must validate wallet-owned policy/ownership/receive authority before calling,
+/// commit the complete resulting snapshot before any key operation, and refuse
+/// the handle after every ambiguous result. No supplied record can replace the
+/// retained intent. A partially attempted application remains Applying forever
+/// until explicit reconciliation; restoring it does not grant retry authority.
+#[cfg(feature = "esplora")]
+impl super::Wallet {
+    /// Apply once on the same stock; returns the exact reviewed PSBT without signing.
+    /// `Applying` records require reconciliation and may never be retried.
+    pub fn apply_consented_pending_fill(
+        &mut self,
+        association_id: &str,
+        consent_digest: &str,
+        now: u64,
+    ) -> Result<String, crate::Error> {
+        use super::rust_only::{AssetColoringInfo, ColoringInfo};
+        use crate::bitcoin::{consensus, psbt::Psbt};
+        use crate::{Error, FileContent};
+        use std::{collections::HashMap, str::FromStr};
+        let refusal = |details: &str| Error::Persistence {
+            details: details.to_owned(),
+        };
+        if self.wallet_data.bitcoin_network != crate::BitcoinNetwork::Regtest {
+            return Err(refusal("pending application is regtest-only"));
+        }
+        if !self.consumer_owned_persistence {
+            return Err(refusal(
+                "pending application requires consumer-owned persistence",
+            ));
+        }
+        self.use_consumer_owned_persistence()?;
+        let mut pending = self
+            .btcx_pending_fill_v1
+            .clone()
+            .ok_or_else(|| refusal("pending consent absent"))?;
+        let r = &pending.request;
+        if pending.state != State::Consented
+            || r.association_id != association_id
+            || pending.digest != consent_digest
+            || now >= r.expires_at
+        {
+            return Err(refusal(
+                "pending application state/association/digest/expiry refused",
+            ));
+        }
+        if r.psbt.len() > 16 * 1024 * 1024
+            || r.colored_transaction_hex.len() > 8_000_000
+            || r.consignment_bytes_hex.len() > 16_000_000
+            || r.previous_transactions_hex
+                .iter()
+                .any(|tx| tx.len() > 8_000_000)
+            || !(2..=4).contains(&r.allocations.len())
+        {
+            return Err(refusal("pending application size/allocation bounds"));
+        }
+        let original =
+            Psbt::from_str(&r.psbt).map_err(|_| refusal("pending application PSBT invalid"))?;
+        let mut psbt = original.clone();
+        if original.inputs.len() != 2
+            || original.unsigned_tx.input.len() != 2
+            || original.unsigned_tx.input[0].previous_output.to_string() != r.spent_outpoint
+            || original.unsigned_tx.input[0].previous_output
+                == original.unsigned_tx.input[1].previous_output
+            || original.inputs.iter().any(|i| {
+                !i.partial_sigs.is_empty()
+                    || i.final_script_sig.is_some()
+                    || i.final_script_witness.is_some()
+                    || i.tap_key_sig.is_some()
+                    || !i.tap_script_sigs.is_empty()
+            })
+        {
+            return Err(refusal(
+                "pending application unsigned input binding invalid",
+            ));
+        }
+        for (index, previous) in r.previous_transactions_hex.iter().enumerate() {
+            let raw = hex::decode(previous)
+                .map_err(|_| refusal("pending application previous transaction invalid"))?;
+            let tx: crate::bitcoin::Transaction = consensus::deserialize(&raw)
+                .map_err(|_| refusal("pending application previous transaction invalid"))?;
+            let input = &original.unsigned_tx.input[index];
+            if original.inputs[index].witness_utxo.is_none()
+                || tx.compute_txid() != input.previous_output.txid
+                || tx.output.get(input.previous_output.vout as usize)
+                    != original.inputs[index].witness_utxo.as_ref()
+            {
+                return Err(refusal("pending application prevout binding invalid"));
+            }
+        }
+        let colored = hex::decode(&r.colored_transaction_hex)
+            .map_err(|_| refusal("pending application transaction invalid"))?;
+        let consignment = hex::decode(&r.consignment_bytes_hex)
+            .map_err(|_| refusal("pending application consignment invalid"))?;
+        let facts = super::rust_only::inspect_transfer_offchain(
+            &consignment,
+            &colored,
+            self.wallet_data.bitcoin_network,
+        )?;
+        if serde_json::to_value(&facts).map_err(|_| refusal("pending facts invalid"))?
+            != serde_json::to_value(&pending.facts).map_err(|_| refusal("pending facts invalid"))?
+            || facts.contract_id != r.contract_id
+        {
+            return Err(refusal("pending application inspected facts changed"));
+        }
+        let coloring = ColoringInfo {
+            asset_info_map: HashMap::from([(
+                crate::ContractId::from_str(&r.contract_id)
+                    .map_err(|_| refusal("pending application contract invalid"))?,
+                AssetColoringInfo {
+                    output_map: r.allocations.iter().map(|(v, a)| (*v, a.amount)).collect(),
+                    static_blinding: Some(r.asset_static_blinding),
+                },
+            )]),
+            static_blinding: Some(r.static_blinding),
+            nonce: Some(r.nonce),
+        };
+        // Recompute on THIS stock before consumption, comparing complete emitted
+        // PSBT/transaction/consignment bytes. A shape/digest alone is insufficient.
+        let check = |psbt: &Psbt, transfers: &[crate::RgbTransfer]| -> Result<(), Error> {
+            if psbt.to_string() != pending.colored_psbt
+                || hex::encode(consensus::serialize(&psbt.unsigned_tx)) != r.colored_transaction_hex
+                || transfers.len() != 1
+            {
+                return Err(refusal("pending exact prospective transaction changed"));
+            }
+            let mut bytes = Vec::new();
+            transfers[0]
+                .save(&mut bytes)
+                .map_err(|_| refusal("pending application transfer encoding failed"))?;
+            if hex::encode(bytes) != r.consignment_bytes_hex {
+                return Err(refusal("pending exact prospective transfer changed"));
+            }
+            Ok(())
+        };
+        let change = r
+            .allocations
+            .get(&r.change_vout)
+            .ok_or_else(|| refusal("pending application change absent"))?;
+        // The reviewed facts carry actual colored vouts. The uncolored request
+        // may have had an OP_RETURN inserted at zero: never register its old vout.
+        let shift = u32::from(
+            !original
+                .unsigned_tx
+                .output
+                .iter()
+                .any(|o| o.script_pubkey.is_op_return())
+                && original
+                    .unsigned_tx
+                    .output
+                    .iter()
+                    .any(|o| o.script_pubkey.is_p2tr()),
+        );
+        let change_vout = r
+            .change_vout
+            .checked_add(shift)
+            .ok_or_else(|| refusal("pending application change vout overflow"))?;
+        if pending.facts.allocations.len() != r.allocations.len() {
+            return Err(refusal("pending application allocation count mismatch"));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for allocation in &pending.facts.allocations {
+            let vout = allocation
+                .vout
+                .checked_sub(shift)
+                .ok_or_else(|| refusal("pending application allocation vout invalid"))?;
+            let expected = r
+                .allocations
+                .get(&vout)
+                .ok_or_else(|| refusal("pending application extra allocation"))?;
+            let output = original
+                .unsigned_tx
+                .output
+                .get(vout as usize)
+                .ok_or_else(|| refusal("pending application output absent"))?;
+            if !seen.insert(vout)
+                || expected.amount == 0
+                || allocation.amount != expected.amount.to_string()
+                || allocation.script_pubkey != expected.script_pubkey
+                || hex::encode(output.script_pubkey.as_bytes()) != expected.script_pubkey
+            {
+                return Err(refusal("pending application allocation binding invalid"));
+            }
+        }
+        let facts = pending
+            .facts
+            .allocations
+            .iter()
+            .filter(|a| a.vout == change_vout)
+            .collect::<Vec<_>>();
+        if facts.len() != 1
+            || facts[0].amount != change.amount.to_string()
+            || facts[0].script_pubkey != change.script_pubkey
+        {
+            return Err(refusal("pending application inspected change mismatch"));
+        }
+        // Poison before the first mutating engine call. Failures retain full
+        // intent, including byte bindings, while forbidding a second consume.
+        let mut applying = pending.clone();
+        applying.state = State::Applying;
+        self.btcx_pending_fill_v1 = Some(applying);
+        let preview = self.color_psbt_and_export(&mut psbt, coloring.clone())?;
+        check(&psbt, &preview)?;
+        psbt = original;
+        let transfers = self.color_psbt_and_consume_in_memory(&mut psbt, coloring)?;
+        check(&psbt, &transfers)?;
+        let row = self.register_collaborative_outgoing_transfer_in_memory(
+            pending.facts.witness_txid.clone(),
+            r.contract_id.clone(),
+            vec![r.spent_outpoint.clone()],
+            Some((change_vout, change.amount)),
+            1,
+        )?;
+        if row.is_none() {
+            return Err(refusal("pending application outgoing row absent"));
+        }
+        pending.state = State::Applied;
+        self.btcx_pending_fill_v1 = Some(pending);
+        Ok(psbt.to_string())
     }
 }
 
