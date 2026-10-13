@@ -3265,28 +3265,10 @@ impl Wallet {
         )
         .map_err(|details| Error::Persistence { details })?;
 
-        // Adopt the durable snapshot's monotonic sequence, never lowering the
-        // local counter. `idb_store::save_snapshot` refuses any snapshot whose
-        // sequence is not strictly greater than the persisted one, so a fresh
-        // unlock (which starts `idb_sequence` at 0) would otherwise have every
-        // subsequent flush rejected as stale and silently lose the session's
-        // writes.
-        let restored_sequence = snapshot.sequence;
-        let current_sequence = self.idb_sequence.load(std::sync::atomic::Ordering::SeqCst);
-        if restored_sequence > current_sequence {
-            self.idb_sequence
-                .store(restored_sequence, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        // Preserve the exact intent alongside the restored financial state.
-        self.btcx_pending_fill_v1 = snapshot.btcx_pending_fill_v1;
-
-        // Restore the in-memory database
-        self.database = Arc::new(snapshot.db);
-
         // Restore BDK changeset and re-load the BDK wallet
-        if let Some(changeset) = snapshot.bdk_changeset {
-            self.bdk_database.set_data(Some(changeset));
+        let restored_bdk = if let Some(changeset) = snapshot.bdk_changeset {
+            let mut database = super::memory_store::MemoryStore::new();
+            database.set_data(Some(changeset));
 
             // Reconstruct descriptors (same logic as Wallet::new)
             let wdata = &self.wallet_data;
@@ -3325,10 +3307,8 @@ impl Wallet {
                 wallet_params = wallet_params.extract_keys();
             }
 
-            match wallet_params.load_wallet(&mut self.bdk_database) {
-                Ok(Some(wallet)) => {
-                    self.bdk_wallet = wallet;
-                }
+            match wallet_params.load_wallet(&mut database) {
+                Ok(Some(wallet)) => Some((wallet, database)),
                 Ok(None) => {
                     return Err(Error::Persistence {
                         details: s!("persisted BDK changeset did not contain a loadable wallet"),
@@ -3340,28 +3320,66 @@ impl Wallet {
                     });
                 }
             }
-        }
+        } else {
+            None
+        };
 
-        // Restore complete pending transfers so send_end can resume after a page reload.
-        self.transfer_artifacts = snapshot.transfer_artifacts;
-
-        // Restore received consignments
-        self.received_consignments = snapshot.received_consignments;
-
-        // Restore address reuse pinned indices
-        self.reuse_address_index = snapshot.reuse_address_index;
-
-        // Restore RGB Stock from strict-encoded components
-        if let (Some(stash_b64), Some(state_b64), Some(index_b64)) = (
+        // Validate all RGB components before adopting any financial state. Missing
+        // components remain legacy-compatible only when all three are absent.
+        let restored_stock = match (
             snapshot.stock_stash_b64,
             snapshot.stock_state_b64,
             snapshot.stock_index_b64,
         ) {
-            let stock = super::idb_store::deserialize_stock(&stash_b64, &state_b64, &index_b64)
-                .map_err(InternalError::StockError)?;
-            *self.rgb_stock.borrow_mut() = Some(stock);
+            (Some(stash), Some(state), Some(index)) => Some(
+                super::idb_store::deserialize_stock(&stash, &state, &index)
+                    .map_err(InternalError::StockError)?,
+            ),
+            (None, None, None) => None,
+            _ => {
+                return Err(Error::Persistence {
+                    details: s!("incomplete persisted RGB stock"),
+                });
+            }
+        };
+        let mut stock = self
+            .rgb_stock
+            .try_borrow_mut()
+            .map_err(|_| Error::Persistence {
+                details: s!("RGB runtime is active; wallet state cannot be restored"),
+            })?;
+
+        // Every fallible validation has completed. Commit in memory without
+        // awaits, writes or callbacks; a refused restore leaves all state intact.
+        // Adopt the durable snapshot's monotonic sequence, never lowering the
+        // local counter. `idb_store::save_snapshot` refuses any snapshot whose
+        // sequence is not strictly greater than the persisted one, so a fresh
+        // unlock (which starts `idb_sequence` at 0) would otherwise have every
+        // subsequent flush rejected as stale and silently lose the session's
+        // writes.
+        let restored_sequence = snapshot.sequence;
+        let current_sequence = self.idb_sequence.load(std::sync::atomic::Ordering::SeqCst);
+        if restored_sequence > current_sequence {
+            self.idb_sequence
+                .store(restored_sequence, std::sync::atomic::Ordering::SeqCst);
         }
 
+        // Preserve the exact intent alongside the restored financial state.
+        self.btcx_pending_fill_v1 = snapshot.btcx_pending_fill_v1;
+
+        // Restore the in-memory database
+        self.database = Arc::new(snapshot.db);
+
+        if let Some((wallet, database)) = restored_bdk {
+            self.bdk_wallet = wallet;
+            self.bdk_database = database;
+        }
+        self.transfer_artifacts = snapshot.transfer_artifacts;
+        self.received_consignments = snapshot.received_consignments;
+        self.reuse_address_index = snapshot.reuse_address_index;
+        if let Some(restored_stock) = restored_stock {
+            *stock = Some(restored_stock);
+        }
         Ok(())
     }
 }
@@ -3437,6 +3455,45 @@ pub(super) mod address_reuse_tests {
             rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(None)),
             vss_client: None,
             last_vss_backup_error: std::cell::RefCell::new(None),
+        }
+    }
+
+    #[test]
+    fn failed_active_restore_preserves_complete_wallet_state() {
+        for failure in ["bdk", "stock", "partial-stock", "borrowed-stock"] {
+            let mut wallet = make_test_wallet(false);
+            *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+            let mut baseline =
+                serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+            let mut incoming = baseline.clone();
+            incoming["sequence"] = 100.into();
+            incoming["btcx_pending_fill_v1"] =
+                serde_json::to_value(super::super::pending_fill::storage_fixture()).unwrap();
+            incoming["reuse_address_index"] = serde_json::json!({"External": 12});
+            incoming["db"]["next_txo_idx"] = 20.into();
+            match failure {
+                "bdk" => {
+                    incoming["bdk_changeset"] =
+                        serde_json::to_value(bdk_wallet::ChangeSet::default()).unwrap()
+                }
+                "stock" => incoming["stock_stash_b64"] = "invalid".into(),
+                "partial-stock" => incoming["stock_index_b64"] = serde_json::Value::Null,
+                "borrowed-stock" => {}
+                _ => unreachable!(),
+            }
+            let snapshot = serde_json::from_value(incoming).unwrap();
+            let stock = wallet.rgb_stock.clone();
+            let held = (failure == "borrowed-stock").then(|| stock.borrow());
+            assert!(wallet.restore_from_snapshot(snapshot).is_err(), "{failure}");
+            drop(held);
+            // Reading a snapshot advances the local counter once; failed restore
+            // must neither adopt sequence 100 nor change any financial bytes.
+            baseline["sequence"] = 2.into();
+            assert_eq!(
+                serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap(),
+                baseline,
+                "{failure}",
+            );
         }
     }
 
