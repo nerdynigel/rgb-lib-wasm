@@ -86,6 +86,28 @@ impl<'de> Deserialize<'de> for PendingFill {
     }
 }
 
+/// Restore is not a lifecycle transition. Once an engine holds an exact pending
+/// record, importing another snapshot may neither erase it nor replace its terms
+/// or state. Reconciliation/confirmed application needs a separate guarded path.
+/// This is preservation only; it does not authenticate either snapshot.
+pub(crate) fn require_preserved_on_restore(
+    current: Option<&PendingFill>,
+    incoming: Option<&PendingFill>,
+) -> Result<(), String> {
+    let Some(current) = current else {
+        return Ok(());
+    };
+    let incoming = incoming.ok_or_else(|| "pending fill erasure refused".to_owned())?;
+    let current =
+        serde_json::to_value(current).map_err(|_| "pending fill encoding failed".to_owned())?;
+    let incoming =
+        serde_json::to_value(incoming).map_err(|_| "pending fill encoding failed".to_owned())?;
+    if incoming != current {
+        return Err("pending fill replacement or state change refused".to_owned());
+    }
+    Ok(())
+}
+
 // Absence is legacy-compatible, but an explicitly present malformed/null record
 // must never become absence and erase an ambiguous financial intent.
 pub(crate) fn deserialize_optional<'de, D: serde::Deserializer<'de>>(
@@ -187,4 +209,12 @@ mod tests {
         changed["request"]["other"] = true.into();
         assert!(serde_json::from_value::<PendingFill>(changed).is_err());
     }
+}
+
+#[cfg(test)]
+pub(crate) fn replacement_storage_fixture() -> PendingFill {
+    let mut record = storage_fixture();
+    record.request.fill_id = "second-storage-fill".into();
+    record.digest = digest(&record.request, &record.facts, &record.colored_psbt).unwrap();
+    record
 }

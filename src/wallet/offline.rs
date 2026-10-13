@@ -3257,8 +3257,16 @@ impl Wallet {
         &mut self,
         snapshot: super::idb_store::WalletSnapshot,
     ) -> Result<(), Error> {
+        // Refuse before changing sequence, database, BDK or RGB state. A valid
+        // digest alone cannot authorize erasure/replacement of ambiguous intent.
+        super::pending_fill::require_preserved_on_restore(
+            self.btcx_pending_fill_v1.as_ref(),
+            snapshot.btcx_pending_fill_v1.as_ref(),
+        )
+        .map_err(|details| Error::Persistence { details })?;
+
         // Adopt the durable snapshot's monotonic sequence, never lowering the
-        // local counter. `idb_store::save_snapshot` drops any snapshot whose
+        // local counter. `idb_store::save_snapshot` refuses any snapshot whose
         // sequence is not strictly greater than the persisted one, so a fresh
         // unlock (which starts `idb_sequence` at 0) would otherwise have every
         // subsequent flush rejected as stale and silently lose the session's
@@ -3467,6 +3475,75 @@ pub(super) mod address_reuse_tests {
         assert!(
             serde_json::from_value::<super::super::idb_store::WalletSnapshot>(changed).is_err()
         );
+    }
+
+    #[test]
+    fn active_restore_refuses_pending_erasure_replacement_and_state_change() {
+        for (initial_state, change) in [
+            ("Consented", "erase"),
+            ("Consented", "replace"),
+            ("Consented", "state"),
+            ("Applied", "erase"),
+            ("Applied", "replace"),
+            ("Applied", "state"),
+        ] {
+            let mut wallet = make_test_wallet(false);
+            *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+            let mut initial = wallet.snapshot_for_persistence().unwrap();
+            initial.btcx_pending_fill_v1 = Some(super::super::pending_fill::storage_fixture());
+            let mut initial = serde_json::to_value(initial).unwrap();
+            initial["btcx_pending_fill_v1"]["state"] = initial_state.into();
+            wallet
+                .restore_from_snapshot(serde_json::from_value(initial).unwrap())
+                .unwrap();
+            // Importing the same exact pending record remains compatible.
+            let exact = wallet.snapshot_for_persistence().unwrap();
+            wallet.restore_from_snapshot(exact).unwrap();
+            let baseline = wallet.snapshot_for_persistence().unwrap();
+            let before = serde_json::to_value(&baseline).unwrap();
+            let mut changed = before.clone();
+            match change {
+                "erase" => {
+                    changed
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("btcx_pending_fill_v1");
+                }
+                "replace" => {
+                    // A second internally consistent intent, not just a broken digest.
+                    changed["btcx_pending_fill_v1"] = serde_json::to_value(
+                        super::super::pending_fill::replacement_storage_fixture(),
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    changed["btcx_pending_fill_v1"]["state"] = if initial_state == "Applied" {
+                        "Consented"
+                    } else {
+                        "Applied"
+                    }
+                    .into();
+                }
+            }
+            changed["sequence"] = (baseline.sequence + 100).into();
+            let snapshot = serde_json::from_value(changed).unwrap();
+            assert!(wallet.restore_from_snapshot(snapshot).is_err(), "{change}");
+            let after = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+            assert_eq!(
+                after["btcx_pending_fill_v1"], before["btcx_pending_fill_v1"],
+                "{change}"
+            );
+            assert_eq!(after["sequence"], baseline.sequence + 1, "{change}");
+            for field in [
+                "db",
+                "bdk_changeset",
+                "stock_stash_b64",
+                "stock_state_b64",
+                "stock_index_b64",
+            ] {
+                assert_eq!(after[field], before[field], "{change}: {field}");
+            }
+        }
     }
 
     #[test]

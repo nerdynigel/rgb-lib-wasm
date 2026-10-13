@@ -67,10 +67,22 @@ fn require_newer_snapshot(existing: u64, proposed: u64) -> Result<(), String> {
     Ok(())
 }
 
+// Pending financial intent may only travel through the authenticated encoded
+// consumer CAS path. Legacy sequence-only writes cannot authenticate its authority
+// or prevent a stale higher-sequence writer from replacing it.
+fn require_legacy_snapshot_allowed(snapshot: &WalletSnapshot) -> Result<(), String> {
+    if snapshot.btcx_pending_fill_v1.is_some() {
+        return Err("pending fill requires authenticated encoded persistence".to_owned());
+    }
+    Ok(())
+}
+
 /// Save a wallet snapshot to IndexedDB under the given key.
 /// Resolves successfully only after this snapshot is committed. Equal/older
 /// sequences refuse; callers must reconcile using authenticated durable state.
 pub async fn save_snapshot(key: &str, snapshot: &WalletSnapshot) -> Result<(), String> {
+    // Fail before opening IndexedDB: never create/upgrade or write on refusal.
+    require_legacy_snapshot_allowed(snapshot)?;
     let db = open_db().await?;
     let tx = db
         .transaction(&[STORE_NAME], TransactionMode::ReadWrite)
@@ -91,6 +103,10 @@ pub async fn save_snapshot(key: &str, snapshot: &WalletSnapshot) -> Result<(), S
             .ok_or_else(|| "IndexedDB value is not a string".to_string())?;
         let existing: WalletSnapshot =
             serde_json::from_str(&json).map_err(|e| format!("Deserialize error: {e}"))?;
+        super::pending_fill::require_preserved_on_restore(
+            existing.btcx_pending_fill_v1.as_ref(),
+            snapshot.btcx_pending_fill_v1.as_ref(),
+        )?;
         require_newer_snapshot(existing.sequence, snapshot.sequence)?;
     }
     let js_val = JsValue::from_str(&json_str);
@@ -297,6 +313,27 @@ mod tests {
     use rgbstd::contract::IssuerWrapper;
     use rgbstd::persistence::Stock;
     use schemata::NonInflatableAsset;
+
+    #[test]
+    fn pending_intent_refuses_legacy_persistence_before_database_open() {
+        let mut snapshot = WalletSnapshot {
+            btcx_pending_fill_v1: None,
+            sequence: u64::MAX,
+            db: InMemoryDb::new(),
+            bdk_changeset: None,
+            transfer_artifacts: HashMap::new(),
+            received_consignments: HashMap::new(),
+            stock_stash_b64: None,
+            stock_state_b64: None,
+            stock_index_b64: None,
+            reuse_address_index: HashMap::new(),
+        };
+        assert!(require_legacy_snapshot_allowed(&snapshot).is_ok());
+        snapshot.btcx_pending_fill_v1 = Some(super::super::pending_fill::storage_fixture());
+        assert!(require_legacy_snapshot_allowed(&snapshot).is_err());
+        assert_eq!(snapshot.sequence, u64::MAX);
+        assert!(snapshot.btcx_pending_fill_v1.is_some());
+    }
 
     #[test]
     fn stock_serialize_round_trip_empty() {
