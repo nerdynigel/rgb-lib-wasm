@@ -16,6 +16,10 @@ const STORE_NAME: &str = "snapshots";
 /// A serializable snapshot of wallet state for IndexedDB persistence.
 #[derive(Serialize, Deserialize)]
 pub struct WalletSnapshot {
+    /// Exact immutable candidate intent/consent, persisted with RGB state.
+    /// No signing authority is inferred from this record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub btcx_pending_fill_v1: Option<super::pending_fill::PendingFill>,
     /// Monotonic wallet-local snapshot sequence used to reject stale writes.
     pub sequence: u64,
     /// The in-memory RGB-lib database.
@@ -363,6 +367,7 @@ mod tests {
             .insert("asset-id".to_owned(), vec![1, 2, 3, 4]);
         transfer_artifact.signed_psbt = Some("signed-psbt".to_owned());
         let snapshot = WalletSnapshot {
+            btcx_pending_fill_v1: None,
             sequence: 1,
             db: InMemoryDb::new(),
             bdk_changeset: None,

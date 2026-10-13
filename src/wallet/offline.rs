@@ -977,6 +977,7 @@ pub(crate) type RgbLibDb = crate::database::memory_db::InMemoryDb;
 /// This should not be manually constructed but should be obtained from the [`Wallet::new`]
 /// method.
 pub struct Wallet {
+    pub(crate) btcx_pending_fill_v1: Option<super::pending_fill::PendingFill>,
     pub(crate) wallet_data: WalletData,
     pub(crate) logger: Logger,
     pub(crate) _logger_guard: LoggerGuard,
@@ -1108,6 +1109,7 @@ impl Wallet {
             .ok_or_else(invalid)?;
         let wallet_dir = PathBuf::from(&wdata.data_dir).join(&wdata.master_fingerprint);
         Ok(Self {
+            btcx_pending_fill_v1: snapshot.btcx_pending_fill_v1,
             wallet_data,
             logger: Logger::root(slog::Discard, o!()),
             _logger_guard: (),
@@ -1235,6 +1237,7 @@ impl Wallet {
 
         info!(logger, "New wallet completed");
         Ok(Wallet {
+            btcx_pending_fill_v1: None,
             wallet_data,
             logger,
             _logger_guard,
@@ -3189,6 +3192,7 @@ impl Wallet {
             })?;
 
         Ok(super::idb_store::WalletSnapshot {
+            btcx_pending_fill_v1: self.btcx_pending_fill_v1.clone(),
             sequence: self
                 .idb_sequence
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -3266,6 +3270,9 @@ impl Wallet {
             self.idb_sequence
                 .store(restored_sequence, std::sync::atomic::Ordering::SeqCst);
         }
+
+        // Preserve the exact intent alongside the restored financial state.
+        self.btcx_pending_fill_v1 = snapshot.btcx_pending_fill_v1;
 
         // Restore the in-memory database
         self.database = Arc::new(snapshot.db);
@@ -3353,7 +3360,7 @@ impl Wallet {
 }
 
 #[cfg(test)]
-mod address_reuse_tests {
+pub(super) mod address_reuse_tests {
     use super::*;
     use crate::keys::generate_keys;
     use crate::utils::{get_descriptors, str_to_xpub};
@@ -3363,7 +3370,7 @@ mod address_reuse_tests {
     /// Bypasses `Wallet::new` (which requires RGB schema import / js-sys)
     /// by constructing only the BDK wallet and the fields that
     /// `_get_new_address` touches.
-    fn make_test_wallet(reuse: bool) -> Wallet {
+    pub(in crate::wallet) fn make_test_wallet(reuse: bool) -> Wallet {
         let keys = generate_keys(BitcoinNetwork::Regtest);
         let bdk_network = BdkNetwork::from(BitcoinNetwork::Regtest);
         let xpub_rgb = str_to_xpub(&keys.account_xpub_colored, bdk_network).unwrap();
@@ -3400,6 +3407,7 @@ mod address_reuse_tests {
         let logger = Logger::root(drain, o!());
 
         Wallet {
+            btcx_pending_fill_v1: None,
             wallet_data: wd,
             logger,
             _logger_guard: (),
@@ -3423,6 +3431,57 @@ mod address_reuse_tests {
             vss_client: None,
             last_vss_backup_error: std::cell::RefCell::new(None),
         }
+    }
+
+    #[test]
+    fn pending_fill_survives_active_and_strict_restore_snapshot() {
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let mut snapshot = wallet.snapshot_for_persistence().unwrap();
+        let record = super::super::pending_fill::storage_fixture();
+        let expected = serde_json::to_value(&record).unwrap();
+        snapshot.btcx_pending_fill_v1 = Some(record);
+        // Exact path used by the authenticated default lifecycle after decryption.
+        let plain = serde_json::to_vec(&snapshot).unwrap();
+        let decoded = serde_json::from_slice(&plain).unwrap();
+        wallet.restore_from_snapshot(decoded).unwrap();
+        let flushed = wallet.snapshot_for_persistence().unwrap();
+        assert_eq!(
+            serde_json::to_value(&flushed.btcx_pending_fill_v1).unwrap(),
+            expected
+        );
+        // Strict existing restore (no fresh wallet or schema import) also preserves it.
+        let strict =
+            Wallet::restore_existing_snapshot(wallet.wallet_data.clone(), flushed).unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                strict
+                    .snapshot_for_persistence()
+                    .unwrap()
+                    .btcx_pending_fill_v1
+            )
+            .unwrap(),
+            expected
+        );
+        let mut changed: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+        changed["btcx_pending_fill_v1"]["digest"] = "invalid".into();
+        assert!(
+            serde_json::from_value::<super::super::idb_store::WalletSnapshot>(changed).is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_snapshot_without_pending_record_remains_readable() {
+        let wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let mut legacy = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("btcx_pending_fill_v1");
+        let decoded: super::super::idb_store::WalletSnapshot =
+            serde_json::from_value(legacy).unwrap();
+        assert!(decoded.btcx_pending_fill_v1.is_none());
     }
 
     #[test]
@@ -4336,6 +4395,7 @@ mod address_reuse_tests {
         *wallet.rgb_stock.borrow_mut() = Some(rgbstd::persistence::Stock::in_memory());
 
         let snapshot = WalletSnapshot {
+            btcx_pending_fill_v1: None,
             sequence: 7,
             db: crate::database::memory_db::InMemoryDb::new(),
             bdk_changeset: None,

@@ -8,6 +8,7 @@ pub(crate) mod memory_store;
 pub(crate) mod offline;
 #[cfg(feature = "esplora")]
 pub(crate) mod online;
+pub mod pending_fill;
 pub mod rust_only;
 pub mod vss;
 
