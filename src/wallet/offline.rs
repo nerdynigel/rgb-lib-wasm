@@ -977,6 +977,8 @@ pub(crate) type RgbLibDb = crate::database::memory_db::InMemoryDb;
 /// This should not be manually constructed but should be obtained from the [`Wallet::new`]
 /// method.
 pub struct Wallet {
+    /// One-way handoff: the consumer owns authenticated snapshot commits.
+    consumer_owned_persistence: bool,
     pub(crate) btcx_pending_fill_v1: Option<super::pending_fill::PendingFill>,
     pub(crate) wallet_data: WalletData,
     pub(crate) logger: Logger,
@@ -1109,6 +1111,7 @@ impl Wallet {
             .ok_or_else(invalid)?;
         let wallet_dir = PathBuf::from(&wdata.data_dir).join(&wdata.master_fingerprint);
         Ok(Self {
+            consumer_owned_persistence: false,
             btcx_pending_fill_v1: snapshot.btcx_pending_fill_v1,
             wallet_data,
             logger: Logger::root(slog::Discard, o!()),
@@ -1237,6 +1240,7 @@ impl Wallet {
 
         info!(logger, "New wallet completed");
         Ok(Wallet {
+            consumer_owned_persistence: false,
             btcx_pending_fill_v1: None,
             wallet_data,
             logger,
@@ -3169,6 +3173,49 @@ impl Wallet {
         self.save_to_idb();
     }
 
+    /// Irreversibly hand persistence of THIS wallet to its embedding consumer.
+    ///
+    /// Call before financial operations and before sharing the wallet with other
+    /// runtime users. Refuses while a legacy save is in flight; a scheduled save
+    /// cannot be cancelled by changing the owner. After success neither automatic
+    /// saves nor `flush` may write through the legacy plaintext/sequence path.
+    /// The consumer must serialize operations, authenticate restored state and
+    /// commit `snapshot_for_persistence` with exact-record CAS. This handoff does
+    /// not authenticate state or confer spending authority. No second wallet is
+    /// created and the mode cannot be disabled on this instance.
+    pub fn use_consumer_owned_persistence(&mut self) -> Result<(), Error> {
+        if self
+            .idb_save_in_progress
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::Persistence {
+                details: s!("legacy wallet save is still in progress"),
+            });
+        }
+        let stock = self
+            .rgb_stock
+            .try_borrow()
+            .map_err(|_| Error::Persistence {
+                details: s!("RGB runtime is active; persistence handoff refused"),
+            })?;
+        if stock.is_none() {
+            return Err(Error::Persistence {
+                details: s!("RGB runtime is active; persistence handoff refused"),
+            });
+        }
+        self.consumer_owned_persistence = true;
+        Ok(())
+    }
+
+    fn require_legacy_persistence(&self) -> Result<(), Error> {
+        if self.consumer_owned_persistence {
+            return Err(Error::Persistence {
+                details: s!("wallet requires consumer-owned authenticated persistence"),
+            });
+        }
+        Ok(())
+    }
+
     /// Explicit consumer persistence seam. Produces the same complete snapshot
     /// as flush, advancing its sequence in memory without writing or scheduling
     /// a backup. Consumers must authenticate/encode and commit it separately.
@@ -3213,6 +3260,7 @@ impl Wallet {
     /// durable-state reconciliation; incrementing the sequence and blindly
     /// retrying an old writer is not safe.
     pub async fn flush(&self) -> Result<(), Error> {
+        self.require_legacy_persistence()?;
         let snapshot = self.snapshot()?;
         super::idb_store::save_snapshot(&self.idb_key(), &snapshot)
             .await
@@ -3222,6 +3270,12 @@ impl Wallet {
     /// Save current wallet state to IndexedDB asynchronously via spawn_local.
     fn save_to_idb(&self) {
         use std::sync::atomic::Ordering;
+
+        // Consumer commits are explicit. Do not serialize, advance sequence or
+        // schedule a legacy write behind its authenticated transaction.
+        if self.consumer_owned_persistence {
+            return;
+        }
 
         // Debounce: skip if a save is already in progress
         if self
@@ -3445,6 +3499,7 @@ pub(super) mod address_reuse_tests {
         let logger = Logger::root(drain, o!());
 
         Wallet {
+            consumer_owned_persistence: false,
             btcx_pending_fill_v1: None,
             wallet_data: wd,
             logger,
@@ -3469,6 +3524,70 @@ pub(super) mod address_reuse_tests {
             vss_client: None,
             last_vss_backup_error: std::cell::RefCell::new(None),
         }
+    }
+
+    #[test]
+    fn consumer_persistence_handoff_blocks_legacy_writes_on_same_wallet() {
+        use std::sync::atomic::Ordering;
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let before = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+        assert!(wallet.require_legacy_persistence().is_ok());
+        wallet.use_consumer_owned_persistence().unwrap();
+        wallet.use_consumer_owned_persistence().unwrap(); // idempotent, never reversible
+        assert!(wallet.require_legacy_persistence().is_err());
+        let sequence = wallet.idb_sequence.load(Ordering::SeqCst);
+        // Poll the public async boundary: refusal must happen before any browser
+        // I/O, even though the legacy future normally opens IndexedDB.
+        {
+            use std::future::Future;
+            let mut flush = std::pin::pin!(wallet.flush());
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(matches!(
+                flush.as_mut().poll(&mut context),
+                std::task::Poll::Ready(Err(Error::Persistence { .. }))
+            ));
+        }
+        wallet.save_to_idb(); // native: any scheduling/browser call would panic
+        assert_eq!(wallet.idb_sequence.load(Ordering::SeqCst), sequence);
+        assert!(!wallet.idb_save_in_progress.load(Ordering::SeqCst));
+        let after = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+        let mut expected = before;
+        expected["sequence"] = after["sequence"].clone();
+        assert_eq!(after, expected); // same financial engine, no state adoption
+        wallet
+            .restore_from_snapshot(serde_json::from_value(after).unwrap())
+            .unwrap();
+        assert!(wallet.require_legacy_persistence().is_err()); // restore cannot undo ownership
+    }
+
+    #[test]
+    fn consumer_handoff_refuses_pending_legacy_save() {
+        use std::sync::atomic::Ordering;
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        wallet.idb_save_in_progress.store(true, Ordering::SeqCst);
+        assert!(wallet.use_consumer_owned_persistence().is_err());
+        assert!(wallet.require_legacy_persistence().is_ok());
+        assert!(wallet.idb_save_in_progress.load(Ordering::SeqCst));
+        wallet.idb_save_in_progress.store(false, Ordering::SeqCst);
+        wallet.use_consumer_owned_persistence().unwrap();
+        assert!(wallet.require_legacy_persistence().is_err());
+    }
+
+    #[test]
+    fn consumer_handoff_refuses_active_rgb_runtime() {
+        let mut wallet = make_test_wallet(false);
+        // Checked-out runtime has removed stock from the wallet.
+        assert!(wallet.use_consumer_owned_persistence().is_err());
+        assert!(wallet.require_legacy_persistence().is_ok());
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let shared_stock = wallet.rgb_stock.clone();
+        let borrowed = shared_stock.borrow_mut();
+        assert!(wallet.use_consumer_owned_persistence().is_err());
+        assert!(wallet.require_legacy_persistence().is_ok());
+        drop(borrowed);
+        wallet.use_consumer_owned_persistence().unwrap();
     }
 
     #[test]
