@@ -487,8 +487,9 @@ export function commitEncodedSnapshot(databaseName, storeName, key, expected, en
     try { request = indexedDB.open(databaseName, version); }
     catch (_) { reject('IndexedDB encoded open failed'); return; }
     request.onupgradeneeded = event => {
-      // Only explicit fresh setup may create a schema; never upgrade an existing one.
-      if (event.oldVersion !== 0) { request.transaction.abort(); return; }
+      // Only insert-only fresh setup may create a schema. An existing-record
+      // CAS must not recreate a deleted database or upgrade any existing one.
+      if (expected !== null || event.oldVersion !== 0) { request.transaction.abort(); return; }
       request.result.createObjectStore(storeName);
     };
     request.onerror = () => reject('IndexedDB encoded open failed');
