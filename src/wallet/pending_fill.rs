@@ -102,6 +102,60 @@ impl PendingFill {
     }
 }
 
+/// One-use Rust embedding capability for an attempted application. Never serialized,
+/// cloned or exposed to JS. A restored Applying record cannot recreate this value.
+#[cfg(feature = "esplora")]
+pub struct PreparedPendingApplication {
+    engine: std::rc::Weak<std::cell::RefCell<Option<rgbstd::persistence::Stock>>>,
+    snapshot: Vec<u8>,
+    pending: PendingFill,
+    original: crate::bitcoin::psbt::Psbt,
+    coloring: super::rust_only::ColoringInfo,
+    change_vout: u32,
+}
+
+#[cfg(feature = "esplora")]
+fn application_snapshot(wallet: &super::Wallet) -> Result<Vec<u8>, crate::Error> {
+    let mut snapshot = wallet.snapshot_for_review()?;
+    // The host allocates persistence sequences between prepare and consume.
+    // Only that sequence may change; every financial/pending/stock field is bound.
+    snapshot.sequence = 0;
+    serde_json::to_vec(&snapshot).map_err(|_| crate::Error::Persistence {
+        details: "pending application snapshot encoding failed".to_owned(),
+    })
+}
+
+#[cfg(feature = "esplora")]
+fn check_application_output(
+    pending: &PendingFill,
+    psbt: &crate::bitcoin::psbt::Psbt,
+    transfers: &[crate::RgbTransfer],
+) -> Result<(), crate::Error> {
+    use crate::FileContent;
+    let refusal = |details: &str| crate::Error::Persistence {
+        details: details.to_owned(),
+    };
+    if psbt.to_string() != pending.colored_psbt
+        || hex::encode(crate::bitcoin::consensus::serialize(&psbt.unsigned_tx))
+            != pending.request.colored_transaction_hex
+        || transfers.len() != 1
+    {
+        return Err(refusal("pending exact prospective transaction changed"));
+    }
+    let mut bytes = Vec::new();
+    transfers[0]
+        .save(&mut bytes)
+        .map_err(|_| refusal("pending application transfer encoding failed"))?;
+    if hex::encode(bytes) != pending.request.consignment_bytes_hex {
+        return Err(refusal("pending exact prospective transfer changed"));
+    }
+    Ok(())
+}
+
+/// Split SAME-engine application. The trusted embedding host must validate full
+/// wallet-owned authority, prepare, durably commit Applying plus approval debit,
+/// revalidate after acknowledgement, then consume with the one-use capability.
+/// This engine seam cannot acknowledge host persistence or grant signing authority.
 /// SAME-engine, memory-only application of the retained exact intent. This is a
 /// Rust embedding seam, NOT approval or persistence. The authenticated consumer
 /// must validate wallet-owned policy/ownership/receive authority before calling,
@@ -111,17 +165,17 @@ impl PendingFill {
 /// until explicit reconciliation; restoring it does not grant retry authority.
 #[cfg(feature = "esplora")]
 impl super::Wallet {
-    /// Apply once on the same stock; returns the exact reviewed PSBT without signing.
-    /// `Applying` records require reconciliation and may never be retried.
-    pub fn apply_consented_pending_fill(
+    /// Prepare without consuming RGB or registering outgoing rows. The complete
+    /// Applying intent can now be durably committed before consumption begins.
+    pub fn prepare_consented_pending_application(
         &mut self,
         association_id: &str,
         consent_digest: &str,
         now: u64,
-    ) -> Result<String, crate::Error> {
+    ) -> Result<PreparedPendingApplication, crate::Error> {
         use super::rust_only::{AssetColoringInfo, ColoringInfo};
+        use crate::Error;
         use crate::bitcoin::{consensus, psbt::Psbt};
-        use crate::{Error, FileContent};
         use std::{collections::HashMap, str::FromStr};
         let refusal = |details: &str| Error::Persistence {
             details: details.to_owned(),
@@ -135,7 +189,7 @@ impl super::Wallet {
             ));
         }
         self.use_consumer_owned_persistence()?;
-        let mut pending = self
+        let pending = self
             .btcx_pending_fill_v1
             .clone()
             .ok_or_else(|| refusal("pending consent absent"))?;
@@ -222,22 +276,6 @@ impl super::Wallet {
         };
         // Recompute on THIS stock before consumption, comparing complete emitted
         // PSBT/transaction/consignment bytes. A shape/digest alone is insufficient.
-        let check = |psbt: &Psbt, transfers: &[crate::RgbTransfer]| -> Result<(), Error> {
-            if psbt.to_string() != pending.colored_psbt
-                || hex::encode(consensus::serialize(&psbt.unsigned_tx)) != r.colored_transaction_hex
-                || transfers.len() != 1
-            {
-                return Err(refusal("pending exact prospective transaction changed"));
-            }
-            let mut bytes = Vec::new();
-            transfers[0]
-                .save(&mut bytes)
-                .map_err(|_| refusal("pending application transfer encoding failed"))?;
-            if hex::encode(bytes) != r.consignment_bytes_hex {
-                return Err(refusal("pending exact prospective transfer changed"));
-            }
-            Ok(())
-        };
         let change = r
             .allocations
             .get(&r.change_vout)
@@ -305,15 +343,49 @@ impl super::Wallet {
         applying.state = State::Applying;
         self.btcx_pending_fill_v1 = Some(applying);
         let preview = self.color_psbt_and_export(&mut psbt, coloring.clone())?;
-        check(&psbt, &preview)?;
-        psbt = original;
-        let transfers = self.color_psbt_and_consume_in_memory(&mut psbt, coloring)?;
-        check(&psbt, &transfers)?;
+        check_application_output(&pending, &psbt, &preview)?;
+        Ok(PreparedPendingApplication {
+            engine: std::rc::Rc::downgrade(&self.rgb_stock),
+            snapshot: application_snapshot(self)?,
+            pending,
+            original,
+            coloring,
+            change_vout,
+        })
+    }
+
+    /// Consume the capability once on the original unchanged engine, after the
+    /// host's durable acknowledgement. Any error leaves Applying for explicit
+    /// reconciliation. No restore/retry/record replacement can obtain a capability.
+    pub fn apply_prepared_pending_fill(
+        &mut self,
+        prepared: PreparedPendingApplication,
+        now: u64,
+    ) -> Result<String, crate::Error> {
+        let refusal = |details: &str| crate::Error::Persistence {
+            details: details.to_owned(),
+        };
+        let engine = prepared
+            .engine
+            .upgrade()
+            .ok_or_else(|| refusal("pending application engine unavailable"))?;
+        if !std::rc::Rc::ptr_eq(&engine, &self.rgb_stock)
+            || !self.consumer_owned_persistence
+            || now >= prepared.pending.request.expires_at
+            || application_snapshot(self)? != prepared.snapshot
+        {
+            return Err(refusal("pending application engine/state/expiry changed"));
+        }
+        let mut pending = prepared.pending;
+        let r = &pending.request;
+        let mut psbt = prepared.original;
+        let transfers = self.color_psbt_and_consume_in_memory(&mut psbt, prepared.coloring)?;
+        check_application_output(&pending, &psbt, &transfers)?;
         let row = self.register_collaborative_outgoing_transfer_in_memory(
             pending.facts.witness_txid.clone(),
             r.contract_id.clone(),
             vec![r.spent_outpoint.clone()],
-            Some((change_vout, change.amount)),
+            Some((prepared.change_vout, r.allocations[&r.change_vout].amount)),
             1,
         )?;
         if row.is_none() {
@@ -322,6 +394,35 @@ impl super::Wallet {
         pending.state = State::Applied;
         self.btcx_pending_fill_v1 = Some(pending);
         Ok(psbt.to_string())
+    }
+}
+
+#[cfg(all(test, feature = "esplora"))]
+pub(crate) fn storage_application_capability(
+    wallet: &mut super::Wallet,
+) -> PreparedPendingApplication {
+    // Guard tests only: NOT a valid transfer, accepted policy or successful prepare.
+    let pending = storage_fixture();
+    let mut applying = pending.clone();
+    applying.state = State::Applying;
+    wallet.btcx_pending_fill_v1 = Some(applying);
+    PreparedPendingApplication {
+        engine: std::rc::Rc::downgrade(&wallet.rgb_stock),
+        snapshot: application_snapshot(wallet).unwrap(),
+        pending,
+        original: crate::bitcoin::psbt::Psbt::from_unsigned_tx(crate::bitcoin::Transaction {
+            version: crate::bitcoin::transaction::Version::TWO,
+            lock_time: crate::bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        })
+        .unwrap(),
+        coloring: super::rust_only::ColoringInfo {
+            asset_info_map: Default::default(),
+            static_blinding: Some(1),
+            nonce: Some(3),
+        },
+        change_vout: 2,
     }
 }
 

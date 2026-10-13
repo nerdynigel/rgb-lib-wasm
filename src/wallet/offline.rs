@@ -3658,7 +3658,7 @@ pub(super) mod address_reuse_tests {
             let digest = wallet.pending_fill().unwrap().digest().to_owned();
             assert!(
                 wallet
-                    .apply_consented_pending_fill(
+                    .prepare_consented_pending_application(
                         if variant == "association" {
                             "wrong"
                         } else {
@@ -3706,7 +3706,7 @@ pub(super) mod address_reuse_tests {
             if variant == "detached" {
                 *wallet.rgb_stock.borrow_mut() = None;
             }
-            let result = wallet.apply_consented_pending_fill(
+            let result = wallet.prepare_consented_pending_application(
                 "storage-case",
                 &super::super::pending_fill::storage_fixture()
                     .digest()
@@ -3727,6 +3727,119 @@ pub(super) mod address_reuse_tests {
             after.as_object_mut().unwrap().remove("sequence");
             assert_eq!(before, after, "{variant}");
         }
+    }
+
+    #[cfg(feature = "esplora")]
+    #[test]
+    fn prepared_application_is_bound_to_exact_engine_state_and_postcommit_expiry() {
+        for variant in ["other-engine", "state-drift", "expiry", "detached"] {
+            let mut wallet = make_test_wallet(false);
+            *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+            wallet.use_consumer_owned_persistence().unwrap();
+            let prepared = super::super::pending_fill::storage_application_capability(&mut wallet);
+            // Host may allocate a persistence sequence to acknowledge Applying.
+            let snapshot = wallet.snapshot_for_persistence().unwrap();
+            let retained = serde_json::to_value(&snapshot.btcx_pending_fill_v1).unwrap();
+            let result = match variant {
+                "other-engine" => {
+                    let mut other = make_test_wallet(false);
+                    *other.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+                    other.use_consumer_owned_persistence().unwrap();
+                    other.btcx_pending_fill_v1 = snapshot.btcx_pending_fill_v1.clone();
+                    let before =
+                        serde_json::to_value(other.snapshot_for_review().unwrap()).unwrap();
+                    let result = other.apply_prepared_pending_fill(prepared, 0);
+                    assert_eq!(
+                        serde_json::to_value(other.snapshot_for_review().unwrap()).unwrap(),
+                        before
+                    );
+                    result
+                }
+                "state-drift" => {
+                    wallet
+                        .reuse_address_index
+                        .insert(bdk_wallet::KeychainKind::External, 1);
+                    wallet.apply_prepared_pending_fill(prepared, 0)
+                }
+                "expiry" => wallet.apply_prepared_pending_fill(prepared, 1),
+                "detached" => {
+                    *wallet.rgb_stock.borrow_mut() = None;
+                    wallet.apply_prepared_pending_fill(prepared, 0)
+                }
+                _ => unreachable!(),
+            };
+            assert!(result.is_err(), "{variant}");
+            assert_eq!(
+                serde_json::to_value(&wallet.btcx_pending_fill_v1).unwrap(),
+                retained
+            );
+            assert!(
+                wallet
+                    .prepare_consented_pending_application(
+                        "storage-case",
+                        super::super::pending_fill::storage_fixture().digest(),
+                        0
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(feature = "esplora")]
+    #[test]
+    fn dropped_application_capability_keeps_full_intent_and_restore_cannot_resume() {
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        wallet.use_consumer_owned_persistence().unwrap();
+        let prepared = super::super::pending_fill::storage_application_capability(&mut wallet);
+        let snapshot = wallet.snapshot_for_persistence().unwrap();
+        drop(prepared);
+        let expected = serde_json::to_value(&snapshot.btcx_pending_fill_v1).unwrap();
+        let mut restored =
+            Wallet::restore_consumer_owned_snapshot(wallet.wallet_data.clone(), snapshot).unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored.btcx_pending_fill_v1).unwrap(),
+            expected
+        );
+        assert!(
+            restored
+                .prepare_consented_pending_application(
+                    "storage-case",
+                    super::super::pending_fill::storage_fixture().digest(),
+                    0
+                )
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(&restored.btcx_pending_fill_v1).unwrap(),
+            expected
+        );
+    }
+
+    #[cfg(feature = "esplora")]
+    #[test]
+    fn application_attempt_after_sequence_commit_preserves_applying_on_engine_error() {
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        wallet.use_consumer_owned_persistence().unwrap();
+        let prepared = super::super::pending_fill::storage_application_capability(&mut wallet);
+        let before = wallet.snapshot_for_persistence().unwrap();
+        let error = wallet.apply_prepared_pending_fill(prepared, 0).unwrap_err();
+        // Sequence-only change passed the guard; actual empty coloring fails.
+        assert!(!error.to_string().contains("engine/state/expiry changed"));
+        assert_eq!(
+            serde_json::to_value(&wallet.btcx_pending_fill_v1).unwrap(),
+            serde_json::to_value(&before.btcx_pending_fill_v1).unwrap()
+        );
+        assert!(
+            wallet
+                .prepare_consented_pending_application(
+                    "storage-case",
+                    super::super::pending_fill::storage_fixture().digest(),
+                    0
+                )
+                .is_err()
+        );
     }
 
     #[test]
