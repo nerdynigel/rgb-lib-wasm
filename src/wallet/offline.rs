@@ -3265,6 +3265,19 @@ impl Wallet {
         )
         .map_err(|details| Error::Persistence { details })?;
 
+        // Exact pending terms do not make old financial state current. Once
+        // intent is active, refuse rollback before decoding/adopting any state.
+        // This local guard is not authentication or cross-writer CAS; the
+        // encrypted consumer still owns those checks. Legacy backup restoration
+        // without an active pending fill retains its existing semantics.
+        if self.btcx_pending_fill_v1.is_some()
+            && snapshot.sequence < self.idb_sequence.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::Persistence {
+                details: s!("active pending fill snapshot rollback refused"),
+            });
+        }
+
         // Restore BDK changeset and re-load the BDK wallet
         let restored_bdk = if let Some(changeset) = snapshot.bdk_changeset {
             let mut database = super::memory_store::MemoryStore::new();
@@ -3532,6 +3545,38 @@ pub(super) mod address_reuse_tests {
         assert!(
             serde_json::from_value::<super::super::idb_store::WalletSnapshot>(changed).is_err()
         );
+    }
+
+    #[test]
+    fn active_pending_restore_refuses_older_financial_state() {
+        for state in ["Consented", "Applied"] {
+            let mut wallet = make_test_wallet(false);
+            *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+            let mut initial = wallet.snapshot_for_persistence().unwrap();
+            initial.btcx_pending_fill_v1 = Some(super::super::pending_fill::storage_fixture());
+            let mut initial = serde_json::to_value(initial).unwrap();
+            initial["btcx_pending_fill_v1"]["state"] = state.into();
+            initial["sequence"] = 100.into();
+            wallet
+                .restore_from_snapshot(serde_json::from_value(initial).unwrap())
+                .unwrap();
+            let before = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+            let mut older = before.clone();
+            older["sequence"] = 1.into();
+            // Exact same pending terms/state, different financial address state.
+            older["reuse_address_index"] = serde_json::json!({"External": 42});
+            assert!(
+                wallet
+                    .restore_from_snapshot(serde_json::from_value(older).unwrap())
+                    .is_err(),
+                "{state}"
+            );
+            let mut after =
+                serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+            assert_eq!(after["sequence"], before["sequence"].as_u64().unwrap() + 1);
+            after["sequence"] = before["sequence"].clone();
+            assert_eq!(after, before, "{state}");
+        }
     }
 
     #[test]
