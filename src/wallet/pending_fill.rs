@@ -86,6 +86,21 @@ impl<'de> Deserialize<'de> for PendingFill {
     }
 }
 
+impl PendingFill {
+    /// Read-only binding used by the embedding consumer's exact-consent guard.
+    /// A digest is not proof of approval, authentication or durable commit.
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub(crate) fn require_consented(&self) -> Result<(), String> {
+        if self.state != State::Consented {
+            return Err("pending fill must enter through consented state".to_owned());
+        }
+        Ok(())
+    }
+}
+
 /// Restore is not a lifecycle transition. Once an engine holds an exact pending
 /// record, importing another snapshot may neither erase it nor replace its terms
 /// or state. Reconciliation/confirmed application needs a separate guarded path.

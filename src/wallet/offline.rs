@@ -3207,6 +3207,46 @@ impl Wallet {
         Ok(())
     }
 
+    /// Install an exact pending intent in THIS active engine, without replacing
+    /// any BTC/RGB state or writing a legacy snapshot. Rust-only embedding seam.
+    ///
+    /// The consumer must independently validate current approval, policy, role,
+    /// ownership, authenticated prevouts and inspected economics BEFORE calling,
+    /// then commit the complete snapshot through its authenticated exact-record
+    /// CAS BEFORE releasing signing. This method does not confer authority or
+    /// acknowledge persistence. Failed/ambiguous consumer commits must poison the
+    /// consumer handle; they must never clear this record to retry another fill.
+    /// An exact repeat is idempotent; erasure, replacement and state substitution
+    /// remain unavailable. Application requires a separate guarded consume path.
+    pub fn install_consented_pending_fill(
+        &mut self,
+        pending: super::pending_fill::PendingFill,
+    ) -> Result<(), Error> {
+        let refusal = |details| Error::Persistence { details };
+        if !self.consumer_owned_persistence {
+            return Err(refusal(s!(
+                "pending consent requires consumer-owned persistence"
+            )));
+        }
+        // Refuse while the shared RGB runtime has detached or borrowed stock.
+        // Reuse the handoff guard without changing its irreversible ownership.
+        self.use_consumer_owned_persistence()?;
+        pending.require_consented().map_err(refusal)?;
+        super::pending_fill::require_preserved_on_restore(
+            self.btcx_pending_fill_v1.as_ref(),
+            Some(&pending),
+        )
+        .map_err(refusal)?;
+        self.btcx_pending_fill_v1 = Some(pending);
+        Ok(())
+    }
+
+    /// Read-only exact intent. Never exposes wallet secret material or mutable
+    /// state; the record alone is not a signing or persistence acknowledgement.
+    pub fn pending_fill(&self) -> Option<&super::pending_fill::PendingFill> {
+        self.btcx_pending_fill_v1.as_ref()
+    }
+
     fn require_legacy_persistence(&self) -> Result<(), Error> {
         if self.consumer_owned_persistence {
             return Err(Error::Persistence {
@@ -3524,6 +3564,144 @@ pub(super) mod address_reuse_tests {
             vss_client: None,
             last_vss_backup_error: std::cell::RefCell::new(None),
         }
+    }
+
+    #[test]
+    fn install_consented_pending_preserves_same_wallet_financial_state() {
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        wallet.use_consumer_owned_persistence().unwrap();
+        let mut before = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+        let pending = super::super::pending_fill::storage_fixture();
+        let digest = pending.digest().to_owned();
+        let sequence = wallet
+            .idb_sequence
+            .load(std::sync::atomic::Ordering::SeqCst);
+        wallet
+            .install_consented_pending_fill(pending.clone())
+            .unwrap();
+        wallet.install_consented_pending_fill(pending).unwrap();
+        assert_eq!(wallet.pending_fill().unwrap().digest(), digest);
+        assert_eq!(
+            wallet
+                .idb_sequence
+                .load(std::sync::atomic::Ordering::SeqCst),
+            sequence
+        );
+        assert!(
+            !wallet
+                .idb_save_in_progress
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        let mut after = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+        before.as_object_mut().unwrap().remove("sequence");
+        after.as_object_mut().unwrap().remove("sequence");
+        assert!(
+            before
+                .as_object_mut()
+                .unwrap()
+                .remove("btcx_pending_fill_v1")
+                .is_none()
+        );
+        assert!(
+            after
+                .as_object_mut()
+                .unwrap()
+                .remove("btcx_pending_fill_v1")
+                .is_some()
+        );
+        assert_eq!(before, after);
+        let snapshot = wallet.snapshot_for_persistence().unwrap();
+        let restored =
+            Wallet::restore_existing_snapshot(wallet.wallet_data.clone(), snapshot).unwrap();
+        assert_eq!(restored.pending_fill().unwrap().digest(), digest);
+    }
+
+    #[test]
+    fn install_consented_pending_refuses_legacy_and_active_runtime() {
+        use std::sync::atomic::Ordering;
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let pending = super::super::pending_fill::storage_fixture();
+        assert!(
+            wallet
+                .install_consented_pending_fill(pending.clone())
+                .is_err()
+        );
+        assert!(wallet.pending_fill().is_none());
+        wallet.use_consumer_owned_persistence().unwrap();
+        wallet.idb_save_in_progress.store(true, Ordering::SeqCst);
+        assert!(
+            wallet
+                .install_consented_pending_fill(pending.clone())
+                .is_err()
+        );
+        wallet.idb_save_in_progress.store(false, Ordering::SeqCst);
+        let stock = wallet.rgb_stock.clone();
+        let borrowed = stock.borrow_mut();
+        assert!(
+            wallet
+                .install_consented_pending_fill(pending.clone())
+                .is_err()
+        );
+        drop(borrowed);
+        let detached = wallet.rgb_stock.borrow_mut().take();
+        assert!(
+            wallet
+                .install_consented_pending_fill(pending.clone())
+                .is_err()
+        );
+        assert!(wallet.pending_fill().is_none());
+        *wallet.rgb_stock.borrow_mut() = detached;
+        wallet.install_consented_pending_fill(pending).unwrap();
+    }
+
+    #[test]
+    fn install_consented_pending_refuses_replacement_and_applied_state() {
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        wallet.use_consumer_owned_persistence().unwrap();
+        let pending = super::super::pending_fill::storage_fixture();
+        let mut applied = serde_json::to_value(&pending).unwrap();
+        applied["state"] = "Applied".into();
+        let applied = serde_json::from_value(applied).unwrap();
+        assert!(wallet.install_consented_pending_fill(applied).is_err());
+        assert!(wallet.pending_fill().is_none());
+        wallet.install_consented_pending_fill(pending).unwrap();
+        let before = serde_json::to_value(wallet.pending_fill()).unwrap();
+        assert!(
+            wallet
+                .install_consented_pending_fill(
+                    super::super::pending_fill::replacement_storage_fixture(),
+                )
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(wallet.pending_fill()).unwrap(), before);
+    }
+
+    #[test]
+    fn install_consented_pending_cannot_downgrade_restored_applied_intent() {
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let pending = super::super::pending_fill::storage_fixture();
+        let mut applied = serde_json::to_value(&pending).unwrap();
+        applied["state"] = "Applied".into();
+        let mut snapshot = wallet.snapshot_for_persistence().unwrap();
+        snapshot.btcx_pending_fill_v1 = Some(serde_json::from_value(applied).unwrap());
+        wallet.restore_from_snapshot(snapshot).unwrap();
+        wallet.use_consumer_owned_persistence().unwrap();
+        let before = serde_json::to_value(wallet.pending_fill()).unwrap();
+        let sequence = wallet
+            .idb_sequence
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(wallet.install_consented_pending_fill(pending).is_err());
+        assert_eq!(serde_json::to_value(wallet.pending_fill()).unwrap(), before);
+        assert_eq!(
+            wallet
+                .idb_sequence
+                .load(std::sync::atomic::Ordering::SeqCst),
+            sequence
+        );
     }
 
     #[test]
