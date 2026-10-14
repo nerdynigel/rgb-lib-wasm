@@ -25,6 +25,9 @@ struct Request {
     nonce: u64,
     colored_transaction_hex: String,
     consignment_bytes_hex: String,
+    // Independently accepted wallet authority (e.g. the exact accepted review
+    // digest). Bound into consent; empty/absent authority is refused on apply.
+    accepted_authority_sha256: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -197,6 +200,11 @@ impl super::Wallet {
         if pending.state != State::Consented
             || r.association_id != association_id
             || pending.digest != consent_digest
+            || r.accepted_authority_sha256.len() != 64
+            || !r
+                .accepted_authority_sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
             || now >= r.expires_at
         {
             return Err(refusal(
@@ -475,6 +483,7 @@ pub(crate) fn storage_fixture() -> PendingFill {
         nonce: 3,
         colored_transaction_hex: "03".into(),
         consignment_bytes_hex: "04".into(),
+        accepted_authority_sha256: "11".repeat(32),
     };
     let facts = InspectedTransfer {
         bytes_sha256: "00".repeat(32),
