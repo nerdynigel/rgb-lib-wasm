@@ -3531,8 +3531,52 @@ impl Wallet {
     }
 }
 
-#[cfg(test)]
-pub(super) mod address_reuse_tests {
+#[cfg(feature = "test-fixtures")]
+impl Wallet {
+    /// TEST-ONLY: deterministic funded regtest wallet for the THE-944 item-9
+    /// exported-surface positive lifecycle test. Builds the established
+    /// in-memory test wallet, installs ONE deterministic synthetic unspent
+    /// funding output into the `InMemoryDb` (the seal is `BlindSeal::new_random`
+    /// on that outpoint, so no BDK ownership is required), then issues ONE
+    /// clearly-fake NIA through the existing in-memory builder to obtain a
+    /// genuine SAME-engine allocation. No network, no key material, no new
+    /// crypto. Feature-gated; never present in default/production builds and
+    /// no fixture initializer is exported to production.
+    pub fn new_funded_regtest_wallet_for_tests() -> Result<Self, Error> {
+        use crate::database::memory_db::{ActiveValue, DbTxoActMod};
+        let mut wallet = address_reuse_tests::make_test_wallet(false);
+        wallet.use_consumer_owned_persistence()?;
+        *wallet.rgb_stock.borrow_mut() = Some(rgbstd::persistence::Stock::in_memory());
+        wallet
+            .database
+            .set_txo(DbTxoActMod {
+                idx: ActiveValue::NotSet,
+                txid: ActiveValue::Set("11".repeat(32)),
+                vout: ActiveValue::Set(0),
+                btc_amount: ActiveValue::Set("1000".to_string()),
+                spent: ActiveValue::Set(false),
+                exists: ActiveValue::Set(true),
+                pending_witness: ActiveValue::Set(false),
+            })
+            .map_err(|e| Error::Persistence {
+                details: format!("fixture funding txo failed: {e:?}"),
+            })?;
+        wallet
+            .issue_asset_nia_in_memory(
+                "T944".to_string(),
+                "THE-944 item-9 unfunded fixture".to_string(),
+                0,
+                vec![1107],
+            )
+            .map_err(|e| Error::Persistence {
+                details: format!("fixture NIA issuance failed: {e:?}"),
+            })?;
+        Ok(wallet)
+    }
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+pub(crate) mod address_reuse_tests {
     use super::*;
     use crate::keys::generate_keys;
     use crate::utils::{get_descriptors, str_to_xpub};
@@ -3542,7 +3586,7 @@ pub(super) mod address_reuse_tests {
     /// Bypasses `Wallet::new` (which requires RGB schema import / js-sys)
     /// by constructing only the BDK wallet and the fields that
     /// `_get_new_address` touches.
-    pub(in crate::wallet) fn make_test_wallet(reuse: bool) -> Wallet {
+    pub(crate) fn make_test_wallet(reuse: bool) -> Wallet {
         let keys = generate_keys(BitcoinNetwork::Regtest);
         let bdk_network = BdkNetwork::from(BitcoinNetwork::Regtest);
         let xpub_rgb = str_to_xpub(&keys.account_xpub_colored, bdk_network).unwrap();
