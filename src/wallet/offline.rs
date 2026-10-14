@@ -3583,8 +3583,9 @@ impl Wallet {
     /// `previous_transactions_hex`. Never present in default/production builds.
     pub fn new_funded_regtest_wallet_for_tests(
     ) -> Result<(Self, crate::bitcoin::Transaction), Error> {
-        use crate::bitcoin::transaction::{OutPoint, TxIn, TxOut, Version, Witness};
-        use crate::bitcoin::{hashes::Hash, Amount, LockTime, ScriptBuf, Sequence, Transaction, Txid};
+        use crate::bitcoin::absolute::LockTime;
+        use crate::bitcoin::transaction::{OutPoint, TxIn, TxOut, Version};
+        use crate::bitcoin::{hashes::Hash, Amount, ScriptBuf, Sequence, Transaction, Txid, Witness};
         let mut wallet = address_reuse_tests::make_test_wallet(false);
         let funding_tx = Transaction {
             version: Version::TWO,
