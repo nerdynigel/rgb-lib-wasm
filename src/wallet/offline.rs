@@ -3542,18 +3542,30 @@ impl Wallet {
     /// genuine SAME-engine allocation. No network, no key material, no new
     /// crypto. Feature-gated; never present in default/production builds and
     /// no fixture initializer is exported to production.
-    pub fn new_funded_regtest_wallet_for_tests() -> Result<Self, Error> {
+    /// TEST-ONLY: seed ONE real unspent funding output for `funding_tx` (vout 0)
+    /// into this wallet's `InMemoryDb` and enable the in-memory RGB stock. The
+    /// stored txo txid equals `funding_tx.compute_txid()`, so a reviewed request
+    /// can bind the SAME previous transaction (the prior fabricated-txid fixture
+    /// could not). Callable on any wallet (including the mnemonic-derived active
+    /// default wallet). Feature-gated; no production presence.
+    pub fn fund_wallet_for_tests(
+        &mut self,
+        funding_tx: crate::bitcoin::Transaction,
+    ) -> Result<(), Error> {
         use crate::database::memory_db::{ActiveValue, DbTxoActMod};
-        let mut wallet = address_reuse_tests::make_test_wallet(false);
-        wallet.use_consumer_owned_persistence()?;
-        *wallet.rgb_stock.borrow_mut() = Some(rgbstd::persistence::Stock::in_memory());
-        wallet
-            .database
+        self.use_consumer_owned_persistence()?;
+        *self.rgb_stock.borrow_mut() = Some(rgbstd::persistence::Stock::in_memory());
+        let value = funding_tx
+            .output
+            .first()
+            .map(|o| o.value.to_sat())
+            .unwrap_or(0);
+        self.database
             .set_txo(DbTxoActMod {
                 idx: ActiveValue::NotSet,
-                txid: ActiveValue::Set("11".repeat(32)),
+                txid: ActiveValue::Set(funding_tx.compute_txid().to_string()),
                 vout: ActiveValue::Set(0),
-                btc_amount: ActiveValue::Set("1000".to_string()),
+                btc_amount: ActiveValue::Set(value.to_string()),
                 spent: ActiveValue::Set(false),
                 exists: ActiveValue::Set(true),
                 pending_witness: ActiveValue::Set(false),
@@ -3561,6 +3573,34 @@ impl Wallet {
             .map_err(|e| Error::Persistence {
                 details: format!("fixture funding txo failed: {e:?}"),
             })?;
+        Ok(())
+    }
+
+    /// TEST-ONLY convenience: build the established in-memory test wallet, fund it
+    /// with a deterministic one-output funding transaction via
+    /// [`Self::fund_wallet_for_tests`], issue ONE clearly-fake NIA, and return
+    /// `(wallet, funding_tx)` so callers can embed the matching
+    /// `previous_transactions_hex`. Never present in default/production builds.
+    pub fn new_funded_regtest_wallet_for_tests(
+    ) -> Result<(Self, crate::bitcoin::Transaction), Error> {
+        use crate::bitcoin::transaction::{OutPoint, TxIn, TxOut, Version, Witness};
+        use crate::bitcoin::{hashes::Hash, Amount, LockTime, ScriptBuf, Sequence, Transaction, Txid};
+        let mut wallet = address_reuse_tests::make_test_wallet(false);
+        let funding_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::all_zeros(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        wallet.fund_wallet_for_tests(funding_tx.clone())?;
         wallet
             .issue_asset_nia_in_memory(
                 "T944".to_string(),
@@ -3571,7 +3611,7 @@ impl Wallet {
             .map_err(|e| Error::Persistence {
                 details: format!("fixture NIA issuance failed: {e:?}"),
             })?;
-        Ok(wallet)
+        Ok((wallet, funding_tx))
     }
 }
 
