@@ -3554,6 +3554,12 @@ impl Wallet {
     ) -> Result<(), Error> {
         use crate::database::memory_db::{ActiveValue, DbTxoActMod};
         self.use_consumer_owned_persistence()?;
+        // Seed the same transaction through BDK's normal indexer as well. Only
+        // scripts already owned by this wallet become spendable; synthetic RGB
+        // funding scripts do not acquire wallet ownership. TEST-only, no sync.
+        self.bdk_wallet
+            .apply_unconfirmed_txs([(funding_tx.clone(), 1)]);
+        self.bdk_wallet.persist(&mut self.bdk_database)?;
         *self.rgb_stock.borrow_mut() = Some(rgbstd::persistence::Stock::in_memory());
         let value = funding_tx
             .output

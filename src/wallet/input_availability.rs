@@ -307,6 +307,31 @@ mod tests {
     }
 
     #[test]
+    fn test_funding_indexes_only_actual_local_btc_outputs() {
+        let (mut wallet, input, output) = btc_fixture();
+        let tx = (*wallet.bdk_wallet.tx_graph().get_tx(input.txid).unwrap()).clone();
+        wallet.fund_wallet_for_tests(tx).unwrap();
+        wallet
+            .require_available_btc_input(input, &output, &[input])
+            .unwrap();
+        let foreign = crate::bitcoin::Transaction {
+            version: crate::bitcoin::transaction::Version::TWO,
+            lock_time: crate::bitcoin::absolute::LockTime::ZERO,
+            input: vec![crate::bitcoin::TxIn::default()],
+            output: vec![TxOut {
+                value: BdkAmount::from_sat(1000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let foreign_input = OutPoint::new(foreign.compute_txid(), 0);
+        let foreign_output = foreign.output[0].clone();
+        wallet.fund_wallet_for_tests(foreign).unwrap();
+        assert!(wallet
+            .require_available_btc_input(foreign_input, &foreign_output, &[foreign_input])
+            .is_err());
+    }
+
+    #[test]
     fn btc_input_requires_exact_bdk_owned_unspent_without_mutation() {
         let (wallet, input, output) = btc_fixture();
         let before = serde_json::to_vec(&wallet.snapshot_for_review().unwrap()).unwrap();
