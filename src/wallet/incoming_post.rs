@@ -669,12 +669,20 @@ mod tests {
                     serde_json::to_value(&frozen.post).unwrap(),
                     serde_json::to_value(&post).unwrap()
                 );
+                // Read-only observation proof above remains; exercise the Rust
+                // embedding entry independently on the unchanged SAME engine.
+                drop(frozen);
                 wallet.use_consumer_owned_persistence().unwrap();
-                let actual =
-                    super::super::incoming_application::PreparedIncoming::new(&mut wallet, frozen)
-                        .unwrap()
-                        .apply()
-                        .unwrap();
+                let (prepared_post, actual) = super::super::incoming_test_indexer::apply_exact(
+                    &mut wallet,
+                    recipient,
+                    contract,
+                    receipt,
+                    &bytes,
+                    &tx,
+                )
+                .unwrap();
+                assert_eq!(prepared_post, serde_json::to_value(&post).unwrap());
                 assert_eq!(
                     serde_json::to_value(actual).unwrap(),
                     serde_json::to_value(&post).unwrap()

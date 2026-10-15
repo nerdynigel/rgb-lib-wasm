@@ -1,12 +1,12 @@
-//! Private exact incoming application core. No approval or persistence authority.
-//! Kept private until the embedding journal commits intent/debit before consume
-//! and quarantines every error/cancellation after that acknowledgement.
+//! Exact incoming Rust embedding capability. No approval or persistence authority.
+//! The host must commit intent/debit before consume and quarantine every
+//! error/cancellation after that acknowledgement. Never exported to JavaScript.
 use super::incoming_observation::{FrozenIncoming, complete_source};
 use super::*;
 
 /// Exclusive SAME-engine custody. Neither clonable nor serializable. Dropping
 /// before consume leaves the engine unchanged; it does not roll back host intent.
-pub(super) struct PreparedIncoming<'a> {
+pub struct PreparedIncoming<'a> {
     wallet: &'a mut Wallet,
     frozen: FrozenIncoming,
 }
@@ -25,12 +25,27 @@ impl<'a> PreparedIncoming<'a> {
         Ok(Self { wallet, frozen })
     }
 
+    /// Complete detached checkpoint for the host's pre-mutation journal. This
+    /// borrowed view cannot construct another preparation or change its contents.
+    pub fn prospective_snapshot(&self) -> &super::idb_store::WalletSnapshot {
+        &self.frozen.post
+    }
+
+    /// Validate the COMPLETE original checkpoint AND staged BDK graph while
+    /// retaining exclusive engine custody across the host's persistence awaits.
+    pub fn require_original(&self) -> Result<(), Error> {
+        if complete_source(self.wallet)? != self.frozen.source {
+            return Err(Error::InvalidConsignment);
+        }
+        Ok(())
+    }
+
     /// Memory-only, consuming transition. The host must durably acknowledge its
     /// exact intent/debit and revalidate session/expiry/revocation BEFORE calling.
     /// Success is NOT durable settlement or permission to sign. The complete
     /// resulting checkpoint still needs authenticated journal CAS/read-back.
     /// Errors after the first mutation are ambiguous; never infer rollback/retry.
-    pub(super) fn apply(self) -> Result<super::idb_store::WalletSnapshot, Error> {
+    pub fn apply(self) -> Result<super::idb_store::WalletSnapshot, Error> {
         let Self { wallet, frozen } = self;
         if complete_source(wallet)? != frozen.source || !wallet.consumer_owned_persistence {
             return Err(Error::InvalidConsignment);
@@ -99,5 +114,45 @@ impl<'a> PreparedIncoming<'a> {
             return Err(Error::InvalidConsignment);
         }
         Ok(actual)
+    }
+}
+
+impl Wallet {
+    /// Prepare a one-shot exact confirmed NIA receipt on the SAME exclusively
+    /// borrowed engine. Regtest and consumer-owned persistence only. Established
+    /// RGB/BDK validation derives the complete post without active mutation.
+    ///
+    /// The host must durably commit and read back this prospective checkpoint,
+    /// its actual approval/debit and original source, then revalidate its live
+    /// session/expiry/revocation before `apply`. A recovered journal, supplied
+    /// checkpoint or success flag cannot construct this capability. Application
+    /// is memory-only; the host must seal/read back the complete actual post.
+    pub async fn prepare_confirmed_pending_witness_receive(
+        &mut self,
+        online: Online,
+        recipient: &str,
+        contract: ContractId,
+        outpoint: OutPoint,
+        units: u64,
+        consignment: &[u8],
+        transaction: &BdkTransaction,
+    ) -> Result<PreparedIncoming<'_>, Error> {
+        if self.wallet_data.bitcoin_network != BitcoinNetwork::Regtest
+            || !self.consumer_owned_persistence
+        {
+            return Err(Error::InvalidConsignment);
+        }
+        let frozen = self
+            .observe_pending_witness_receive(
+                online,
+                recipient,
+                contract,
+                outpoint,
+                units,
+                consignment,
+                transaction,
+            )
+            .await?;
+        PreparedIncoming::new(self, frozen)
     }
 }

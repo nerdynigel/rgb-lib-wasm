@@ -127,15 +127,13 @@ impl Drop for Server {
     }
 }
 
-pub(super) fn observe(
+fn with_indexer<T>(
     wallet: &mut Wallet,
-    recipient: &str,
-    contract: ContractId,
     receipt: OutPoint,
-    consignment: &[u8],
     transaction: &BdkTransaction,
     fault: Fault,
-) -> Result<super::incoming_observation::FrozenIncoming, Error> {
+    action: impl FnOnce(&tokio::runtime::Runtime, &mut Wallet, Online) -> Result<T, Error>,
+) -> Result<T, Error> {
     let genesis = bitcoin::blockdata::constants::genesis_block(BdkNetwork::Regtest).block_hash();
     let hash = BlockHash::from_str(&"01".repeat(32)).unwrap();
     let mut routes = HashMap::from([
@@ -170,10 +168,32 @@ pub(super) fn observe(
         .enable_all()
         .build()
         .unwrap();
-    let result = runtime.block_on(async {
-        let online = wallet.go_online(true, server.address.clone()).await?;
-        wallet
-            .observe_pending_witness_receive(
+    let online = runtime.block_on(wallet.go_online(true, server.address.clone()))?;
+    let result = action(&runtime, wallet, online);
+    assert_eq!(
+        server.injected.load(Ordering::SeqCst),
+        fault != Fault::None,
+        "negative case must reach its intended network fault"
+    );
+    result
+}
+
+pub(super) fn observe(
+    wallet: &mut Wallet,
+    recipient: &str,
+    contract: ContractId,
+    receipt: OutPoint,
+    consignment: &[u8],
+    transaction: &BdkTransaction,
+    fault: Fault,
+) -> Result<super::incoming_observation::FrozenIncoming, Error> {
+    with_indexer(
+        wallet,
+        receipt,
+        transaction,
+        fault,
+        |runtime, wallet, online| {
+            runtime.block_on(wallet.observe_pending_witness_receive(
                 online,
                 recipient,
                 contract,
@@ -181,13 +201,77 @@ pub(super) fn observe(
                 1107,
                 consignment,
                 transaction,
-            )
-            .await
-    });
-    assert_eq!(
-        server.injected.load(Ordering::SeqCst),
-        fault != Fault::None,
-        "negative case must reach its intended network fault"
-    );
-    result
+            ))
+        },
+    )
+}
+
+/// Exercise the public Rust embedding boundary; no FrozenIncoming constructor
+/// or prospective checkpoint supplied by the host can enter this path.
+pub(super) fn apply_exact(
+    wallet: &mut Wallet,
+    recipient: &str,
+    contract: ContractId,
+    receipt: OutPoint,
+    consignment: &[u8],
+    transaction: &BdkTransaction,
+) -> Result<(serde_json::Value, serde_json::Value), Error> {
+    with_indexer(
+        wallet,
+        receipt,
+        transaction,
+        Fault::None,
+        |runtime, wallet, online| {
+            let original = super::incoming_observation::complete_source(wallet)?;
+            wallet.consumer_owned_persistence = false;
+            assert!(
+                runtime
+                    .block_on(wallet.prepare_confirmed_pending_witness_receive(
+                        online.clone(),
+                        recipient,
+                        contract,
+                        receipt,
+                        1107,
+                        consignment,
+                        transaction,
+                    ))
+                    .is_err(),
+                "legacy persistence must refuse the public prepare boundary"
+            );
+            wallet.consumer_owned_persistence = true;
+            assert_eq!(
+                super::incoming_observation::complete_source(wallet)?,
+                original
+            );
+            let prepared = runtime.block_on(wallet.prepare_confirmed_pending_witness_receive(
+                online.clone(),
+                recipient,
+                contract,
+                receipt,
+                1107,
+                consignment,
+                transaction,
+            ))?;
+            prepared.require_original()?;
+            drop(prepared);
+            assert_eq!(
+                super::incoming_observation::complete_source(wallet)?,
+                original,
+                "dropping a public preparation cannot consume any state"
+            );
+            let prepared = runtime.block_on(wallet.prepare_confirmed_pending_witness_receive(
+                online,
+                recipient,
+                contract,
+                receipt,
+                1107,
+                consignment,
+                transaction,
+            ))?;
+            prepared.require_original()?;
+            let prospective = serde_json::to_value(prepared.prospective_snapshot()).unwrap();
+            let actual = serde_json::to_value(prepared.apply()?).unwrap();
+            Ok((prospective, actual))
+        },
+    )
 }

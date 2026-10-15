@@ -7,6 +7,8 @@ pub mod idb_store;
 #[cfg(feature = "esplora")]
 mod incoming_application;
 #[cfg(feature = "esplora")]
+pub use incoming_application::PreparedIncoming;
+#[cfg(feature = "esplora")]
 mod incoming_bdk;
 #[cfg(feature = "esplora")]
 mod incoming_history;
