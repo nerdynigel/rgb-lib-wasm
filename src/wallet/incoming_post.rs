@@ -318,6 +318,332 @@ mod tests {
     }
 
     #[test]
+    fn valid_nia_transfer_projects_full_checkpoint_without_active_mutation() {
+        use super::super::rust_only::{AssetColoringInfo, ColoringInfo};
+        let (mut wallet, mut tx, prevouts, inclusion) =
+            super::super::incoming_bdk::tests::fixture();
+        let sender = super::super::offline::address_reuse_tests::make_test_wallet(false);
+        let mut stock = Stock::in_memory();
+        let foreign = tx.input[1].previous_output;
+        let issued = ContractBuilder::with(
+            Identity::default(),
+            NonInflatableAsset::schema(),
+            NonInflatableAsset::types(),
+            NonInflatableAsset::scripts(),
+            wallet.chain_net(),
+        )
+        .add_global_state(
+            "spec",
+            AssetSpec {
+                ticker: Ticker::try_from("TEST".to_string()).unwrap(),
+                name: Name::try_from("Fake projection test".to_string()).unwrap(),
+                details: None,
+                precision: Precision::try_from(0u8).unwrap(),
+            },
+        )
+        .unwrap()
+        .add_global_state(
+            "terms",
+            ContractTerms {
+                text: RicardianContract::default(),
+                media: None,
+            },
+        )
+        .unwrap()
+        .add_global_state("issuedSupply", Amount::from(1107u64))
+        .unwrap()
+        .add_fungible_state(
+            "assetOwner",
+            BlindSeal::new_random(
+                RgbTxid::from_str(&foreign.txid.to_string()).unwrap(),
+                foreign.vout,
+            ),
+            1107u64,
+        )
+        .unwrap()
+        .issue_contract()
+        .unwrap();
+        let contract = issued.contract_id();
+        stock.import_contract(issued, &DumbResolver).unwrap();
+        *sender.rgb_stock.borrow_mut() = Some(stock);
+        // OpretFirst requires OP_RETURN before the wallet P2TR outputs.
+        tx.output.insert(
+            0,
+            TxOut {
+                value: BdkAmount::ZERO,
+                script_pubkey: ScriptBuf::new_op_return([]),
+            },
+        );
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        let transfer = sender
+            .color_psbt_and_export(
+                &mut psbt,
+                ColoringInfo {
+                    asset_info_map: HashMap::from([(
+                        contract,
+                        AssetColoringInfo {
+                            output_map: HashMap::from([(1, 1107)]),
+                            static_blinding: Some(23),
+                        },
+                    )]),
+                    static_blinding: Some(29),
+                    nonce: Some(31),
+                },
+            )
+            .unwrap()
+            .remove(0);
+        tx = psbt.unsigned_tx;
+        let receipt = OutPoint::new(tx.compute_txid(), 1);
+        let witness = RgbTxid::from_str(&receipt.txid.to_string()).unwrap();
+        let resolver = PreFetchResolver::new(
+            HashMap::from([(
+                witness,
+                WitnessStatus::Resolved(
+                    tx.clone(),
+                    WitnessOrd::Mined(
+                        WitnessPos::bitcoin(NonZeroU32::new(20).unwrap(), 1_700_000_000).unwrap(),
+                    ),
+                ),
+            )]),
+            wallet.chain_net(),
+        );
+        let valid = transfer
+            .clone()
+            .validate(
+                &resolver,
+                &ValidationConfig {
+                    chain_net: wallet.chain_net(),
+                    trusted_typesystem: AssetSchema::Nia.types(),
+                    ..Default::default()
+                },
+            )
+            .expect("established RGB validator accepts actual NIA transfer");
+        assert!(super::super::incoming_history::safe_to_accept(
+            valid.validation_status()
+        ));
+        let recipient_string = XChainNet::with(
+            wallet.chain_net(),
+            Beneficiary::WitnessVout(
+                Pay2Vout::new(
+                    AddressPayload::from_script(&tx.output[receipt.vout as usize].script_pubkey)
+                        .unwrap(),
+                ),
+                None,
+            ),
+        )
+        .to_string();
+        let recipient = recipient_string.as_str();
+        wallet
+            .database
+            .set_pending_witness_script(DbPendingWitnessScriptActMod {
+                script: ActiveValue::Set(
+                    tx.output[receipt.vout as usize]
+                        .script_pubkey
+                        .to_hex_string(),
+                ),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .database
+            .set_asset(DbAssetActMod {
+                id: ActiveValue::Set(contract.to_string()),
+                schema: ActiveValue::Set(AssetSchema::Nia),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut bytes = vec![];
+        transfer.save(&mut bytes).unwrap();
+        wallet.received_consignments.insert(recipient.into(), bytes);
+        for output in wallet
+            .bdk_wallet
+            .list_output()
+            .filter(|o| o.keychain == KeychainKind::External)
+        {
+            wallet.database.set_txo(output.into()).unwrap();
+        }
+        let txo = wallet
+            .database
+            .set_txo(DbTxoActMod {
+                txid: ActiveValue::Set(receipt.txid.to_string()),
+                vout: ActiveValue::Set(receipt.vout),
+                btc_amount: ActiveValue::Set("0".into()),
+                pending_witness: ActiveValue::Set(true),
+                ..Default::default()
+            })
+            .unwrap();
+        let batch = wallet
+            .database
+            .set_batch_transfer(DbBatchTransferActMod {
+                txid: ActiveValue::Set(Some(receipt.txid.to_string())),
+                status: ActiveValue::Set(TransferStatus::WaitingConfirmations),
+                min_confirmations: ActiveValue::Set(1),
+                ..Default::default()
+            })
+            .unwrap();
+        let asset = wallet
+            .database
+            .set_asset_transfer(DbAssetTransferActMod {
+                batch_transfer_idx: ActiveValue::Set(batch),
+                user_driven: ActiveValue::Set(true),
+                asset_id: ActiveValue::Set(Some(contract.to_string())),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .database
+            .set_transfer(DbTransferActMod {
+                asset_transfer_idx: ActiveValue::Set(asset),
+                incoming: ActiveValue::Set(true),
+                recipient_id: ActiveValue::Set(Some(recipient.into())),
+                recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Witness {
+                    vout: Some(receipt.vout),
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .database
+            .set_coloring(DbColoringActMod {
+                txo_idx: ActiveValue::Set(txo),
+                asset_transfer_idx: ActiveValue::Set(asset),
+                r#type: ActiveValue::Set(ColoringType::Receive),
+                assignment: ActiveValue::Set(Assignment::Fungible(1107)),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .require_exact_pending_witness_receive(
+                recipient,
+                contract,
+                receipt,
+                1107,
+                wallet.received_consignments.get(recipient).unwrap(),
+                &tx.output[receipt.vout as usize].script_pubkey,
+            )
+            .unwrap();
+        let original = source(&wallet);
+        let bdk = super::super::incoming_bdk::project(&wallet, &tx, &prevouts, inclusion).unwrap();
+        assert!(
+            project(
+                &wallet,
+                recipient,
+                contract,
+                receipt,
+                1108,
+                &tx,
+                &valid,
+                &resolver,
+                bdk.clone(),
+                &original
+            )
+            .is_err()
+        );
+        assert_eq!(
+            source(&wallet),
+            original,
+            "wrong amount cannot mutate active state"
+        );
+        let post = project(
+            &wallet, recipient, contract, receipt, 1107, &tx, &valid, &resolver, bdk, &original,
+        )
+        .unwrap();
+        assert_eq!(
+            source(&wallet),
+            original,
+            "complete active snapshot AND staged BDK unchanged"
+        );
+        let received_stock = super::super::idb_store::deserialize_stock(
+            post.stock_stash_b64.as_ref().unwrap(),
+            post.stock_state_b64.as_ref().unwrap(),
+            post.stock_index_b64.as_ref().unwrap(),
+        )
+        .unwrap();
+        let amounts: Vec<_> = received_stock
+            .contract_assignments_for(contract, [receipt])
+            .unwrap()
+            .values()
+            .flat_map(|states| states.values())
+            .cloned()
+            .collect();
+        assert_eq!(amounts.len(), 1);
+        let AllocatedState::Amount(amount) = &amounts[0] else {
+            panic!("fungible receipt expected")
+        };
+        assert_eq!(amount.as_u64(), 1107);
+        assert!(post.received_consignments.is_empty());
+        assert!(
+            post.db.get_db_data(false).unwrap().batch_transfers[0]
+                .status
+                .settled()
+        );
+        assert_eq!(
+            post.sequence,
+            wallet.snapshot_for_review().unwrap().sequence
+        );
+        // Independently apply established primitives to this disposable in-memory
+        // test wallet. Do not adopt the projected snapshot as the actual result.
+        let mut update = Update {
+            chain: Some(
+                wallet
+                    .bdk_wallet
+                    .local_chain()
+                    .tip()
+                    .push(inclusion.block_id)
+                    .unwrap(),
+            ),
+            ..Default::default()
+        };
+        update.tx_update.txs.push(Arc::new(tx.clone()));
+        update.tx_update.anchors.insert((inclusion, receipt.txid));
+        wallet.bdk_wallet.apply_update(update).unwrap();
+        wallet.bdk_wallet.persist(&mut wallet.bdk_database).unwrap();
+        wallet
+            .rgb_stock
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .accept_transfer(valid, &resolver)
+            .unwrap();
+        let row = wallet
+            .database
+            .get_txo(&Outpoint {
+                txid: receipt.txid.to_string(),
+                vout: receipt.vout,
+            })
+            .unwrap()
+            .unwrap();
+        let mut changed: DbTxoActMod = row.into();
+        changed.btc_amount = ActiveValue::Set("1000".into());
+        changed.exists = ActiveValue::Set(true);
+        changed.pending_witness = ActiveValue::Set(false);
+        wallet.database.update_txo(changed).unwrap();
+        let row = wallet
+            .database
+            .get_db_data(false)
+            .unwrap()
+            .batch_transfers
+            .remove(0);
+        let mut changed: DbBatchTransferActMod = row.into();
+        changed.status = ActiveValue::Set(TransferStatus::Settled);
+        wallet.database.update_batch_transfer(&mut changed).unwrap();
+        wallet
+            .database
+            .del_pending_witness_script(
+                tx.output[receipt.vout as usize]
+                    .script_pubkey
+                    .to_hex_string(),
+            )
+            .unwrap();
+        wallet.received_consignments.remove(recipient).unwrap();
+        assert_eq!(
+            serde_json::to_value(wallet.snapshot_for_review().unwrap()).unwrap(),
+            serde_json::to_value(post).unwrap(),
+            "complete Stock, BDK, DB, sequence, intent, artifacts and metadata match"
+        );
+    }
+
+    #[test]
     fn detached_db_imports_only_receipt_and_preserves_entire_source_and_counters() {
         let (wallet, tx, after, batch) = fixture();
         let original = source(&wallet);
