@@ -18,6 +18,15 @@ pub(super) fn project(
     prevouts: &BTreeMap<OutPoint, TxOut>,
     inclusion: ConfirmationBlockTime,
 ) -> Result<ChangeSet, Error> {
+    project_with_update(wallet, transaction, prevouts, inclusion).map(|(post, _)| post)
+}
+
+pub(super) fn project_with_update(
+    wallet: &Wallet,
+    transaction: &BdkTransaction,
+    prevouts: &BTreeMap<OutPoint, TxOut>,
+    inclusion: ConfirmationBlockTime,
+) -> Result<(ChangeSet, Update), Error> {
     if transaction.is_coinbase()
         || transaction.input.is_empty()
         || transaction.input.len() > MAX_INPUTS
@@ -123,7 +132,9 @@ pub(super) fn project(
     };
     update.tx_update.txs.push(Arc::new(transaction.clone()));
     update.tx_update.anchors.insert((inclusion, txid));
-    detached.apply_update(update).map_err(|_| refuse())?;
+    detached
+        .apply_update(update.clone())
+        .map_err(|_| refuse())?;
     let after: BTreeMap<_, _> = detached.list_output().map(|o| (o.outpoint, o)).collect();
     // Every existing canonical output survives exactly, except the exact local
     // inputs' spent bit. Reject conflict/eviction effects on unrelated outputs.
@@ -153,7 +164,7 @@ pub(super) fn project(
     if let Some(stage) = detached.take_staged() {
         source.merge(stage);
     }
-    Ok(source)
+    Ok((source, update))
 }
 
 #[cfg(test)]

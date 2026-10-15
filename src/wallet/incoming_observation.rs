@@ -39,10 +39,15 @@ pub(super) fn complete_source(wallet: &Wallet) -> Result<serde_json::Value, Erro
 }
 
 pub(super) struct FrozenIncoming {
+    pub(super) engine: std::rc::Weak<std::cell::RefCell<Option<Stock>>>,
     pub(super) source: serde_json::Value,
     pub(super) resolver: PreFetchResolver,
     pub(super) transfer: ValidTransfer,
     pub(super) post: super::idb_store::WalletSnapshot,
+    pub(super) update: Update,
+    pub(super) recipient: String,
+    pub(super) receipt: OutPoint,
+    pub(super) transaction: BdkTransaction,
 }
 
 impl Wallet {
@@ -284,7 +289,7 @@ impl Wallet {
         if complete_source(self)? != source {
             return Err(refuse());
         }
-        let bdk_post = super::incoming_bdk::project(
+        let (bdk_post, update) = super::incoming_bdk::project_with_update(
             self,
             transaction,
             &prevouts,
@@ -303,10 +308,15 @@ impl Wallet {
             &source,
         )?;
         Ok(FrozenIncoming {
+            engine: std::rc::Rc::downgrade(&self.rgb_stock),
             source,
             resolver,
             transfer: validated,
             post,
+            update,
+            recipient: recipient.to_owned(),
+            receipt: outpoint,
+            transaction: transaction.clone(),
         })
     }
 }

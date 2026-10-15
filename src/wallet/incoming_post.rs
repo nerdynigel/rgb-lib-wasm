@@ -63,7 +63,7 @@ fn require_uncolored_inputs(
 
 // Require exact source DB / canonical BDK correspondence before updating only
 // transaction-touched External TXOs. Internal BTC change lives in BDK only.
-fn project_db(
+pub(super) fn project_db(
     db: &InMemoryDb,
     before: &BdkWallet,
     after: &BdkWallet,
@@ -319,6 +319,15 @@ mod tests {
 
     #[test]
     fn valid_nia_transfer_projects_full_checkpoint_without_active_mutation() {
+        valid_nia_case(false);
+    }
+
+    #[test]
+    fn valid_nia_private_one_use_consumer_matches_complete_projection() {
+        valid_nia_case(true);
+    }
+
+    fn valid_nia_case(consume: bool) {
         use super::super::rust_only::{AssetColoringInfo, ColoringInfo};
         let (mut wallet, mut tx, prevouts, inclusion) =
             super::super::incoming_bdk::tests::fixture();
@@ -581,6 +590,138 @@ mod tests {
             post.sequence,
             wallet.snapshot_for_review().unwrap().sequence
         );
+        if consume {
+            let (bdk, update) =
+                super::super::incoming_bdk::project_with_update(&wallet, &tx, &prevouts, inclusion)
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(bdk).unwrap(),
+                serde_json::to_value(post.bdk_changeset.as_ref().unwrap()).unwrap()
+            );
+            let frozen = super::super::incoming_observation::FrozenIncoming {
+                engine: std::rc::Rc::downgrade(&wallet.rgb_stock),
+                source: original.clone(),
+                resolver,
+                transfer: valid,
+                post: serde_json::from_value(serde_json::to_value(&post).unwrap()).unwrap(),
+                update,
+                recipient: recipient.to_owned(),
+                receipt,
+                transaction: tx.clone(),
+            };
+            assert!(
+                super::super::incoming_application::PreparedIncoming::new(&mut wallet, frozen)
+                    .is_err(),
+                "legacy persistence cannot consume"
+            );
+            assert_eq!(source(&wallet), original);
+            wallet.use_consumer_owned_persistence().unwrap();
+            let make_frozen = |wallet: &Wallet| {
+                let resolver = PreFetchResolver::new(
+                    HashMap::from([(
+                        witness,
+                        WitnessStatus::Resolved(
+                            tx.clone(),
+                            WitnessOrd::Mined(
+                                WitnessPos::bitcoin(NonZeroU32::new(20).unwrap(), 1_700_000_000)
+                                    .unwrap(),
+                            ),
+                        ),
+                    )]),
+                    wallet.chain_net(),
+                );
+                let valid = transfer
+                    .clone()
+                    .validate(
+                        &resolver,
+                        &ValidationConfig {
+                            chain_net: wallet.chain_net(),
+                            trusted_typesystem: AssetSchema::Nia.types(),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                let (_, update) = super::super::incoming_bdk::project_with_update(
+                    &wallet, &tx, &prevouts, inclusion,
+                )
+                .unwrap();
+                super::super::incoming_observation::FrozenIncoming {
+                    engine: std::rc::Rc::downgrade(&wallet.rgb_stock),
+                    source: source(&wallet),
+                    resolver,
+                    transfer: valid,
+                    post: serde_json::from_value(serde_json::to_value(&post).unwrap()).unwrap(),
+                    update,
+                    recipient: recipient.to_owned(),
+                    receipt,
+                    transaction: tx.clone(),
+                }
+            };
+            let stable = source(&wallet);
+            let other = super::super::offline::address_reuse_tests::make_test_wallet(false);
+            let mut wrong_engine = make_frozen(&wallet);
+            wrong_engine.engine = std::rc::Rc::downgrade(&other.rgb_stock);
+            assert!(
+                super::super::incoming_application::PreparedIncoming::new(
+                    &mut wallet,
+                    wrong_engine
+                )
+                .is_err()
+            );
+            let mut stale = make_frozen(&wallet);
+            stale.source = serde_json::Value::Null;
+            assert!(
+                super::super::incoming_application::PreparedIncoming::new(&mut wallet, stale)
+                    .is_err()
+            );
+            let frozen = make_frozen(&wallet);
+            drop(
+                super::super::incoming_application::PreparedIncoming::new(&mut wallet, frozen)
+                    .unwrap(),
+            );
+            assert_eq!(
+                source(&wallet),
+                stable,
+                "refusals and preconsume cancellation preserve complete source"
+            );
+            let alias = Arc::clone(&wallet.database);
+            let frozen = make_frozen(&wallet);
+            assert!(
+                super::super::incoming_application::PreparedIncoming::new(&mut wallet, frozen)
+                    .unwrap()
+                    .apply()
+                    .is_err(),
+                "shared DB owner refuses before mutation"
+            );
+            assert_eq!(source(&wallet), stable);
+            drop(alias);
+            let frozen = make_frozen(&wallet);
+            let bytes_for_replay = wallet.received_consignments.get(recipient).unwrap().clone();
+            let actual =
+                super::super::incoming_application::PreparedIncoming::new(&mut wallet, frozen)
+                    .unwrap()
+                    .apply()
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(&post).unwrap()
+            );
+            assert!(
+                wallet
+                    .require_exact_pending_witness_receive(
+                        recipient,
+                        contract,
+                        receipt,
+                        1107,
+                        &bytes_for_replay,
+                        &tx.output[receipt.vout as usize].script_pubkey,
+                    )
+                    .is_err(),
+                "completed receipt cannot prepare again"
+            );
+
+            return;
+        }
         // Independently apply established primitives to this disposable in-memory
         // test wallet. Do not adopt the projected snapshot as the actual result.
         let mut update = Update {

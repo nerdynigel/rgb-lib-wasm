@@ -5,6 +5,8 @@
 pub(crate) mod backup;
 pub mod idb_store;
 #[cfg(feature = "esplora")]
+mod incoming_application;
+#[cfg(feature = "esplora")]
 mod incoming_bdk;
 #[cfg(feature = "esplora")]
 mod incoming_history;
