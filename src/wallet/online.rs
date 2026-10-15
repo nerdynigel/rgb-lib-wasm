@@ -3170,6 +3170,27 @@ impl Wallet {
             let consignment =
                 RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
 
+            // Validate incoming history before any wallet mutation.
+            let wasm_resolver = WasmResolver::from_consignment(&consignment, self.chain_net());
+            let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
+            let validation_config = ValidationConfig {
+                chain_net: self.chain_net(),
+                trusted_typesystem: asset_schema.types(),
+                ..Default::default()
+            };
+            let valid_consignment = consignment
+                .validate(&wasm_resolver, &validation_config)
+                .map_err(|_| InternalError::Unexpected)?;
+            // Reject unsafe history before sync, TXO mutation or Stock acceptance.
+            // Warning order is not a safety boundary: inspect the entire status.
+            if !super::incoming_history::safe_to_accept(valid_consignment.validation_status()) {
+                warn!(
+                    self.logger,
+                    "Cannot accept transfer because of unsafe history"
+                );
+                return Ok(None);
+            }
+
             if let Some(RecipientTypeFull::Witness { vout }) = transfer.recipient_type {
                 if !skip_sync {
                     self.sync_db_txos(false).await?;
@@ -3184,18 +3205,6 @@ impl Wallet {
                 self.database.update_txo(txo)?;
             }
 
-            // accept consignment using WasmResolver
-            let wasm_resolver = WasmResolver::from_consignment(&consignment, self.chain_net());
-            let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-            let validation_config = ValidationConfig {
-                chain_net: self.chain_net(),
-                trusted_typesystem: asset_schema.types(),
-                ..Default::default()
-            };
-            let valid_consignment = consignment
-                .validate(&wasm_resolver, &validation_config)
-                .map_err(|_| InternalError::Unexpected)?;
-            let validation_status = valid_consignment.validation_status();
             let mut runtime = self.rgb_runtime()?;
             runtime.accept_transfer(valid_consignment.clone(), &wasm_resolver)?;
             if asset_schema == AssetSchema::Ifa {
@@ -3216,21 +3225,6 @@ impl Wallet {
                     updated_asset.known_circulating_supply =
                         ActiveValue::Set(Some(known_circulating_supply.to_string()));
                     self.database.update_asset(&mut updated_asset)?;
-                }
-            }
-
-            match validation_status.validity() {
-                Validity::Valid => {}
-                Validity::Warnings => {
-                    if let Warning::UnsafeHistory(ref unsafe_history) =
-                        validation_status.warnings[0]
-                    {
-                        warn!(
-                            self.logger,
-                            "Cannot accept transfer because of unsafe history: {unsafe_history:?}"
-                        );
-                        return Ok(None);
-                    }
                 }
             }
         }
