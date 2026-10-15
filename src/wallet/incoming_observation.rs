@@ -2,6 +2,7 @@
 //! Indexer observations are evidence, never consent or a consuming capability.
 use super::*;
 use crate::utils::PreFetchResolver;
+use bdk_wallet::chain::{BlockId, ConfirmationBlockTime};
 use esplora_client::TxStatus;
 
 const MAX_HISTORY_WITNESSES: usize = 128;
@@ -41,6 +42,7 @@ pub(super) struct FrozenIncoming {
     pub(super) source: serde_json::Value,
     pub(super) resolver: PreFetchResolver,
     pub(super) transfer: ValidTransfer,
+    pub(super) bdk_post: ChangeSet,
 }
 
 impl Wallet {
@@ -84,7 +86,12 @@ impl Wallet {
         transaction: &BdkTransaction,
     ) -> Result<FrozenIncoming, Error> {
         self.check_online(online.clone())?;
-        if transaction.compute_txid() != outpoint.txid || transaction.total_size() > 4_000_000 {
+        if transaction.compute_txid() != outpoint.txid
+            || transaction.total_size() > 4_000_000
+            || transaction.input.len() > super::incoming_bdk::MAX_INPUTS
+            || transaction.output.len() > super::incoming_bdk::MAX_OUTPUTS
+            || transaction.is_coinbase()
+        {
             return Err(refuse());
         }
         let output = transaction
@@ -154,6 +161,48 @@ impl Wallet {
             .get_block_hash(tip)
             .await
             .map_err(IndexerError::from)?;
+        // A detached update must preserve every existing local checkpoint. Refuse
+        // a local chain that disagrees with the frozen indexer, including a
+        // locally newer chain. Bound this exact consumer's network work.
+        let checkpoints: Vec<_> = self.bdk_wallet.local_chain().iter_checkpoints().collect();
+        if checkpoints.len() > 256 {
+            return Err(refuse());
+        }
+        for point in checkpoints {
+            if point.height() > tip
+                || client
+                    .get_block_hash(point.height())
+                    .await
+                    .map_err(IndexerError::from)?
+                    != point.hash()
+            {
+                return Err(refuse());
+            }
+        }
+        let mut prevouts = BTreeMap::new();
+        let mut previous = HashMap::new();
+        for input in &transaction.input {
+            let point = input.previous_output;
+            if let std::collections::hash_map::Entry::Vacant(entry) = previous.entry(point.txid) {
+                let tx = client
+                    .get_tx(&point.txid)
+                    .await
+                    .map_err(IndexerError::from)?
+                    .ok_or_else(refuse)?;
+                if tx.compute_txid() != point.txid || tx.total_size() > 4_000_000 {
+                    return Err(refuse());
+                }
+                entry.insert(tx);
+            }
+            let output = previous
+                .get(&point.txid)
+                .and_then(|tx| tx.output.get(point.vout as usize))
+                .ok_or_else(refuse)?;
+            if prevouts.insert(point, output.clone()).is_some() {
+                return Err(refuse());
+            }
+        }
+        let mut inclusion = None;
         let mut cache = HashMap::new();
         let mut statuses = Vec::new();
         for id in witnesses {
@@ -183,6 +232,15 @@ impl Wallet {
                 != status.block_hash.ok_or_else(refuse)?
             {
                 return Err(refuse());
+            }
+            if id == witness_id {
+                inclusion = Some(ConfirmationBlockTime {
+                    block_id: BlockId {
+                        height: status.block_height.ok_or_else(refuse)?,
+                        hash: status.block_hash.ok_or_else(refuse)?,
+                    },
+                    confirmation_time: status.block_time.ok_or_else(refuse)?,
+                });
             }
             cache.insert(id, WitnessStatus::Resolved(tx, position));
             statuses.push((txid, status));
@@ -225,10 +283,17 @@ impl Wallet {
         if complete_source(self)? != source {
             return Err(refuse());
         }
+        let bdk_post = super::incoming_bdk::project(
+            self,
+            transaction,
+            &prevouts,
+            inclusion.ok_or_else(refuse)?,
+        )?;
         Ok(FrozenIncoming {
             source,
             resolver,
             transfer: validated,
+            bdk_post,
         })
     }
 }
