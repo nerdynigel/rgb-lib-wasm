@@ -1,5 +1,33 @@
 use wasm_bindgen_test::*;
 
+#[path = "support/state_bytes.rs"]
+mod state_bytes;
+
+// Read the actual stored string, not a reserialized public projection.
+async fn durable_snapshot_bytes(key: &str) -> Vec<u8> {
+    use rexie::{ObjectStore, Rexie, TransactionMode};
+    let db = Rexie::builder("rgb_lib_wallet")
+        .version(1)
+        .add_object_store(ObjectStore::new("snapshots"))
+        .build()
+        .await
+        .unwrap();
+    let tx = db
+        .transaction(&["snapshots"], TransactionMode::ReadOnly)
+        .unwrap();
+    let value = tx
+        .store("snapshots")
+        .unwrap()
+        .get(wasm_bindgen::JsValue::from_str(key))
+        .await
+        .unwrap()
+        .unwrap();
+    let bytes = value.as_string().unwrap().into_bytes();
+    tx.done().await.unwrap();
+    db.close();
+    bytes
+}
+
 wasm_bindgen_test_configure!(run_in_browser);
 
 use rgb_lib_wasm::wallet::rust_only::{ValidateConsignmentResult, validate_consignment_offchain};
@@ -27,6 +55,175 @@ fn test_wallet_data(schemas: Vec<AssetSchema>) -> WalletData {
 fn test_wallet_new_signing() {
     let wd = test_wallet_data(vec![AssetSchema::Nia]);
     assert!(Wallet::new(wd).is_ok());
+}
+
+#[wasm_bindgen_test]
+async fn test_color_export_fresh_wallet_refusal() {
+    use rgb_lib_wasm::bitcoin::{
+        Amount, ScriptBuf, Transaction, TxOut, absolute, psbt::Psbt, transaction,
+    };
+    use rgb_lib_wasm::wallet::idb_store::load_snapshot;
+    use rgb_lib_wasm::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
+    use std::collections::HashMap;
+    let wd = test_wallet_data(vec![AssetSchema::Nia]);
+    let wallet = Wallet::new(wd.clone()).unwrap();
+    let key = wallet.idb_key();
+    // Fresh keys isolate this unfunded wallet from every other test/profile.
+    assert!(load_snapshot(&key).await.unwrap().is_none());
+    wallet.flush().await.unwrap();
+    let durable_before = serde_json::to_value(load_snapshot(&key).await.unwrap().unwrap()).unwrap();
+    let raw_before = durable_snapshot_bytes(&key).await;
+    let stock_before = state_bytes::snapshot_stock_bytes(&durable_before);
+    // Decode strict persisted components, then independently reserialize the restored Stock.
+    let parts = (
+        durable_before["stock_stash_b64"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+        durable_before["stock_state_b64"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+        durable_before["stock_index_b64"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+    );
+    let stock =
+        rgb_lib_wasm::wallet::idb_store::deserialize_stock(&parts.0, &parts.1, &parts.2).unwrap();
+    assert_eq!(
+        state_bytes::strict_stock_bytes(
+            &rgb_lib_wasm::wallet::idb_store::serialize_stock(&stock).unwrap()
+        ),
+        stock_before
+    );
+    let before =
+        serde_json::to_value(wallet.list_transfers(AssetFilter::Any, None).unwrap()).unwrap();
+    let mut psbt = Psbt::from_unsigned_tx(Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new(),
+        }],
+    })
+    .unwrap();
+    let original = psbt.serialize();
+    let info = ColoringInfo {
+        asset_info_map: HashMap::from([(
+            "rgb:qFuT6DN8-9AuO95M-7R8R8Mc-AZvs7zG-obum1Va-BRnweKk"
+                .parse()
+                .unwrap(),
+            AssetColoringInfo {
+                output_map: HashMap::from([(0, 1)]),
+                static_blinding: Some(1),
+            },
+        )]),
+        static_blinding: Some(1),
+        nonce: Some(1),
+    };
+    assert!(wallet.color_psbt_and_export(&mut psbt, info).is_err());
+    // Pure inspection refuses malformed bytes without accessing or persisting this wallet.
+    assert!(
+        rgb_lib_wasm::wallet::rust_only::inspect_transfer_offchain(
+            b"invalid consignment",
+            b"invalid colored transaction",
+            BitcoinNetwork::Regtest,
+        )
+        .is_err()
+    );
+
+    assert_eq!(psbt.serialize(), original);
+    assert_eq!(
+        serde_json::to_value(wallet.list_transfers(AssetFilter::Any, None).unwrap()).unwrap(),
+        before
+    );
+    assert!(wallet.rgb_contract_ids().unwrap().is_empty());
+    assert_eq!(
+        serde_json::to_value(load_snapshot(&key).await.unwrap().unwrap()).unwrap(),
+        durable_before,
+        "refusal must not persist or advance the durable sequence"
+    );
+    assert_eq!(
+        durable_snapshot_bytes(&key).await,
+        raw_before,
+        "refusal changed stored bytes"
+    );
+    // Explicit caller persistence must retain stock, records and BDK state;
+    // only the caller-requested snapshot sequence advances.
+    wallet.flush().await.unwrap();
+    let durable_after = serde_json::to_value(load_snapshot(&key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(
+        durable_after["sequence"],
+        durable_before["sequence"].as_u64().unwrap() + 1
+    );
+    let mut state_before = durable_before.clone();
+    let mut state_after = durable_after.clone();
+    state_before.as_object_mut().unwrap().remove("sequence");
+    state_after.as_object_mut().unwrap().remove("sequence");
+    assert_eq!(state_after, state_before);
+    let raw_after = durable_snapshot_bytes(&key).await;
+    assert_ne!(
+        raw_after, raw_before,
+        "explicit flush advances persisted sequence"
+    );
+    assert_eq!(
+        state_bytes::snapshot_stock_bytes(&durable_after),
+        stock_before
+    );
+    assert_eq!(
+        state_bytes::snapshot_state_bytes(durable_after.clone()),
+        state_bytes::snapshot_state_bytes(durable_before.clone())
+    );
+    drop(wallet);
+    assert_eq!(
+        durable_snapshot_bytes(&key).await,
+        raw_after,
+        "drop changed stored bytes"
+    );
+    assert_eq!(
+        serde_json::to_value(load_snapshot(&key).await.unwrap().unwrap()).unwrap(),
+        durable_after,
+        "wallet drop must not write a snapshot"
+    );
+    let restored = Wallet::restore(wd).await.unwrap();
+    assert!(restored.rgb_contract_ids().unwrap().is_empty());
+    assert_eq!(
+        serde_json::to_value(restored.list_transfers(AssetFilter::Any, None).unwrap()).unwrap(),
+        before
+    );
+    assert_eq!(
+        serde_json::to_value(load_snapshot(&key).await.unwrap().unwrap()).unwrap(),
+        durable_after,
+        "restoration must not write a snapshot"
+    );
+    assert_eq!(
+        durable_snapshot_bytes(&key).await,
+        raw_after,
+        "restore changed stored bytes"
+    );
+    // Explicit flush after restore measures restored in-memory stock at the persistence boundary.
+    restored.flush().await.unwrap();
+    let round_trip = serde_json::to_value(load_snapshot(&key).await.unwrap().unwrap()).unwrap();
+    assert_eq!(state_bytes::snapshot_stock_bytes(&round_trip), stock_before);
+    assert_eq!(
+        state_bytes::snapshot_state_bytes(round_trip.clone()),
+        state_bytes::snapshot_state_bytes(durable_after.clone())
+    );
+    assert_eq!(
+        round_trip["sequence"].as_u64().unwrap(),
+        durable_after["sequence"].as_u64().unwrap() + 1
+    );
+    console_log!(
+        "THE876_BYTE_STATE {}",
+        serde_json::json!({
+            "boundary": "fresh-unfunded-indexeddb", "stock": stock_before.each_ref().map(|b| state_bytes::receipt(b)),
+            "persisted_before": state_bytes::receipt(&raw_before), "persisted_after": state_bytes::receipt(&raw_after),
+            "snapshot_state": state_bytes::receipt(&state_bytes::snapshot_state_bytes(durable_after)),
+            "sequence_after_restore_flush": round_trip["sequence"]
+        })
+    );
 }
 
 #[wasm_bindgen_test]

@@ -4,10 +4,28 @@
 
 pub(crate) mod backup;
 pub mod idb_store;
+#[cfg(feature = "esplora")]
+mod incoming_application;
+#[cfg(feature = "esplora")]
+pub use incoming_application::PreparedIncoming;
+#[cfg(feature = "esplora")]
+mod incoming_bdk;
+#[cfg(feature = "esplora")]
+mod incoming_history;
+#[cfg(feature = "esplora")]
+mod incoming_observation;
+#[cfg(feature = "esplora")]
+mod incoming_post;
+#[cfg(feature = "esplora")]
+mod incoming_selection;
+#[cfg(all(test, feature = "esplora", not(target_arch = "wasm32")))]
+mod incoming_test_indexer;
+mod input_availability;
 pub(crate) mod memory_store;
 pub(crate) mod offline;
 #[cfg(feature = "esplora")]
 pub(crate) mod online;
+pub mod pending_fill;
 pub mod rust_only;
 pub mod vss;
 

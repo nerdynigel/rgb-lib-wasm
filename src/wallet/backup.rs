@@ -28,6 +28,12 @@ pub(crate) struct BackupPubData {
 /// The serializable wallet state that gets encrypted.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct WalletBackupPayload {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::pending_fill::deserialize_optional"
+    )]
+    pub(crate) btcx_pending_fill_v1: Option<super::pending_fill::PendingFill>,
     pub(crate) db: crate::database::memory_db::InMemoryDb,
     pub(crate) bdk_changeset: Option<bdk_wallet::ChangeSet>,
     /// Strict-encoded MemStash, base64
@@ -169,6 +175,7 @@ impl super::Wallet {
 
         // 4. Restore InMemoryDb + BDK via existing snapshot mechanism
         let snapshot = super::idb_store::WalletSnapshot {
+            btcx_pending_fill_v1: payload.btcx_pending_fill_v1,
             sequence: 0,
             db: payload.db,
             bdk_changeset: payload.bdk_changeset,
@@ -297,6 +304,7 @@ impl super::Wallet {
             serde_json::from_slice(&payload_json).map_err(|_| Error::InvalidBackup)?;
 
         let snapshot = super::idb_store::WalletSnapshot {
+            btcx_pending_fill_v1: payload.btcx_pending_fill_v1,
             sequence: 0,
             db: payload.db,
             bdk_changeset: payload.bdk_changeset,
@@ -384,6 +392,7 @@ impl super::Wallet {
         drop(stock_ref);
 
         let payload = WalletBackupPayload {
+            btcx_pending_fill_v1: self.btcx_pending_fill_v1.clone(),
             db: self.database.as_ref().clone(),
             bdk_changeset: self.bdk_database.get_data().clone(),
             stock_stash_b64: general_purpose::STANDARD.encode(stash_bytes.as_unconfined()),
@@ -475,5 +484,39 @@ mod tests {
 
         let k3 = derive_key("different", salt.as_str()).unwrap();
         assert_ne!(k1, k3);
+    }
+}
+
+#[cfg(test)]
+mod pending_fill_tests {
+    use super::*;
+    #[test]
+    fn pending_fill_survives_encrypted_backup_payload_and_restore() {
+        let mut wallet = super::super::offline::address_reuse_tests::make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(rgbstd::persistence::Stock::in_memory());
+        wallet.btcx_pending_fill_v1 = Some(super::super::pending_fill::storage_fixture());
+        let expected = serde_json::to_value(&wallet.btcx_pending_fill_v1).unwrap();
+        // Exercise production payload/encryption/restore; browser-only timestamp
+        // bookkeeping and IndexedDB scheduling are separate browser acceptance.
+        let plain = wallet.serialize_backup_payload().unwrap();
+        let (ciphertext, public) = encrypt_payload(&plain, "test-only-passphrase").unwrap();
+        let encrypted = encode_backup(&ciphertext, &public).unwrap();
+        wallet
+            .idb_save_in_progress
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        wallet.btcx_pending_fill_v1 = None;
+        wallet
+            .restore_backup(&encrypted, "test-only-passphrase")
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                wallet
+                    .snapshot_for_persistence()
+                    .unwrap()
+                    .btcx_pending_fill_v1
+            )
+            .unwrap(),
+            expected
+        );
     }
 }

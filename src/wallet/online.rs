@@ -1157,6 +1157,35 @@ impl Wallet {
         change: Option<(u32, u64)>,
         min_confirmations: u8,
     ) -> Result<Option<i32>, Error> {
+        let result = self.register_collaborative_outgoing_transfer_in_memory(
+            txid,
+            asset_id,
+            spent_outpoints,
+            change,
+            min_confirmations,
+        )?;
+        if result.is_some() {
+            #[cfg(target_arch = "wasm32")]
+            {
+                self.update_backup_info(false)?;
+                self.trigger_auto_backup();
+            }
+        }
+        Ok(result)
+    }
+
+    /// Register the same real outgoing rows as the ordinary collaborative path,
+    /// without scheduling backup or writing IndexedDB. This is not authorization.
+    /// Caller owns exact transaction/recipient validation and complete snapshot
+    /// commit; discard its isolated wallet on any mutation or commit error.
+    pub fn register_collaborative_outgoing_transfer_in_memory(
+        &self,
+        txid: String,
+        asset_id: String,
+        spent_outpoints: Vec<String>,
+        change: Option<(u32, u64)>,
+        min_confirmations: u8,
+    ) -> Result<Option<i32>, Error> {
         let change_amount = change.map(|(_, amount)| amount).unwrap_or(0);
         if spent_outpoints.is_empty() && change_amount == 0 {
             return Err(Error::Internal {
@@ -1164,13 +1193,63 @@ impl Wallet {
             });
         }
 
-        // Idempotent: rows already exist for this txid -> no-op.
-        if self
+        // Exact replay is a no-op; a txid must not hide altered terms.
+        if let Some(batch) = self
             .database
             .iter_batch_transfers()?
             .iter()
-            .any(|batch| batch.txid.as_deref() == Some(txid.as_str()))
+            .find(|batch| batch.txid.as_deref() == Some(txid.as_str()))
         {
+            let data = self.database.get_db_data(false)?;
+            let asset_transfers: Vec<_> = data
+                .asset_transfers
+                .iter()
+                .filter(|a| a.batch_transfer_idx == batch.idx)
+                .collect();
+            let matches = if asset_transfers.len() == 1
+                && asset_transfers[0].asset_id.as_deref() == Some(asset_id.as_str())
+                && batch.min_confirmations == min_confirmations
+            {
+                let colorings: Vec<_> = data
+                    .colorings
+                    .iter()
+                    .filter(|c| c.asset_transfer_idx == asset_transfers[0].idx)
+                    .collect();
+                let mut inputs: Vec<_> = colorings
+                    .iter()
+                    .filter(|c| c.r#type == ColoringType::Input)
+                    .filter_map(|c| data.txos.iter().find(|t| t.idx == c.txo_idx))
+                    .map(|t| format!("{}:{}", t.txid, t.vout))
+                    .collect();
+                inputs.sort();
+                inputs.dedup();
+                let mut requested = spent_outpoints.clone();
+                requested.sort();
+                requested.dedup();
+                let changes: Vec<_> = colorings
+                    .iter()
+                    .filter(|c| c.r#type == ColoringType::Change)
+                    .collect();
+                let change_matches = match (change, changes.as_slice()) {
+                    (None, []) => true,
+                    (Some((vout, amount)), [c]) => {
+                        c.assignment == Assignment::Fungible(amount)
+                            && data
+                                .txos
+                                .iter()
+                                .any(|t| t.idx == c.txo_idx && t.txid == txid && t.vout == vout)
+                    }
+                    _ => false,
+                };
+                inputs == requested && change_matches
+            } else {
+                false
+            };
+            if !matches {
+                return Err(Error::Internal {
+                    details: s!("collaborative replay terms differ"),
+                });
+            }
             return Ok(None);
         }
 
@@ -1230,6 +1309,31 @@ impl Wallet {
             spent.insert(txo.idx, assignments);
         }
 
+        // Validate exact fungible arithmetic before creating any durable rows.
+        let input_amount =
+            spent
+                .values()
+                .flatten()
+                .try_fold(0u64, |sum, assignment| match assignment {
+                    Assignment::Fungible(amount) => {
+                        sum.checked_add(*amount).ok_or_else(|| Error::Internal {
+                            details: s!("collaborative amount overflow"),
+                        })
+                    }
+                    _ => Err(Error::Internal {
+                        details: s!("collaborative send requires fungible assignments"),
+                    }),
+                })?;
+        input_amount
+            .checked_sub(change_amount)
+            .ok_or_else(|| Error::Internal {
+                details: s!("collaborative change exceeds inputs"),
+            })?;
+        let assignments_collected = AssignmentsCollection {
+            fungible: input_amount,
+            ..Default::default()
+        };
+
         let change_utxo_idx = if let Some((vout, _amount)) = change {
             Some(
                 match self.database.get_txo(&Outpoint {
@@ -1260,21 +1364,15 @@ impl Wallet {
             });
         }
 
-        let mut assignments_collected = AssignmentsCollection::default();
-        for assignments in spent.values() {
-            for assignment in assignments {
-                if let Assignment::Fungible(amount) = assignment {
-                    assignments_collected.add_fungible(*amount);
-                }
-            }
-        }
         let asset_spend = AssetSpend {
             txo_map: HashMap::new(),
             assignments_collected,
             input_btc_amt: 0,
         };
-        let mut change_collection = AssignmentsCollection::default();
-        change_collection.fungible = change_amount;
+        let change_collection = AssignmentsCollection {
+            fungible: change_amount,
+            ..Default::default()
+        };
 
         let transfer_info = InfoAssetTransfer {
             asset_info: AssetInfo {
@@ -1327,14 +1425,6 @@ impl Wallet {
             ..Default::default()
         };
         self.database.set_transfer(db_transfer)?;
-
-        // Schedule the IndexedDB auto-backup on wasm. Native builds have no
-        // IndexedDB (`js_sys` is wasm-only); there the caller owns persistence.
-        #[cfg(target_arch = "wasm32")]
-        {
-            self.update_backup_info(false)?;
-            self.trigger_auto_backup();
-        }
 
         info!(
             self.logger,
@@ -1471,6 +1561,29 @@ impl Wallet {
                 details: e.to_string(),
             })?;
         self.bdk_wallet.persist(&mut self.bdk_database)?;
+
+        self.reconcile_bdk_txos()
+    }
+
+    /// Reconcile RGB TXOs with the canonical BDK graph after an indexer update.
+    pub(crate) fn reconcile_bdk_txos(&self) -> Result<(), Error> {
+        // Only a canonical BDK output proves its spent state. Absence from a
+        // thin/restored graph is not evidence of a spend. This also restores
+        // unspent state when BDK resolves an eviction/reorg back to the source.
+        for output in self
+            .bdk_wallet
+            .list_output()
+            .filter(|u| u.keychain == KeychainKind::External)
+        {
+            if let Some(txo) = self.database.get_txo(&Outpoint {
+                txid: output.outpoint.txid.to_string(),
+                vout: output.outpoint.vout,
+            })? {
+                let mut updated: DbTxoActMod = txo.into();
+                updated.spent = ActiveValue::Set(output.is_spent);
+                self.database.update_txo(updated)?;
+            }
+        }
 
         let db_txos = self.database.iter_txos()?;
 
@@ -2216,7 +2329,11 @@ impl Wallet {
         proxy_url: String,
         recipient_id: String,
         updated_batch_transfer: &mut DbBatchTransferActMod,
+        local_only: bool,
     ) -> Result<Option<DbBatchTransfer>, Error> {
+        if local_only {
+            return Err(Error::InvalidConsignment);
+        }
         debug!(
             self.logger,
             "Refusing invalid consignment for {recipient_id}"
@@ -2342,6 +2459,32 @@ impl Wallet {
             return Ok(None);
         };
 
+        self.receive_consignment_core(
+            batch_transfer,
+            &asset_transfer,
+            &transfer,
+            recipient_id,
+            consignment,
+            proxy_url,
+            txid,
+            vout,
+            false,
+        )
+        .await
+    }
+
+    async fn receive_consignment_core(
+        &mut self,
+        batch_transfer: &DbBatchTransfer,
+        asset_transfer: &DbAssetTransfer,
+        transfer: &DbTransfer,
+        recipient_id: String,
+        consignment: String,
+        proxy_url: String,
+        txid: String,
+        vout: Option<u32>,
+        local_only: bool,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
 
         // decode consignment bytes
@@ -2350,7 +2493,12 @@ impl Wallet {
             Err(e) => {
                 error!(self.logger, "Failed to decode consignment bytes: {e}");
                 return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    ._refuse_consignment_async(
+                        proxy_url,
+                        recipient_id,
+                        &mut updated_batch_transfer,
+                        local_only,
+                    )
                     .await;
             }
         };
@@ -2365,12 +2513,23 @@ impl Wallet {
             Err(e) => {
                 error!(self.logger, "Failed to deserialize consignment: {e}");
                 return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    ._refuse_consignment_async(
+                        proxy_url,
+                        recipient_id,
+                        &mut updated_batch_transfer,
+                        local_only,
+                    )
                     .await;
             }
         };
         let contract_id = consignment.contract_id();
         let asset_id = contract_id.to_string();
+
+        // Direct isolated import supports only the existing NIA path without media.
+        // No remote reject-list or media fetch is permitted in the memory-only API.
+        if local_only && AssetSchema::try_from(consignment.schema_id())? != AssetSchema::Nia {
+            return Err(Error::InvalidConsignment);
+        }
 
         // validate consignment
         if let Some(aid) = asset_transfer.asset_id.clone() {
@@ -2380,7 +2539,12 @@ impl Wallet {
                     "Received a different asset than the expected one"
                 );
                 return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    ._refuse_consignment_async(
+                        proxy_url,
+                        recipient_id,
+                        &mut updated_batch_transfer,
+                        local_only,
+                    )
                     .await;
             }
         }
@@ -2390,7 +2554,12 @@ impl Wallet {
             Err(_) => {
                 error!(self.logger, "Received an invalid TXID from the proxy");
                 return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    ._refuse_consignment_async(
+                        proxy_url,
+                        recipient_id,
+                        &mut updated_batch_transfer,
+                        local_only,
+                    )
                     .await;
             }
         };
@@ -2416,7 +2585,12 @@ impl Wallet {
             Err(ValidationError::InvalidConsignment(e)) => {
                 error!(self.logger, "Consignment is invalid: {}", e);
                 return self
-                    ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                    ._refuse_consignment_async(
+                        proxy_url,
+                        recipient_id,
+                        &mut updated_batch_transfer,
+                        local_only,
+                    )
                     .await;
             }
             Err(ValidationError::ResolverError(e)) => {
@@ -2452,6 +2626,7 @@ impl Wallet {
                                         proxy_url,
                                         recipient_id,
                                         &mut updated_batch_transfer,
+                                        local_only,
                                     )
                                     .await;
                             }
@@ -2462,6 +2637,7 @@ impl Wallet {
                                     proxy_url,
                                     recipient_id,
                                     &mut updated_batch_transfer,
+                                    local_only,
                                 )
                                 .await;
                         }
@@ -2472,6 +2648,7 @@ impl Wallet {
                                 proxy_url,
                                 recipient_id,
                                 &mut updated_batch_transfer,
+                                local_only,
                             )
                             .await;
                     }
@@ -2485,6 +2662,7 @@ impl Wallet {
                             proxy_url,
                             recipient_id,
                             &mut updated_batch_transfer,
+                            local_only,
                         )
                         .await;
                 }
@@ -2495,7 +2673,12 @@ impl Wallet {
                 "Cannot find the provided TXID in the consignment"
             );
             return self
-                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                ._refuse_consignment_async(
+                    proxy_url,
+                    recipient_id,
+                    &mut updated_batch_transfer,
+                    local_only,
+                )
                 .await;
         }
 
@@ -2505,7 +2688,12 @@ impl Wallet {
                 "The wallet doesn't support the provided schema: {}", asset_schema
             );
             return self
-                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                ._refuse_consignment_async(
+                    proxy_url,
+                    recipient_id,
+                    &mut updated_batch_transfer,
+                    local_only,
+                )
                 .await;
         }
 
@@ -2525,7 +2713,12 @@ impl Wallet {
         if received.is_empty() {
             error!(self.logger, "Cannot find any receiving assignment");
             return self
-                ._refuse_consignment_async(proxy_url, recipient_id, &mut updated_batch_transfer)
+                ._refuse_consignment_async(
+                    proxy_url,
+                    recipient_id,
+                    &mut updated_batch_transfer,
+                    local_only,
+                )
                 .await;
         };
 
@@ -2560,6 +2753,7 @@ impl Wallet {
                             proxy_url,
                             recipient_id,
                             &mut updated_batch_transfer,
+                            local_only,
                         )
                         .await;
                 } else {
@@ -2596,6 +2790,9 @@ impl Wallet {
                         }
                     }
                 };
+                if local_only && !attachments.is_empty() {
+                    return Err(Error::InvalidConsignment);
+                }
                 for attachment in attachments {
                     let digest = hex::encode(attachment.digest);
                     // on wasm32, skip media file download/storage (no filesystem)
@@ -2620,6 +2817,7 @@ impl Wallet {
                                     proxy_url,
                                     recipient_id,
                                     &mut updated_batch_transfer,
+                                    local_only,
                                 )
                                 .await;
                         }
@@ -2634,6 +2832,7 @@ impl Wallet {
                                 proxy_url,
                                 recipient_id,
                                 &mut updated_batch_transfer,
+                                local_only,
                             )
                             .await;
                     }
@@ -2641,9 +2840,13 @@ impl Wallet {
 
                 let wasm_resolver_import =
                     WasmResolver::from_consignment(&consignment, self.chain_net());
-                runtime
-                    .import_contract(valid_contract.clone(), &wasm_resolver_import)
-                    .expect("failure importing received contract");
+                let imported =
+                    runtime.import_contract(valid_contract.clone(), &wasm_resolver_import);
+                if local_only {
+                    imported?;
+                } else {
+                    imported.expect("failure importing received contract");
+                }
                 debug!(self.logger, "Contract registered");
                 self.save_new_asset_internal(
                     &runtime,
@@ -2651,6 +2854,11 @@ impl Wallet {
                     asset_schema,
                     valid_contract,
                     valid_consignment,
+                    // A local exact-byte receipt can be previewed and then
+                    // applied later on the authoritative engine. Bind metadata
+                    // to its existing receive event, never the invocation clock.
+                    // Network receives retain ordinary discovery-time metadata.
+                    local_only.then_some(batch_transfer.created_at),
                 )?;
             }
 
@@ -2665,22 +2873,24 @@ impl Wallet {
             "Consignment is valid. Received '{:?}' of contract '{}'", received, asset_id
         );
 
-        match self
-            .wasm_proxy_client
-            .post_ack(&proxy_url, recipient_id, true)
-            .await
-        {
-            Ok(r) => {
-                debug!(self.logger, "Consignment ACK response: {:?}", r);
-            }
-            Err(e) if e.to_string().contains("Cannot change ACK") => {
-                warn!(self.logger, "Found an NACK when trying ACK");
-            }
-            Err(e) => {
-                error!(self.logger, "Failed to post ACK: {e}");
-                return Err(e);
-            }
-        };
+        if !local_only {
+            match self
+                .wasm_proxy_client
+                .post_ack(&proxy_url, recipient_id, true)
+                .await
+            {
+                Ok(r) => {
+                    debug!(self.logger, "Consignment ACK response: {:?}", r);
+                }
+                Err(e) if e.to_string().contains("Cannot change ACK") => {
+                    warn!(self.logger, "Found an NACK when trying ACK");
+                }
+                Err(e) => {
+                    error!(self.logger, "Failed to post ACK: {e}");
+                    return Err(e);
+                }
+            };
+        }
 
         let utxo_idx = match transfer.recipient_type {
             Some(RecipientTypeFull::Blind { ref unblinded_utxo }) => {
@@ -2725,6 +2935,99 @@ impl Wallet {
             self.database
                 .update_batch_transfer(&mut updated_batch_transfer)?,
         ))
+    }
+
+    /// Import exact caller-supplied NIA consignment into an established witness
+    /// receive, preserving ordinary asset/transfer/coloring rows. No proxy ACK,
+    /// network, flush or backup. Validation failure requires discard by caller.
+    pub async fn import_witness_consignment_in_memory(
+        &mut self,
+        recipient_id: String,
+        consignment: String,
+        txid: String,
+        vout: u32,
+    ) -> Result<(), Error> {
+        let db = self.database.get_db_data(false)?;
+        let transfer = db
+            .transfers
+            .iter()
+            .find(|t| t.recipient_id.as_ref() == Some(&recipient_id))
+            .ok_or(Error::InvalidConsignment)?;
+        if !matches!(
+            transfer.recipient_type,
+            Some(RecipientTypeFull::Witness { vout: None })
+        ) {
+            return Err(Error::InvalidConsignment);
+        }
+        let asset = db
+            .asset_transfers
+            .iter()
+            .find(|a| a.idx == transfer.asset_transfer_idx)
+            .ok_or(Error::InvalidConsignment)?;
+        let batch = db
+            .batch_transfers
+            .iter()
+            .find(|b| b.idx == asset.batch_transfer_idx)
+            .ok_or(Error::InvalidConsignment)?;
+        if !batch.waiting_counterparty() || !batch.incoming(&db.asset_transfers, &db.transfers)? {
+            return Err(Error::InvalidConsignment);
+        }
+        self.receive_consignment_core(
+            batch,
+            asset,
+            transfer,
+            recipient_id,
+            consignment,
+            String::new(),
+            txid,
+            Some(vout),
+            true,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Reconcile only incoming WaitingConfirmations rows using the established
+    /// indexer/stock path. Explicit network read/sync; no send/ACK/broadcast,
+    /// wallet snapshot or backup. Any error must discard the isolated handle.
+    pub async fn settle_witness_receives_in_memory(
+        &mut self,
+        online: Online,
+    ) -> Result<RefreshResult, Error> {
+        self.check_online(online)?;
+        let db = self.database.get_db_data(false)?;
+        let mut result = HashMap::new();
+        for batch in &db.batch_transfers {
+            if !batch.waiting_confirmations()
+                || !batch.incoming(&db.asset_transfers, &db.transfers)?
+            {
+                continue;
+            }
+            let batch_data = batch.get_transfers(&db.asset_transfers, &db.transfers)?;
+            let (asset, transfer) = self.database.get_incoming_transfer(&batch_data)?;
+            if !matches!(
+                transfer.recipient_type,
+                Some(RecipientTypeFull::Witness { vout: Some(_) })
+            ) || self
+                .database
+                .check_asset_exists(asset.asset_id.ok_or(Error::InvalidConsignment)?)?
+                .schema
+                != AssetSchema::Nia
+            {
+                return Err(Error::InvalidConsignment);
+            }
+            let updated = self
+                ._wait_confirmations_async(batch, &db, true, false)
+                .await?;
+            result.insert(
+                batch.idx,
+                RefreshedTransfer {
+                    updated_status: updated.map(|b| b.status),
+                    failure: None,
+                },
+            );
+        }
+        Ok(result)
     }
 
     async fn _wait_ack_async(
@@ -2867,6 +3170,27 @@ impl Wallet {
             let consignment =
                 RgbTransfer::load(&consignment_bytes[..]).map_err(InternalError::from)?;
 
+            // Validate incoming history before any wallet mutation.
+            let wasm_resolver = WasmResolver::from_consignment(&consignment, self.chain_net());
+            let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
+            let validation_config = ValidationConfig {
+                chain_net: self.chain_net(),
+                trusted_typesystem: asset_schema.types(),
+                ..Default::default()
+            };
+            let valid_consignment = consignment
+                .validate(&wasm_resolver, &validation_config)
+                .map_err(|_| InternalError::Unexpected)?;
+            // Reject unsafe history before sync, TXO mutation or Stock acceptance.
+            // Warning order is not a safety boundary: inspect the entire status.
+            if !super::incoming_history::safe_to_accept(valid_consignment.validation_status()) {
+                warn!(
+                    self.logger,
+                    "Cannot accept transfer because of unsafe history"
+                );
+                return Ok(None);
+            }
+
             if let Some(RecipientTypeFull::Witness { vout }) = transfer.recipient_type {
                 if !skip_sync {
                     self.sync_db_txos(false).await?;
@@ -2881,18 +3205,6 @@ impl Wallet {
                 self.database.update_txo(txo)?;
             }
 
-            // accept consignment using WasmResolver
-            let wasm_resolver = WasmResolver::from_consignment(&consignment, self.chain_net());
-            let asset_schema: AssetSchema = consignment.schema_id().try_into()?;
-            let validation_config = ValidationConfig {
-                chain_net: self.chain_net(),
-                trusted_typesystem: asset_schema.types(),
-                ..Default::default()
-            };
-            let valid_consignment = consignment
-                .validate(&wasm_resolver, &validation_config)
-                .map_err(|_| InternalError::Unexpected)?;
-            let validation_status = valid_consignment.validation_status();
             let mut runtime = self.rgb_runtime()?;
             runtime.accept_transfer(valid_consignment.clone(), &wasm_resolver)?;
             if asset_schema == AssetSchema::Ifa {
@@ -2913,21 +3225,6 @@ impl Wallet {
                     updated_asset.known_circulating_supply =
                         ActiveValue::Set(Some(known_circulating_supply.to_string()));
                     self.database.update_asset(&mut updated_asset)?;
-                }
-            }
-
-            match validation_status.validity() {
-                Validity::Valid => {}
-                Validity::Warnings => {
-                    if let Warning::UnsafeHistory(ref unsafe_history) =
-                        validation_status.warnings[0]
-                    {
-                        warn!(
-                            self.logger,
-                            "Cannot accept transfer because of unsafe history: {unsafe_history:?}"
-                        );
-                        return Ok(None);
-                    }
                 }
             }
         }
@@ -4089,3 +4386,7 @@ impl Wallet {
         Ok(res)
     }
 }
+
+#[cfg(all(test, feature = "test-fixtures"))]
+#[path = "receipt_metadata_tests.rs"]
+mod receipt_metadata_tests;

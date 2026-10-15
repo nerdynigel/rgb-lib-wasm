@@ -1,0 +1,51 @@
+{
+  "testedSource": "591c6f659e2f5ce8f1c1f0262c7779c69a502658",
+  "sourceHashes": {
+    "src/wallet/offline.rs": "0511063a5513e53e90971f2da2369253a914b8b8fb2840d577d2c01db4bd7799",
+    "tests/existing_snapshot_wasm.rs": "8c6406b16b762a8898dad4ac349bb6fc720bfb6ad582e9db103331d89e4735a5",
+    "src/wallet/memory_store.rs": "ad19a01b4835067c26086db104dbb353fab4e8fc88cbe30e04be03da626809de",
+    "src/wallet/online.rs": "7ce8c610af306fc0ae5ed31aa4102fd81dbc594036f40cc543b9e58075740b10",
+    "Cargo.toml": "92334cb58fe1b8531899c9b84554471c2a3174634bd78e130ba19b535edef028",
+    "Cargo.lock": "6287c1b3bebd571efc5a78f325f52ca0274c87d77ed35d10f40d72408125014c"
+  },
+  "artifact": {
+    "name": "existing_snapshot_wasm-024f3a2beba96ecc.wasm",
+    "sha256": "690a69d6de40ec8aa97be0501d2c35d8d566e79644b1e964806b7cfc3e46e450",
+    "target": "wasm32-unknown-unknown",
+    "features": "default"
+  },
+  "profileId": "297203fd-1f4f-4003-b40c-54c431cf382e",
+  "tests": {
+    "name": "memory_only_producer_real_idb",
+    "passed": 1,
+    "failed": 0,
+    "filtered": 3,
+    "seconds": 0.99,
+    "idbReads": 0,
+    "idbWrites": 0,
+    "bytesUnchanged": true,
+    "schemaUnchanged": true,
+    "funded": false,
+    "successfulIssuance": false
+  },
+  "checks": {
+    "compile": "PASS",
+    "workspaceCheck": "PASS54.49s",
+    "clippy": "PASS4.50s; baseline field_reassign_with_default allowed only",
+    "fmt": "PASS",
+    "diff": "PASS"
+  },
+  "effects": {
+    "funding": 0,
+    "issuance": 0,
+    "blocks": 0,
+    "signing": 0,
+    "broadcast": 0
+  },
+  "logHashes": {
+    "engine-compile.log": "f005a8a6e7ba179be86f1cce43827b5dee17bdb5fe2c0040fd2b10e83fa18811",
+    "engine-check.log": "438c0a0daf09a3f419dab945bf168d7cae88c48584974153e8a9305a902e296a",
+    "engine-clippy.log": "a574c4f3701dd55bc63f7fe252af5d51f85bbf8d3eb183d09e8ef0386493f34d",
+    "engine-browser.log": "7c3a8baff5506fec4cd247105285e1039cbc8bbedaaace5402ca39920cdeb8ee"
+  }
+}

@@ -88,6 +88,12 @@ esplora = [
     "reqwest",
 ]
 camel_case = []
+# TEST-ONLY: deterministic in-memory funded-wallet fixture for the THE-944 item-9
+# exported-surface positive lifecycle test. Never enabled in default/production
+# builds; no fixture initializer is exported to production. Mirrors the existing
+# `make_test_wallet` test path plus an in-memory synthetic UTXO + one NIA issuance
+# (`InMemoryDb::set_txo` + `issue_asset_nia_in_memory`).
+test-fixtures = []
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

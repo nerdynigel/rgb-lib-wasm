@@ -1,0 +1,32 @@
+{
+  "sourceRevision": "f508554468960774c2427d6f0a7aa388150d0437",
+  "baseRevision": "e6fc0356c0e9676adaed870ad064ca3e0ef1e494",
+  "sourceHashes": {
+    "src/wallet/rust_only.rs": "f01865d9417299b3412401f7ab39f92c88f18a0328070c00bcd2322d7e8ccb94",
+    "src/wallet/online.rs": "7ce8c610af306fc0ae5ed31aa4102fd81dbc594036f40cc543b9e58075740b10",
+    "tests/existing_snapshot_wasm.rs": "d6e067b7220715fcd7b5d5e3c66882050e1439222992525595a145ad95cf8930",
+    "Cargo.toml": "92334cb58fe1b8531899c9b84554471c2a3174634bd78e130ba19b535edef028",
+    "Cargo.lock": "6287c1b3bebd571efc5a78f325f52ca0274c87d77ed35d10f40d72408125014c"
+  },
+  "testArtifactSha256": "c6895b200b3fc9a32994acc9514ec13f70a8b1316f4ca1fcbd7db01f792a69ab",
+  "testName": "memory_only_pending_refusals_real_idb",
+  "result": {
+    "passed": 1,
+    "failed": 0,
+    "filtered": 2
+  },
+  "profile": ".state/the876-memory-only/ba238407-32c9-4826-862a-0c6dd316ec16",
+  "earlierSubsetProfile": ".state/the876-memory-only/87c678c5-df25-4932-bf90-d58b32236af8",
+  "financialEffects": {
+    "funding": 0,
+    "issuance": 0,
+    "blocks": 0,
+    "signing": 0,
+    "broadcast": 0
+  },
+  "limitations": [
+    "Refusals only; successful consume/outgoing rows not executed",
+    "No facade adoption or wallet artifact rebuild",
+    "No financial persistence failure/crash/recovery proof"
+  ]
+}

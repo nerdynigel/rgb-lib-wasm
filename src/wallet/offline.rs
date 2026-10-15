@@ -977,6 +977,9 @@ pub(crate) type RgbLibDb = crate::database::memory_db::InMemoryDb;
 /// This should not be manually constructed but should be obtained from the [`Wallet::new`]
 /// method.
 pub struct Wallet {
+    /// One-way handoff: the consumer owns authenticated snapshot commits.
+    pub(super) consumer_owned_persistence: bool,
+    pub(crate) btcx_pending_fill_v1: Option<super::pending_fill::PendingFill>,
     pub(crate) wallet_data: WalletData,
     pub(crate) logger: Logger,
     pub(crate) _logger_guard: LoggerGuard,
@@ -1031,6 +1034,122 @@ impl Wallet {
             wallet.restore_from_snapshot(snapshot)?;
         }
         Ok(wallet)
+    }
+
+    /// Strictly restore an existing durable snapshot; never bootstrap a wallet.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn load_existing_snapshot(wallet_data: WalletData) -> Result<Self, Error> {
+        let key = PathBuf::from(&wallet_data.data_dir)
+            .join(&wallet_data.master_fingerprint)
+            .to_string_lossy()
+            .to_string();
+        let snapshot = super::idb_store::load_existing_snapshot(&key)
+            .await
+            .map_err(|details| Error::Persistence { details })?;
+        Self::restore_existing_snapshot(wallet_data, snapshot)
+    }
+
+    /// Restore one complete, consumer-authenticated snapshot and hand persistence
+    /// to that consumer before exposing the wallet to any runtime user. This is
+    /// the SAME active engine, never a second accounting writer. The caller must
+    /// authenticate the exact stored ciphertext before calling and retain it for
+    /// CAS; this constructor neither reads storage nor acknowledges a commit.
+    pub fn restore_consumer_owned_snapshot(
+        wallet_data: WalletData,
+        snapshot: super::idb_store::WalletSnapshot,
+    ) -> Result<Self, Error> {
+        let mut wallet = Self::restore_existing_snapshot(wallet_data, snapshot)?;
+        wallet.use_consumer_owned_persistence()?;
+        Ok(wallet)
+    }
+
+    /// Construct only from complete persisted state. No schema imports, new BDK
+    /// wallet, receipt reconciliation, snapshot/flush or implicit persistence.
+    /// Consumers using encrypted envelopes authenticate/decrypt before this call.
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn restore_existing_snapshot(
+        wallet_data: WalletData,
+        snapshot: super::idb_store::WalletSnapshot,
+    ) -> Result<Self, Error> {
+        let invalid = || Error::Persistence {
+            details: s!("existing snapshot restore failed"),
+        };
+        let (Some(stash), Some(state), Some(index)) = (
+            snapshot.stock_stash_b64.as_ref(),
+            snapshot.stock_state_b64.as_ref(),
+            snapshot.stock_index_b64.as_ref(),
+        ) else {
+            return Err(invalid());
+        };
+        let stock =
+            super::idb_store::deserialize_stock(stash, state, index).map_err(|_| invalid())?;
+        let changeset = snapshot.bdk_changeset.ok_or_else(invalid)?;
+        let wdata = &wallet_data;
+        let network = BdkNetwork::from(wdata.bitcoin_network);
+        let xpub_rgb = str_to_xpub(&wdata.account_xpub_colored, network)?;
+        let xpub_btc = str_to_xpub(&wdata.account_xpub_vanilla, network)?;
+        let (colored, vanilla, watch_only) = if let Some(mnemonic) = &wdata.mnemonic {
+            let (c, v) = get_descriptors(
+                wdata.bitcoin_network,
+                mnemonic,
+                wdata.vanilla_keychain,
+                xpub_btc,
+                xpub_rgb,
+            )?;
+            (c, v, false)
+        } else {
+            let (c, v) = get_descriptors_from_xpubs(
+                wdata.bitcoin_network,
+                &wdata.master_fingerprint,
+                xpub_rgb,
+                xpub_btc,
+                wdata.vanilla_keychain,
+            )?;
+            (c, v, true)
+        };
+        let chain_net: ChainNet = wdata.bitcoin_network.into();
+        let mut params = BdkWallet::load()
+            .descriptor(KeychainKind::External, Some(colored))
+            .descriptor(KeychainKind::Internal, Some(vanilla))
+            .check_genesis_hash(BlockHash::from_byte_array(
+                chain_net.chain_hash().to_bytes(),
+            ));
+        if !watch_only {
+            params = params.extract_keys();
+        }
+        let mut bdk_database = super::memory_store::MemoryStore::new();
+        bdk_database.set_data(Some(changeset));
+        let bdk_wallet = params
+            .load_wallet(&mut bdk_database)
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?;
+        let wallet_dir = PathBuf::from(&wdata.data_dir).join(&wdata.master_fingerprint);
+        Ok(Self {
+            consumer_owned_persistence: false,
+            btcx_pending_fill_v1: snapshot.btcx_pending_fill_v1,
+            wallet_data,
+            logger: Logger::root(slog::Discard, o!()),
+            _logger_guard: (),
+            watch_only,
+            database: Arc::new(snapshot.db),
+            wallet_dir,
+            bdk_wallet,
+            bdk_database,
+            reuse_address_index: snapshot.reuse_address_index,
+            #[cfg(feature = "esplora")]
+            wasm_proxy_client: crate::api::proxy::WasmProxyClient::new()?,
+            #[cfg(feature = "esplora")]
+            online_data: None,
+            #[cfg(feature = "esplora")]
+            transfer_artifacts: snapshot.transfer_artifacts,
+            #[cfg(feature = "esplora")]
+            received_consignments: snapshot.received_consignments,
+            idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(snapshot.sequence)),
+            rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(Some(stock))),
+            vss_client: None,
+            last_vss_backup_error: std::cell::RefCell::new(None),
+        })
     }
 
     /// Create a new RGB wallet based on the provided [`WalletData`].
@@ -1135,6 +1254,8 @@ impl Wallet {
 
         info!(logger, "New wallet completed");
         Ok(Wallet {
+            consumer_owned_persistence: false,
+            btcx_pending_fill_v1: None,
             wallet_data,
             logger,
             _logger_guard,
@@ -1576,6 +1697,23 @@ impl Wallet {
         precision: u8,
         amounts: Vec<u64>,
     ) -> Result<AssetNIA, Error> {
+        let asset = self.issue_asset_nia_in_memory(ticker, name, precision, amounts)?;
+        self.update_backup_info(false)?;
+        self.trigger_auto_backup();
+        info!(self.logger, "Issue asset NIA completed");
+        Ok(asset)
+    }
+
+    /// Established NIA issuance without scheduling persistence or backup.
+    /// For isolated encrypted snapshot producers only. Later failures may leave
+    /// partial state; callers must discard/poison the handle, never retry.
+    pub fn issue_asset_nia_in_memory(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        amounts: Vec<u64>,
+    ) -> Result<AssetNIA, Error> {
         info!(
             self.logger,
             "Issuing NIA asset with ticker '{}' name '{}' precision '{}' amounts '{:?}'...",
@@ -1705,10 +1843,6 @@ impl Wallet {
 
         let asset = AssetNIA::get_asset_details(self, &asset, None, None, None, None, None, None)?;
 
-        self.update_backup_info(false)?;
-        self.trigger_auto_backup();
-
-        info!(self.logger, "Issue asset NIA completed");
         Ok(asset)
     }
 
@@ -2307,7 +2441,7 @@ impl Wallet {
             .filter(|&c| c.asset_transfer_idx == asset_transfer.idx)
             .cloned();
 
-        let assignments = filtered_coloring
+        let mut assignments = filtered_coloring
             .clone()
             .filter(|c| c.r#type != ColoringType::Input)
             .map(|c| c.assignment)
@@ -2336,6 +2470,34 @@ impl Wallet {
         } else {
             TransferKind::Send
         };
+
+        // Collaborative sends have one recipient-less row. Their non-input
+        // colorings describe wallet-owned change, not the quantity sent.
+        // Derive the net fungible send from durable colorings so snapshots
+        // written by the previous candidate are projected correctly too.
+        if matches!(kind, TransferKind::Send) && transfer.recipient_id.is_none() {
+            let sum = |coloring_type| -> Result<u64, Error> {
+                filtered_coloring
+                    .clone()
+                    .filter(|c| c.r#type == coloring_type)
+                    .try_fold(0u64, |total, c| match c.assignment {
+                        Assignment::Fungible(amount) => {
+                            total.checked_add(amount).ok_or_else(|| Error::Internal {
+                                details: s!("collaborative amount overflow"),
+                            })
+                        }
+                        _ => Err(Error::Internal {
+                            details: s!("collaborative send requires fungible assignments"),
+                        }),
+                    })
+            };
+            let sent = sum(ColoringType::Input)?
+                .checked_sub(sum(ColoringType::Change)?)
+                .ok_or_else(|| Error::Internal {
+                    details: s!("collaborative change exceeds inputs"),
+                })?;
+            assignments = vec![Assignment::Fungible(sent)];
+        }
 
         let txo_ids: Vec<i32> = filtered_coloring.clone().map(|c| c.txo_idx).collect();
         let transfer_txos: Vec<DbTxo> = txos
@@ -2821,6 +2983,28 @@ impl Wallet {
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
     ) -> Result<ReceiveData, Error> {
+        let received = self.witness_receive_in_memory(
+            asset_id,
+            assignment,
+            duration_seconds,
+            transport_endpoints,
+            min_confirmations,
+        )?;
+        self.update_backup_info(false)?;
+        self.trigger_auto_backup();
+        Ok(received)
+    }
+
+    /// Establish the ordinary witness recipient and pending rows in memory.
+    /// No snapshot/backup. Errors may mutate memory: isolated callers must discard.
+    pub fn witness_receive_in_memory(
+        &mut self,
+        asset_id: Option<String>,
+        assignment: Assignment,
+        duration_seconds: Option<u32>,
+        transport_endpoints: Vec<String>,
+        min_confirmations: u8,
+    ) -> Result<ReceiveData, Error> {
         info!(
             self.logger,
             "Receiving via witness TX for asset '{:?}' with duration '{:?}'...",
@@ -2846,9 +3030,6 @@ impl Wallet {
                 script: ActiveValue::Set(script_pubkey.to_hex_string()),
                 ..Default::default()
             })?;
-
-        self.update_backup_info(false)?;
-        self.trigger_auto_backup();
 
         info!(self.logger, "Witness receive completed");
         Ok(ReceiveData {
@@ -2879,6 +3060,26 @@ impl Wallet {
 
     pub(crate) fn get_new_address(&mut self) -> Result<BdkAddress, Error> {
         self._get_new_address(KeychainKind::External)
+    }
+
+    /// Query the live BDK wallet's indexed script membership without deriving,
+    /// revealing, syncing or persisting any address. A false result must refuse
+    /// local-output authorization; it is not evidence of foreign ownership.
+    /// This Rust-only query does not authenticate a caller or chain state.
+    pub fn is_local_script(&self, script: &bitcoin::Script) -> bool {
+        self.bdk_wallet.is_mine(script.into())
+    }
+
+    /// Reveal a funding address into the in-memory BDK changeset only.
+    /// No wallet snapshot write/backup or signing. The encrypted consumer must
+    /// commit this state explicitly before funding the returned address.
+    pub fn reveal_funding_address_in_memory(&mut self, colored: bool) -> Result<String, Error> {
+        let keychain = if colored {
+            KeychainKind::External
+        } else {
+            KeychainKind::Internal
+        };
+        Ok(self._get_new_address(keychain)?.to_string())
     }
 
     /// Return a new Bitcoin address from the vanilla wallet.
@@ -2986,7 +3187,106 @@ impl Wallet {
         self.save_to_idb();
     }
 
+    /// Irreversibly hand persistence of THIS wallet to its embedding consumer.
+    ///
+    /// Call before financial operations and before sharing the wallet with other
+    /// runtime users. Refuses while a legacy save is in flight; a scheduled save
+    /// cannot be cancelled by changing the owner. After success neither automatic
+    /// saves nor `flush` may write through the legacy plaintext/sequence path.
+    /// The consumer must serialize operations, authenticate restored state and
+    /// commit `snapshot_for_persistence` with exact-record CAS. This handoff does
+    /// not authenticate state or confer spending authority. No second wallet is
+    /// created and the mode cannot be disabled on this instance.
+    pub fn use_consumer_owned_persistence(&mut self) -> Result<(), Error> {
+        if self
+            .idb_save_in_progress
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::Persistence {
+                details: s!("legacy wallet save is still in progress"),
+            });
+        }
+        let stock = self
+            .rgb_stock
+            .try_borrow()
+            .map_err(|_| Error::Persistence {
+                details: s!("RGB runtime is active; persistence handoff refused"),
+            })?;
+        if stock.is_none() {
+            return Err(Error::Persistence {
+                details: s!("RGB runtime is active; persistence handoff refused"),
+            });
+        }
+        self.consumer_owned_persistence = true;
+        Ok(())
+    }
+
+    /// Install an exact pending intent in THIS active engine, without replacing
+    /// any BTC/RGB state or writing a legacy snapshot. Rust-only embedding seam.
+    ///
+    /// The consumer must independently validate current approval, policy, role,
+    /// ownership, authenticated prevouts and inspected economics BEFORE calling,
+    /// then commit the complete snapshot through its authenticated exact-record
+    /// CAS BEFORE releasing signing. This method does not confer authority or
+    /// acknowledge persistence. Failed/ambiguous consumer commits must poison the
+    /// consumer handle; they must never clear this record to retry another fill.
+    /// An exact repeat is idempotent; erasure, replacement and state substitution
+    /// remain unavailable. Application requires a separate guarded consume path.
+    pub fn install_consented_pending_fill(
+        &mut self,
+        pending: super::pending_fill::PendingFill,
+    ) -> Result<(), Error> {
+        let refusal = |details| Error::Persistence { details };
+        if !self.consumer_owned_persistence {
+            return Err(refusal(s!(
+                "pending consent requires consumer-owned persistence"
+            )));
+        }
+        // Refuse while the shared RGB runtime has detached or borrowed stock.
+        // Reuse the handoff guard without changing its irreversible ownership.
+        self.use_consumer_owned_persistence()?;
+        pending.require_consented().map_err(refusal)?;
+        super::pending_fill::require_preserved_on_restore(
+            self.btcx_pending_fill_v1.as_ref(),
+            Some(&pending),
+        )
+        .map_err(refusal)?;
+        self.btcx_pending_fill_v1 = Some(pending);
+        Ok(())
+    }
+
+    /// Read-only exact intent. Never exposes wallet secret material or mutable
+    /// state; the record alone is not a signing or persistence acknowledgement.
+    pub fn pending_fill(&self) -> Option<&super::pending_fill::PendingFill> {
+        self.btcx_pending_fill_v1.as_ref()
+    }
+
+    fn require_legacy_persistence(&self) -> Result<(), Error> {
+        if self.consumer_owned_persistence {
+            return Err(Error::Persistence {
+                details: s!("wallet requires consumer-owned authenticated persistence"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Explicit consumer persistence seam. Produces the same complete snapshot
+    /// as flush, advancing its sequence in memory without writing or scheduling
+    /// a backup. Consumers must authenticate/encode and commit it separately.
+    pub fn snapshot_for_persistence(&self) -> Result<super::idb_store::WalletSnapshot, Error> {
+        self.snapshot()
+    }
+
     fn snapshot(&self) -> Result<super::idb_store::WalletSnapshot, Error> {
+        let mut snapshot = self.snapshot_for_review()?;
+        snapshot.sequence = next_snapshot_sequence(&self.idb_sequence)?;
+        Ok(snapshot)
+    }
+
+    /// Complete non-mutating state view for immutable consumer review. Unlike
+    /// persistence snapshots, this does not allocate a sequence or acknowledge
+    /// durability/approval. Missing/detached stock still fails closed.
+    pub fn snapshot_for_review(&self) -> Result<super::idb_store::WalletSnapshot, Error> {
         let stock = self
             .rgb_stock
             .try_borrow()
@@ -3002,10 +3302,8 @@ impl Wallet {
             })?;
 
         Ok(super::idb_store::WalletSnapshot {
-            sequence: self
-                .idb_sequence
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                + 1,
+            btcx_pending_fill_v1: self.btcx_pending_fill_v1.clone(),
+            sequence: self.idb_sequence.load(std::sync::atomic::Ordering::SeqCst),
             db: self.database.as_ref().clone(),
             bdk_changeset: self.bdk_database.get_data().clone(),
             transfer_artifacts: self.transfer_artifacts.clone(),
@@ -3021,8 +3319,11 @@ impl Wallet {
     ///
     /// This method resolves only after the IndexedDB read-write transaction commits. Callers must
     /// not persist dependent application state until this method succeeds. A failure leaves the
-    /// current in-memory wallet state intact and may be retried.
+    /// current in-memory wallet state intact. A stale-sequence refusal requires
+    /// durable-state reconciliation; incrementing the sequence and blindly
+    /// retrying an old writer is not safe.
     pub async fn flush(&self) -> Result<(), Error> {
+        self.require_legacy_persistence()?;
         let snapshot = self.snapshot()?;
         super::idb_store::save_snapshot(&self.idb_key(), &snapshot)
             .await
@@ -3032,6 +3333,12 @@ impl Wallet {
     /// Save current wallet state to IndexedDB asynchronously via spawn_local.
     fn save_to_idb(&self) {
         use std::sync::atomic::Ordering;
+
+        // Consumer commits are explicit. Do not serialize, advance sequence or
+        // schedule a legacy write behind its authenticated transaction.
+        if self.consumer_owned_persistence {
+            return;
+        }
 
         // Debounce: skip if a save is already in progress
         if self
@@ -3067,25 +3374,48 @@ impl Wallet {
         &mut self,
         snapshot: super::idb_store::WalletSnapshot,
     ) -> Result<(), Error> {
-        // Adopt the durable snapshot's monotonic sequence, never lowering the
-        // local counter. `idb_store::save_snapshot` drops any snapshot whose
-        // sequence is not strictly greater than the persisted one, so a fresh
-        // unlock (which starts `idb_sequence` at 0) would otherwise have every
-        // subsequent flush rejected as stale and silently lose the session's
-        // writes.
-        let restored_sequence = snapshot.sequence;
-        let current_sequence = self.idb_sequence.load(std::sync::atomic::Ordering::SeqCst);
-        if restored_sequence > current_sequence {
-            self.idb_sequence
-                .store(restored_sequence, std::sync::atomic::Ordering::SeqCst);
+        // An authenticated consumer restore must be a complete financial state,
+        // never a merge of incoming rows with this handle's old BDK/RGB state.
+        // A detached runtime is still using this wallet's stock; restoring over
+        // it would leave two divergent owners. Refuse before any adoption.
+        if self.consumer_owned_persistence {
+            self.use_consumer_owned_persistence()?;
+            if snapshot.bdk_changeset.is_none()
+                || snapshot.stock_stash_b64.is_none()
+                || snapshot.stock_state_b64.is_none()
+                || snapshot.stock_index_b64.is_none()
+            {
+                return Err(Error::Persistence {
+                    details: s!("consumer restore requires complete financial state"),
+                });
+            }
         }
 
-        // Restore the in-memory database
-        self.database = Arc::new(snapshot.db);
+        // Refuse before changing sequence, database, BDK or RGB state. A valid
+        // digest alone cannot authorize erasure/replacement of ambiguous intent.
+        super::pending_fill::require_preserved_on_restore(
+            self.btcx_pending_fill_v1.as_ref(),
+            snapshot.btcx_pending_fill_v1.as_ref(),
+        )
+        .map_err(|details| Error::Persistence { details })?;
+
+        // Exact pending terms do not make old financial state current. Once
+        // intent or consumer persistence is active, refuse rollback before adoption.
+        // This local guard is not authentication or cross-writer CAS; the
+        // encrypted consumer still owns those checks. Legacy backup restoration
+        // without an active pending fill retains its existing semantics.
+        if (self.consumer_owned_persistence || self.btcx_pending_fill_v1.is_some())
+            && snapshot.sequence < self.idb_sequence.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::Persistence {
+                details: s!("active financial snapshot rollback refused"),
+            });
+        }
 
         // Restore BDK changeset and re-load the BDK wallet
-        if let Some(changeset) = snapshot.bdk_changeset {
-            self.bdk_database.set_data(Some(changeset));
+        let restored_bdk = if let Some(changeset) = snapshot.bdk_changeset {
+            let mut database = super::memory_store::MemoryStore::new();
+            database.set_data(Some(changeset));
 
             // Reconstruct descriptors (same logic as Wallet::new)
             let wdata = &self.wallet_data;
@@ -3124,10 +3454,8 @@ impl Wallet {
                 wallet_params = wallet_params.extract_keys();
             }
 
-            match wallet_params.load_wallet(&mut self.bdk_database) {
-                Ok(Some(wallet)) => {
-                    self.bdk_wallet = wallet;
-                }
+            match wallet_params.load_wallet(&mut database) {
+                Ok(Some(wallet)) => Some((wallet, database)),
                 Ok(None) => {
                     return Err(Error::Persistence {
                         details: s!("persisted BDK changeset did not contain a loadable wallet"),
@@ -3139,34 +3467,166 @@ impl Wallet {
                     });
                 }
             }
-        }
+        } else {
+            None
+        };
 
-        // Restore complete pending transfers so send_end can resume after a page reload.
-        self.transfer_artifacts = snapshot.transfer_artifacts;
-
-        // Restore received consignments
-        self.received_consignments = snapshot.received_consignments;
-
-        // Restore address reuse pinned indices
-        self.reuse_address_index = snapshot.reuse_address_index;
-
-        // Restore RGB Stock from strict-encoded components
-        if let (Some(stash_b64), Some(state_b64), Some(index_b64)) = (
+        // Validate all RGB components before adopting any financial state. Missing
+        // components remain legacy-compatible only when all three are absent.
+        let restored_stock = match (
             snapshot.stock_stash_b64,
             snapshot.stock_state_b64,
             snapshot.stock_index_b64,
         ) {
-            let stock = super::idb_store::deserialize_stock(&stash_b64, &state_b64, &index_b64)
-                .map_err(InternalError::StockError)?;
-            *self.rgb_stock.borrow_mut() = Some(stock);
+            (Some(stash), Some(state), Some(index)) => Some(
+                super::idb_store::deserialize_stock(&stash, &state, &index)
+                    .map_err(InternalError::StockError)?,
+            ),
+            (None, None, None) => None,
+            _ => {
+                return Err(Error::Persistence {
+                    details: s!("incomplete persisted RGB stock"),
+                });
+            }
+        };
+        let mut stock = self
+            .rgb_stock
+            .try_borrow_mut()
+            .map_err(|_| Error::Persistence {
+                details: s!("RGB runtime is active; wallet state cannot be restored"),
+            })?;
+
+        // Every fallible validation has completed. Commit in memory without
+        // awaits, writes or callbacks; a refused restore leaves all state intact.
+        // Adopt the durable snapshot's monotonic sequence, never lowering the
+        // local counter. `idb_store::save_snapshot` refuses any snapshot whose
+        // sequence is not strictly greater than the persisted one, so a fresh
+        // unlock (which starts `idb_sequence` at 0) would otherwise have every
+        // subsequent flush rejected as stale and silently lose the session's
+        // writes.
+        let restored_sequence = snapshot.sequence;
+        let current_sequence = self.idb_sequence.load(std::sync::atomic::Ordering::SeqCst);
+        if restored_sequence > current_sequence {
+            self.idb_sequence
+                .store(restored_sequence, std::sync::atomic::Ordering::SeqCst);
         }
 
+        // Preserve the exact intent alongside the restored financial state.
+        self.btcx_pending_fill_v1 = snapshot.btcx_pending_fill_v1;
+
+        // Restore the in-memory database
+        self.database = Arc::new(snapshot.db);
+
+        if let Some((wallet, database)) = restored_bdk {
+            self.bdk_wallet = wallet;
+            self.bdk_database = database;
+        }
+        self.transfer_artifacts = snapshot.transfer_artifacts;
+        self.received_consignments = snapshot.received_consignments;
+        self.reuse_address_index = snapshot.reuse_address_index;
+        if let Some(restored_stock) = restored_stock {
+            *stock = Some(restored_stock);
+        }
         Ok(())
     }
 }
 
-#[cfg(test)]
-mod address_reuse_tests {
+#[cfg(feature = "test-fixtures")]
+impl Wallet {
+    /// TEST-ONLY: deterministic funded regtest wallet for the THE-944 item-9
+    /// exported-surface positive lifecycle test. Builds the established
+    /// in-memory test wallet, installs ONE deterministic synthetic unspent
+    /// funding output into the `InMemoryDb` (the seal is `BlindSeal::new_random`
+    /// on that outpoint, so no BDK ownership is required), then issues ONE
+    /// clearly-fake NIA through the existing in-memory builder to obtain a
+    /// genuine SAME-engine allocation. No network, no key material, no new
+    /// crypto. Feature-gated; never present in default/production builds and
+    /// no fixture initializer is exported to production.
+    /// TEST-ONLY: seed ONE real unspent funding output for `funding_tx` (vout 0)
+    /// into this wallet's `InMemoryDb` and enable the in-memory RGB stock. The
+    /// stored txo txid equals `funding_tx.compute_txid()`, so a reviewed request
+    /// can bind the SAME previous transaction (the prior fabricated-txid fixture
+    /// could not). Callable on any wallet (including the mnemonic-derived active
+    /// default wallet). Feature-gated; no production presence.
+    pub fn fund_wallet_for_tests(
+        &mut self,
+        funding_tx: crate::bitcoin::Transaction,
+    ) -> Result<(), Error> {
+        use crate::database::memory_db::{ActiveValue, DbTxoActMod};
+        self.use_consumer_owned_persistence()?;
+        // Seed the same transaction through BDK's normal indexer as well. Only
+        // scripts already owned by this wallet become spendable; synthetic RGB
+        // funding scripts do not acquire wallet ownership. TEST-only, no sync.
+        self.bdk_wallet
+            .apply_unconfirmed_txs([(funding_tx.clone(), 1)]);
+        self.bdk_wallet.persist(&mut self.bdk_database)?;
+        *self.rgb_stock.borrow_mut() = Some(rgbstd::persistence::Stock::in_memory());
+        let value = funding_tx
+            .output
+            .first()
+            .map(|o| o.value.to_sat())
+            .unwrap_or(0);
+        self.database
+            .set_txo(DbTxoActMod {
+                idx: ActiveValue::NotSet,
+                txid: ActiveValue::Set(funding_tx.compute_txid().to_string()),
+                vout: ActiveValue::Set(0),
+                btc_amount: ActiveValue::Set(value.to_string()),
+                spent: ActiveValue::Set(false),
+                exists: ActiveValue::Set(true),
+                pending_witness: ActiveValue::Set(false),
+            })
+            .map_err(|e| Error::Persistence {
+                details: format!("fixture funding txo failed: {e:?}"),
+            })?;
+        Ok(())
+    }
+
+    /// TEST-ONLY convenience: build the established in-memory test wallet, fund it
+    /// with a deterministic one-output funding transaction via
+    /// [`Self::fund_wallet_for_tests`], issue ONE clearly-fake NIA, and return
+    /// `(wallet, funding_tx)` so callers can embed the matching
+    /// `previous_transactions_hex`. Never present in default/production builds.
+    pub fn new_funded_regtest_wallet_for_tests(
+    ) -> Result<(Self, crate::bitcoin::Transaction), Error> {
+        use crate::bitcoin::absolute::LockTime;
+        use crate::bitcoin::transaction::{OutPoint, TxIn, TxOut, Version};
+        use crate::bitcoin::{hashes::Hash, Amount, ScriptBuf, Sequence, Transaction, Txid, Witness};
+        let mut wallet = address_reuse_tests::make_test_wallet(false);
+        // The address-only constructor intentionally leaves stock absent. Install
+        // initial TEST stock before the normal consumer-persistence handoff.
+        *wallet.rgb_stock.borrow_mut() = Some(rgbstd::persistence::Stock::in_memory());
+        let funding_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::all_zeros(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        wallet.fund_wallet_for_tests(funding_tx.clone())?;
+        wallet
+            .issue_asset_nia_in_memory(
+                "T944".to_string(),
+                "THE-944 item-9 unfunded fixture".to_string(),
+                0,
+                vec![1107],
+            )
+            .map_err(|e| Error::Persistence {
+                details: format!("fixture NIA issuance failed: {e:?}"),
+            })?;
+        Ok((wallet, funding_tx))
+    }
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+pub(crate) mod address_reuse_tests {
     use super::*;
     use crate::keys::generate_keys;
     use crate::utils::{get_descriptors, str_to_xpub};
@@ -3176,7 +3636,7 @@ mod address_reuse_tests {
     /// Bypasses `Wallet::new` (which requires RGB schema import / js-sys)
     /// by constructing only the BDK wallet and the fields that
     /// `_get_new_address` touches.
-    fn make_test_wallet(reuse: bool) -> Wallet {
+    pub(crate) fn make_test_wallet(reuse: bool) -> Wallet {
         let keys = generate_keys(BitcoinNetwork::Regtest);
         let bdk_network = BdkNetwork::from(BitcoinNetwork::Regtest);
         let xpub_rgb = str_to_xpub(&keys.account_xpub_colored, bdk_network).unwrap();
@@ -3190,7 +3650,7 @@ mod address_reuse_tests {
         )
         .unwrap();
         let mut bdk_database: BdkPersister = super::super::memory_store::MemoryStore::new();
-        let bdk_wallet = BdkWallet::create(desc_colored, desc_vanilla)
+        BdkWallet::create(desc_colored, desc_vanilla)
             .network(bdk_network)
             .create_wallet(&mut bdk_database)
             .unwrap();
@@ -3209,33 +3669,944 @@ mod address_reuse_tests {
             reuse_addresses: reuse,
         };
 
-        let drain = slog::Discard;
-        let logger = Logger::root(drain, o!());
-
-        Wallet {
-            wallet_data: wd,
-            logger,
-            _logger_guard: (),
-            watch_only: false,
-            database: Arc::new(crate::database::memory_db::InMemoryDb::new()),
-            wallet_dir: PathBuf::from(":memory:"),
-            bdk_wallet,
-            bdk_database,
-            reuse_address_index: HashMap::new(),
-            #[cfg(feature = "esplora")]
-            wasm_proxy_client: crate::api::proxy::WasmProxyClient::new().unwrap(),
-            #[cfg(feature = "esplora")]
-            online_data: None,
-            #[cfg(feature = "esplora")]
+        // Exercise the established complete-state constructor rather than
+        // duplicating the Wallet layout (including its Arc-backed database).
+        // This is local TEST setup only: no storage, keys export or schema import.
+        let (stash, state, index) =
+            super::super::idb_store::serialize_stock(&rgbstd::persistence::Stock::in_memory())
+                .unwrap();
+        let snapshot = super::super::idb_store::WalletSnapshot {
+            btcx_pending_fill_v1: None,
+            sequence: 0,
+            db: crate::database::memory_db::InMemoryDb::new(),
+            bdk_changeset: bdk_database.get_data().clone(),
             transfer_artifacts: HashMap::new(),
-            #[cfg(feature = "esplora")]
             received_consignments: HashMap::new(),
-            idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(None)),
-            vss_client: None,
-            last_vss_backup_error: std::cell::RefCell::new(None),
+            stock_stash_b64: Some(stash),
+            stock_state_b64: Some(state),
+            stock_index_b64: Some(index),
+            reuse_address_index: HashMap::new(),
+        };
+        let wallet = Wallet::restore_existing_snapshot(wd, snapshot).unwrap();
+        // Keep the original fixture precondition: tests explicitly install stock
+        // when they need a complete RGB engine; address-only tests need none.
+        wallet.rgb_stock.borrow_mut().take();
+        wallet
+    }
+
+    #[test]
+    fn review_snapshot_is_complete_nonmutating_and_persistence_allocates_sequence() {
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        wallet.use_consumer_owned_persistence().unwrap();
+        wallet
+            .install_consented_pending_fill(super::super::pending_fill::storage_fixture())
+            .unwrap();
+        let before = serde_json::to_value(wallet.snapshot_for_review().unwrap()).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                serde_json::to_value(wallet.snapshot_for_review().unwrap()).unwrap(),
+                before
+            );
         }
+        let persisted = wallet.snapshot_for_persistence().unwrap();
+        assert_eq!(persisted.sequence, before["sequence"].as_u64().unwrap() + 1);
+        let mut persisted = serde_json::to_value(persisted).unwrap();
+        persisted["sequence"] = before["sequence"].clone();
+        assert_eq!(
+            persisted, before,
+            "view includes every durable BTC/RGB/pending field"
+        );
+        assert!(
+            wallet
+                .snapshot_for_review()
+                .unwrap()
+                .btcx_pending_fill_v1
+                .is_some()
+        );
+        *wallet.rgb_stock.borrow_mut() = None;
+        assert!(wallet.snapshot_for_review().is_err());
+    }
+
+    #[cfg(feature = "esplora")]
+    #[test]
+    fn pending_application_refuses_wrong_binding_expiry_and_attempted_state() {
+        for variant in ["association", "digest", "expired", "Applying", "Applied"] {
+            let mut wallet = make_test_wallet(false);
+            *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+            wallet.use_consumer_owned_persistence().unwrap();
+            let mut pending =
+                serde_json::to_value(super::super::pending_fill::storage_fixture()).unwrap();
+            if variant == "Applying" || variant == "Applied" {
+                pending["state"] = variant.into();
+            }
+            wallet.btcx_pending_fill_v1 = Some(serde_json::from_value(pending).unwrap());
+            let mut before =
+                serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+            let digest = wallet.pending_fill().unwrap().digest().to_owned();
+            assert!(
+                wallet
+                    .prepare_consented_pending_application(
+                        if variant == "association" {
+                            "wrong"
+                        } else {
+                            "storage-case"
+                        },
+                        if variant == "digest" {
+                            "wrong"
+                        } else {
+                            &digest
+                        },
+                        if variant == "expired" { 1 } else { 0 },
+                    )
+                    .is_err(),
+                "{variant}"
+            );
+            let mut after =
+                serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+            assert_eq!(
+                after["sequence"].as_u64().unwrap(),
+                before["sequence"].as_u64().unwrap() + 1
+            );
+            before.as_object_mut().unwrap().remove("sequence");
+            after.as_object_mut().unwrap().remove("sequence");
+            assert_eq!(
+                before, after,
+                "{variant} must preserve complete engine state"
+            );
+        }
+    }
+
+    #[cfg(feature = "esplora")]
+    #[test]
+    fn pending_application_refuses_legacy_detached_absent_and_malformed_without_mutation() {
+        for variant in ["legacy", "detached", "absent", "malformed"] {
+            let mut wallet = make_test_wallet(false);
+            *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+            if variant != "legacy" {
+                wallet.use_consumer_owned_persistence().unwrap();
+            }
+            if variant != "absent" {
+                wallet.btcx_pending_fill_v1 = Some(super::super::pending_fill::storage_fixture());
+            }
+            let mut before =
+                serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+            if variant == "detached" {
+                *wallet.rgb_stock.borrow_mut() = None;
+            }
+            let result = wallet.prepare_consented_pending_application(
+                "storage-case",
+                &super::super::pending_fill::storage_fixture()
+                    .digest()
+                    .to_owned(),
+                0,
+            );
+            assert!(result.is_err(), "{variant}");
+            if variant == "detached" {
+                *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+            }
+            let mut after =
+                serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+            assert_eq!(
+                after["sequence"].as_u64().unwrap(),
+                before["sequence"].as_u64().unwrap() + 1
+            );
+            before.as_object_mut().unwrap().remove("sequence");
+            after.as_object_mut().unwrap().remove("sequence");
+            assert_eq!(before, after, "{variant}");
+        }
+    }
+
+    #[cfg(feature = "esplora")]
+    #[test]
+    fn prepared_application_is_bound_to_exact_engine_state_and_postcommit_expiry() {
+        for variant in ["other-engine", "state-drift", "expiry", "detached"] {
+            let mut wallet = make_test_wallet(false);
+            *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+            wallet.use_consumer_owned_persistence().unwrap();
+            let prepared = super::super::pending_fill::storage_application_capability(&mut wallet);
+            // Host may allocate a persistence sequence to acknowledge Applying.
+            let snapshot = wallet.snapshot_for_persistence().unwrap();
+            let retained = serde_json::to_value(&snapshot.btcx_pending_fill_v1).unwrap();
+            let result = match variant {
+                "other-engine" => {
+                    let mut other = make_test_wallet(false);
+                    *other.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+                    other.use_consumer_owned_persistence().unwrap();
+                    other.btcx_pending_fill_v1 = snapshot.btcx_pending_fill_v1.clone();
+                    let before =
+                        serde_json::to_value(other.snapshot_for_review().unwrap()).unwrap();
+                    let result = other.apply_prepared_pending_fill(prepared, 0);
+                    assert_eq!(
+                        serde_json::to_value(other.snapshot_for_review().unwrap()).unwrap(),
+                        before
+                    );
+                    result
+                }
+                "state-drift" => {
+                    wallet
+                        .reuse_address_index
+                        .insert(bdk_wallet::KeychainKind::External, 1);
+                    wallet.apply_prepared_pending_fill(prepared, 0)
+                }
+                "expiry" => wallet.apply_prepared_pending_fill(prepared, 1),
+                "detached" => {
+                    *wallet.rgb_stock.borrow_mut() = None;
+                    wallet.apply_prepared_pending_fill(prepared, 0)
+                }
+                _ => unreachable!(),
+            };
+            assert!(result.is_err(), "{variant}");
+            assert_eq!(
+                serde_json::to_value(&wallet.btcx_pending_fill_v1).unwrap(),
+                retained
+            );
+            assert!(
+                wallet
+                    .prepare_consented_pending_application(
+                        "storage-case",
+                        super::super::pending_fill::storage_fixture().digest(),
+                        0
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(feature = "esplora")]
+    #[test]
+    fn dropped_application_capability_keeps_full_intent_and_restore_cannot_resume() {
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        wallet.use_consumer_owned_persistence().unwrap();
+        let prepared = super::super::pending_fill::storage_application_capability(&mut wallet);
+        let snapshot = wallet.snapshot_for_persistence().unwrap();
+        drop(prepared);
+        let expected = serde_json::to_value(&snapshot.btcx_pending_fill_v1).unwrap();
+        let mut restored =
+            Wallet::restore_consumer_owned_snapshot(wallet.wallet_data.clone(), snapshot).unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored.btcx_pending_fill_v1).unwrap(),
+            expected
+        );
+        assert!(
+            restored
+                .prepare_consented_pending_application(
+                    "storage-case",
+                    super::super::pending_fill::storage_fixture().digest(),
+                    0
+                )
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(&restored.btcx_pending_fill_v1).unwrap(),
+            expected
+        );
+    }
+
+    #[cfg(feature = "esplora")]
+    #[test]
+    fn application_attempt_after_sequence_commit_preserves_applying_on_engine_error() {
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        wallet.use_consumer_owned_persistence().unwrap();
+        let prepared = super::super::pending_fill::storage_application_capability(&mut wallet);
+        let before = wallet.snapshot_for_persistence().unwrap();
+        let error = wallet.apply_prepared_pending_fill(prepared, 0).unwrap_err();
+        // Sequence-only change passed the guard; actual empty coloring fails.
+        assert!(!error.to_string().contains("engine/state/expiry changed"));
+        assert_eq!(
+            serde_json::to_value(&wallet.btcx_pending_fill_v1).unwrap(),
+            serde_json::to_value(&before.btcx_pending_fill_v1).unwrap()
+        );
+        assert!(
+            wallet
+                .prepare_consented_pending_application(
+                    "storage-case",
+                    super::super::pending_fill::storage_fixture().digest(),
+                    0
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn install_consented_pending_preserves_same_wallet_financial_state() {
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        wallet.use_consumer_owned_persistence().unwrap();
+        let mut before = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+        let pending = super::super::pending_fill::storage_fixture();
+        let digest = pending.digest().to_owned();
+        let sequence = wallet
+            .idb_sequence
+            .load(std::sync::atomic::Ordering::SeqCst);
+        wallet
+            .install_consented_pending_fill(pending.clone())
+            .unwrap();
+        wallet.install_consented_pending_fill(pending).unwrap();
+        assert_eq!(wallet.pending_fill().unwrap().digest(), digest);
+        assert_eq!(
+            wallet
+                .idb_sequence
+                .load(std::sync::atomic::Ordering::SeqCst),
+            sequence
+        );
+        assert!(
+            !wallet
+                .idb_save_in_progress
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        let mut after = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+        before.as_object_mut().unwrap().remove("sequence");
+        after.as_object_mut().unwrap().remove("sequence");
+        assert!(
+            before
+                .as_object_mut()
+                .unwrap()
+                .remove("btcx_pending_fill_v1")
+                .is_none()
+        );
+        assert!(
+            after
+                .as_object_mut()
+                .unwrap()
+                .remove("btcx_pending_fill_v1")
+                .is_some()
+        );
+        assert_eq!(before, after);
+        let snapshot = wallet.snapshot_for_persistence().unwrap();
+        let restored =
+            Wallet::restore_existing_snapshot(wallet.wallet_data.clone(), snapshot).unwrap();
+        assert_eq!(restored.pending_fill().unwrap().digest(), digest);
+    }
+
+    #[test]
+    fn install_consented_pending_refuses_legacy_and_active_runtime() {
+        use std::sync::atomic::Ordering;
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let pending = super::super::pending_fill::storage_fixture();
+        assert!(
+            wallet
+                .install_consented_pending_fill(pending.clone())
+                .is_err()
+        );
+        assert!(wallet.pending_fill().is_none());
+        wallet.use_consumer_owned_persistence().unwrap();
+        wallet.idb_save_in_progress.store(true, Ordering::SeqCst);
+        assert!(
+            wallet
+                .install_consented_pending_fill(pending.clone())
+                .is_err()
+        );
+        wallet.idb_save_in_progress.store(false, Ordering::SeqCst);
+        let stock = wallet.rgb_stock.clone();
+        let borrowed = stock.borrow_mut();
+        assert!(
+            wallet
+                .install_consented_pending_fill(pending.clone())
+                .is_err()
+        );
+        drop(borrowed);
+        let detached = wallet.rgb_stock.borrow_mut().take();
+        assert!(
+            wallet
+                .install_consented_pending_fill(pending.clone())
+                .is_err()
+        );
+        assert!(wallet.pending_fill().is_none());
+        *wallet.rgb_stock.borrow_mut() = detached;
+        wallet.install_consented_pending_fill(pending).unwrap();
+    }
+
+    #[test]
+    fn install_consented_pending_refuses_replacement_and_applied_state() {
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        wallet.use_consumer_owned_persistence().unwrap();
+        let pending = super::super::pending_fill::storage_fixture();
+        let mut applied = serde_json::to_value(&pending).unwrap();
+        applied["state"] = "Applied".into();
+        let applied = serde_json::from_value(applied).unwrap();
+        assert!(wallet.install_consented_pending_fill(applied).is_err());
+        assert!(wallet.pending_fill().is_none());
+        wallet.install_consented_pending_fill(pending).unwrap();
+        let before = serde_json::to_value(wallet.pending_fill()).unwrap();
+        assert!(
+            wallet
+                .install_consented_pending_fill(
+                    super::super::pending_fill::replacement_storage_fixture(),
+                )
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(wallet.pending_fill()).unwrap(), before);
+    }
+
+    #[test]
+    fn install_consented_pending_cannot_downgrade_restored_applied_intent() {
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let pending = super::super::pending_fill::storage_fixture();
+        let mut applied = serde_json::to_value(&pending).unwrap();
+        applied["state"] = "Applied".into();
+        let mut snapshot = wallet.snapshot_for_persistence().unwrap();
+        snapshot.btcx_pending_fill_v1 = Some(serde_json::from_value(applied).unwrap());
+        wallet.restore_from_snapshot(snapshot).unwrap();
+        wallet.use_consumer_owned_persistence().unwrap();
+        let before = serde_json::to_value(wallet.pending_fill()).unwrap();
+        let sequence = wallet
+            .idb_sequence
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(wallet.install_consented_pending_fill(pending).is_err());
+        assert_eq!(serde_json::to_value(wallet.pending_fill()).unwrap(), before);
+        assert_eq!(
+            wallet
+                .idb_sequence
+                .load(std::sync::atomic::Ordering::SeqCst),
+            sequence
+        );
+    }
+
+    #[test]
+    fn consumer_restore_constructor_preserves_exact_state_without_legacy_writer() {
+        use std::sync::atomic::Ordering;
+        let mut source = make_test_wallet(false);
+        *source.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        source.use_consumer_owned_persistence().unwrap();
+        source
+            .install_consented_pending_fill(super::super::pending_fill::storage_fixture())
+            .unwrap();
+        let snapshot = source.snapshot_for_persistence().unwrap();
+        let mut expected = serde_json::to_value(&snapshot).unwrap();
+        let restored =
+            Wallet::restore_consumer_owned_snapshot(source.wallet_data.clone(), snapshot).unwrap();
+        assert!(restored.require_legacy_persistence().is_err());
+        assert_eq!(restored.idb_sequence.load(Ordering::SeqCst), 1);
+        restored.save_to_idb(); // any native scheduling would panic
+        assert_eq!(restored.idb_sequence.load(Ordering::SeqCst), 1);
+        assert!(!restored.idb_save_in_progress.load(Ordering::SeqCst));
+        expected["sequence"] = 2.into();
+        assert_eq!(
+            serde_json::to_value(restored.snapshot_for_persistence().unwrap()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn consumer_restore_refuses_partial_rollback_and_detached_runtime() {
+        use std::sync::atomic::Ordering;
+        for failure in ["missing-bdk", "missing-rgb", "rollback", "detached-runtime"] {
+            let mut wallet = make_test_wallet(false);
+            *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+            wallet.use_consumer_owned_persistence().unwrap();
+            let mut before =
+                serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+            let mut incoming = before.clone();
+            incoming["sequence"] = 100.into();
+            incoming["db"]["next_txo_idx"] = 20.into();
+            match failure {
+                "missing-bdk" => incoming["bdk_changeset"] = serde_json::Value::Null,
+                "missing-rgb" => {
+                    for field in ["stock_stash_b64", "stock_state_b64", "stock_index_b64"] {
+                        incoming[field] = serde_json::Value::Null;
+                    }
+                }
+                "rollback" => incoming["sequence"] = 0.into(),
+                "detached-runtime" => {}
+                _ => unreachable!(),
+            }
+            let detached = if failure == "detached-runtime" {
+                wallet.rgb_stock.borrow_mut().take()
+            } else {
+                None
+            };
+            assert!(
+                wallet
+                    .restore_from_snapshot(serde_json::from_value(incoming).unwrap())
+                    .is_err(),
+                "{failure}"
+            );
+            if let Some(stock) = detached {
+                assert!(wallet.rgb_stock.borrow().is_none());
+                *wallet.rgb_stock.borrow_mut() = Some(stock);
+            }
+            assert_eq!(wallet.idb_sequence.load(Ordering::SeqCst), 1, "{failure}");
+            before["sequence"] = 2.into();
+            assert_eq!(
+                serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap(),
+                before,
+                "{failure}"
+            );
+            assert!(wallet.require_legacy_persistence().is_err());
+        }
+    }
+
+    #[test]
+    fn consumer_persistence_handoff_blocks_legacy_writes_on_same_wallet() {
+        use std::sync::atomic::Ordering;
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let before = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+        assert!(wallet.require_legacy_persistence().is_ok());
+        wallet.use_consumer_owned_persistence().unwrap();
+        wallet.use_consumer_owned_persistence().unwrap(); // idempotent, never reversible
+        assert!(wallet.require_legacy_persistence().is_err());
+        let sequence = wallet.idb_sequence.load(Ordering::SeqCst);
+        // Poll the public async boundary: refusal must happen before any browser
+        // I/O, even though the legacy future normally opens IndexedDB.
+        {
+            use std::future::Future;
+            let mut flush = std::pin::pin!(wallet.flush());
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(matches!(
+                flush.as_mut().poll(&mut context),
+                std::task::Poll::Ready(Err(Error::Persistence { .. }))
+            ));
+        }
+        wallet.save_to_idb(); // native: any scheduling/browser call would panic
+        assert_eq!(wallet.idb_sequence.load(Ordering::SeqCst), sequence);
+        assert!(!wallet.idb_save_in_progress.load(Ordering::SeqCst));
+        let after = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+        let mut expected = before;
+        expected["sequence"] = after["sequence"].clone();
+        assert_eq!(after, expected); // same financial engine, no state adoption
+        wallet
+            .restore_from_snapshot(serde_json::from_value(after).unwrap())
+            .unwrap();
+        assert!(wallet.require_legacy_persistence().is_err()); // restore cannot undo ownership
+    }
+
+    #[test]
+    fn consumer_handoff_refuses_pending_legacy_save() {
+        use std::sync::atomic::Ordering;
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        wallet.idb_save_in_progress.store(true, Ordering::SeqCst);
+        assert!(wallet.use_consumer_owned_persistence().is_err());
+        assert!(wallet.require_legacy_persistence().is_ok());
+        assert!(wallet.idb_save_in_progress.load(Ordering::SeqCst));
+        wallet.idb_save_in_progress.store(false, Ordering::SeqCst);
+        wallet.use_consumer_owned_persistence().unwrap();
+        assert!(wallet.require_legacy_persistence().is_err());
+    }
+
+    #[test]
+    fn consumer_handoff_refuses_active_rgb_runtime() {
+        let mut wallet = make_test_wallet(false);
+        // Checked-out runtime has removed stock from the wallet.
+        assert!(wallet.use_consumer_owned_persistence().is_err());
+        assert!(wallet.require_legacy_persistence().is_ok());
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let shared_stock = wallet.rgb_stock.clone();
+        let borrowed = shared_stock.borrow_mut();
+        assert!(wallet.use_consumer_owned_persistence().is_err());
+        assert!(wallet.require_legacy_persistence().is_ok());
+        drop(borrowed);
+        wallet.use_consumer_owned_persistence().unwrap();
+    }
+
+    #[test]
+    fn failed_active_restore_preserves_complete_wallet_state() {
+        for failure in ["bdk", "stock", "partial-stock", "borrowed-stock"] {
+            let mut wallet = make_test_wallet(false);
+            *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+            let mut baseline =
+                serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+            let mut incoming = baseline.clone();
+            incoming["sequence"] = 100.into();
+            incoming["btcx_pending_fill_v1"] =
+                serde_json::to_value(super::super::pending_fill::storage_fixture()).unwrap();
+            incoming["reuse_address_index"] = serde_json::json!({"External": 12});
+            incoming["db"]["next_txo_idx"] = 20.into();
+            match failure {
+                "bdk" => {
+                    incoming["bdk_changeset"] =
+                        serde_json::to_value(bdk_wallet::ChangeSet::default()).unwrap()
+                }
+                "stock" => incoming["stock_stash_b64"] = "invalid".into(),
+                "partial-stock" => incoming["stock_index_b64"] = serde_json::Value::Null,
+                "borrowed-stock" => {}
+                _ => unreachable!(),
+            }
+            let snapshot = serde_json::from_value(incoming).unwrap();
+            let stock = wallet.rgb_stock.clone();
+            let held = (failure == "borrowed-stock").then(|| stock.borrow());
+            assert!(wallet.restore_from_snapshot(snapshot).is_err(), "{failure}");
+            drop(held);
+            // Reading a snapshot advances the local counter once; failed restore
+            // must neither adopt sequence 100 nor change any financial bytes.
+            baseline["sequence"] = 2.into();
+            assert_eq!(
+                serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap(),
+                baseline,
+                "{failure}",
+            );
+        }
+    }
+
+    #[test]
+    fn pending_fill_survives_active_and_strict_restore_snapshot() {
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let mut snapshot = wallet.snapshot_for_persistence().unwrap();
+        let record = super::super::pending_fill::storage_fixture();
+        let expected = serde_json::to_value(&record).unwrap();
+        snapshot.btcx_pending_fill_v1 = Some(record);
+        // Exact path used by the authenticated default lifecycle after decryption.
+        let plain = serde_json::to_vec(&snapshot).unwrap();
+        let decoded = serde_json::from_slice(&plain).unwrap();
+        wallet.restore_from_snapshot(decoded).unwrap();
+        let flushed = wallet.snapshot_for_persistence().unwrap();
+        assert_eq!(
+            serde_json::to_value(&flushed.btcx_pending_fill_v1).unwrap(),
+            expected
+        );
+        // Strict existing restore (no fresh wallet or schema import) also preserves it.
+        let strict =
+            Wallet::restore_existing_snapshot(wallet.wallet_data.clone(), flushed).unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                strict
+                    .snapshot_for_persistence()
+                    .unwrap()
+                    .btcx_pending_fill_v1
+            )
+            .unwrap(),
+            expected
+        );
+        let mut changed: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+        changed["btcx_pending_fill_v1"]["digest"] = "invalid".into();
+        assert!(
+            serde_json::from_value::<super::super::idb_store::WalletSnapshot>(changed).is_err()
+        );
+    }
+
+    #[test]
+    fn active_pending_restore_refuses_older_financial_state() {
+        for state in ["Consented", "Applying", "Applied"] {
+            let mut wallet = make_test_wallet(false);
+            *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+            let mut initial = wallet.snapshot_for_persistence().unwrap();
+            initial.btcx_pending_fill_v1 = Some(super::super::pending_fill::storage_fixture());
+            let mut initial = serde_json::to_value(initial).unwrap();
+            initial["btcx_pending_fill_v1"]["state"] = state.into();
+            initial["sequence"] = 100.into();
+            wallet
+                .restore_from_snapshot(serde_json::from_value(initial).unwrap())
+                .unwrap();
+            let before = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+            let mut older = before.clone();
+            older["sequence"] = 1.into();
+            // Exact same pending terms/state, different financial address state.
+            older["reuse_address_index"] = serde_json::json!({"External": 42});
+            assert!(
+                wallet
+                    .restore_from_snapshot(serde_json::from_value(older).unwrap())
+                    .is_err(),
+                "{state}"
+            );
+            let mut after =
+                serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+            assert_eq!(after["sequence"], before["sequence"].as_u64().unwrap() + 1);
+            after["sequence"] = before["sequence"].clone();
+            assert_eq!(after, before, "{state}");
+        }
+    }
+
+    #[test]
+    fn active_restore_refuses_pending_erasure_replacement_and_state_change() {
+        for (initial_state, change) in [
+            ("Consented", "erase"),
+            ("Consented", "replace"),
+            ("Consented", "state"),
+            ("Applied", "erase"),
+            ("Applied", "replace"),
+            ("Applied", "state"),
+        ] {
+            let mut wallet = make_test_wallet(false);
+            *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+            let mut initial = wallet.snapshot_for_persistence().unwrap();
+            initial.btcx_pending_fill_v1 = Some(super::super::pending_fill::storage_fixture());
+            let mut initial = serde_json::to_value(initial).unwrap();
+            initial["btcx_pending_fill_v1"]["state"] = initial_state.into();
+            wallet
+                .restore_from_snapshot(serde_json::from_value(initial).unwrap())
+                .unwrap();
+            // Importing the same exact pending record remains compatible.
+            let exact = wallet.snapshot_for_persistence().unwrap();
+            wallet.restore_from_snapshot(exact).unwrap();
+            let baseline = wallet.snapshot_for_persistence().unwrap();
+            let before = serde_json::to_value(&baseline).unwrap();
+            let mut changed = before.clone();
+            match change {
+                "erase" => {
+                    changed
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("btcx_pending_fill_v1");
+                }
+                "replace" => {
+                    // A second internally consistent intent, not just a broken digest.
+                    changed["btcx_pending_fill_v1"] = serde_json::to_value(
+                        super::super::pending_fill::replacement_storage_fixture(),
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    changed["btcx_pending_fill_v1"]["state"] = if initial_state == "Applied" {
+                        "Consented"
+                    } else {
+                        "Applied"
+                    }
+                    .into();
+                }
+            }
+            changed["sequence"] = (baseline.sequence + 100).into();
+            let snapshot = serde_json::from_value(changed).unwrap();
+            assert!(wallet.restore_from_snapshot(snapshot).is_err(), "{change}");
+            let after = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+            assert_eq!(
+                after["btcx_pending_fill_v1"], before["btcx_pending_fill_v1"],
+                "{change}"
+            );
+            assert_eq!(after["sequence"], baseline.sequence + 1, "{change}");
+            for field in [
+                "db",
+                "bdk_changeset",
+                "stock_stash_b64",
+                "stock_state_b64",
+                "stock_index_b64",
+            ] {
+                assert_eq!(after[field], before[field], "{change}: {field}");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_snapshot_without_pending_record_remains_readable() {
+        let wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let mut legacy = serde_json::to_value(wallet.snapshot_for_persistence().unwrap()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("btcx_pending_fill_v1");
+        let decoded: super::super::idb_store::WalletSnapshot =
+            serde_json::from_value(legacy).unwrap();
+        assert!(decoded.btcx_pending_fill_v1.is_none());
+        let mut malformed = serde_json::to_value(decoded).unwrap();
+        malformed["btcx_pending_fill_v1"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<super::super::idb_store::WalletSnapshot>(malformed).is_err()
+        );
+    }
+
+    #[test]
+    fn local_script_membership_is_read_only() {
+        let wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let external = wallet
+            .bdk_wallet
+            .peek_address(KeychainKind::External, 0)
+            .address
+            .script_pubkey();
+        let internal = wallet
+            .bdk_wallet
+            .peek_address(KeychainKind::Internal, 0)
+            .address
+            .script_pubkey();
+        let foreign = make_test_wallet(false)
+            .bdk_wallet
+            .peek_address(KeychainKind::External, 0)
+            .address
+            .script_pubkey();
+        let unknown = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+        let empty = bitcoin::ScriptBuf::new();
+        let before_store = serde_json::to_vec(wallet.bdk_database.get_data()).unwrap();
+        let before_stage = serde_json::to_vec(&wallet.bdk_wallet.staged()).unwrap();
+        let before_db = serde_json::to_vec(wallet.database.as_ref()).unwrap();
+        let before_stock =
+            super::super::idb_store::serialize_stock(wallet.rgb_stock.borrow().as_ref().unwrap())
+                .unwrap();
+        let before_reuse = wallet.reuse_address_index.clone();
+        let before_sequence = wallet
+            .idb_sequence
+            .load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..3 {
+            assert!(wallet.is_local_script(&external));
+            assert!(wallet.is_local_script(&internal));
+            assert!(!wallet.is_local_script(&foreign));
+            assert!(!wallet.is_local_script(&unknown));
+            assert!(!wallet.is_local_script(&empty));
+        }
+        assert_eq!(
+            serde_json::to_vec(wallet.bdk_database.get_data()).unwrap(),
+            before_store
+        );
+        assert_eq!(
+            serde_json::to_vec(&wallet.bdk_wallet.staged()).unwrap(),
+            before_stage
+        );
+        assert_eq!(
+            serde_json::to_vec(wallet.database.as_ref()).unwrap(),
+            before_db
+        );
+        assert_eq!(
+            super::super::idb_store::serialize_stock(wallet.rgb_stock.borrow().as_ref().unwrap())
+                .unwrap(),
+            before_stock
+        );
+        assert_eq!(wallet.reuse_address_index, before_reuse);
+        assert_eq!(
+            wallet
+                .idb_sequence
+                .load(std::sync::atomic::Ordering::SeqCst),
+            before_sequence
+        );
+    }
+
+    #[test]
+    fn color_export_unfunded_refusals_preserve_stock_and_records() {
+        use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
+        let wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let before_stock =
+            super::super::idb_store::serialize_stock(wallet.rgb_stock.borrow().as_ref().unwrap())
+                .unwrap();
+        let before_db = serde_json::to_value(wallet.database.as_ref()).unwrap();
+        let mut psbt = Psbt::from_unsigned_tx(bdk_wallet::bitcoin::Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: BdkAmount::ZERO,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        })
+        .unwrap();
+        let original = psbt.serialize();
+        let empty = ColoringInfo {
+            asset_info_map: HashMap::new(),
+            static_blinding: Some(1),
+            nonce: Some(1),
+        };
+        assert!(matches!(
+            wallet.color_psbt_and_export(&mut psbt, empty.clone()),
+            Err(Error::InvalidColoringInfo { .. })
+        ));
+        // A syntactically valid but unowned contract must fail without changing stock or PSBT.
+        let contract_id =
+            ContractId::from_str("rgb:qFuT6DN8-9AuO95M-7R8R8Mc-AZvs7zG-obum1Va-BRnweKk").unwrap();
+        let info = ColoringInfo {
+            asset_info_map: HashMap::from([(
+                contract_id,
+                AssetColoringInfo {
+                    output_map: HashMap::from([(0, 1)]),
+                    static_blinding: Some(1),
+                },
+            )]),
+            ..empty
+        };
+        assert!(
+            wallet
+                .color_psbt_and_export(&mut psbt, info.clone())
+                .is_err()
+        );
+        assert_eq!(psbt.serialize(), original);
+        assert_eq!(
+            serde_json::to_value(wallet.database.as_ref()).unwrap(),
+            before_db
+        );
+        assert_eq!(
+            super::super::idb_store::serialize_stock(wallet.rgb_stock.borrow().as_ref().unwrap())
+                .unwrap(),
+            before_stock
+        );
+        assert_eq!(
+            wallet
+                .idb_sequence
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let held = wallet.rgb_runtime().unwrap();
+        assert!(wallet.color_psbt_and_export(&mut psbt, info).is_err());
+        assert!(wallet.rgb_stock.borrow().is_none());
+        drop(held);
+        assert_eq!(
+            super::super::idb_store::serialize_stock(wallet.rgb_stock.borrow().as_ref().unwrap())
+                .unwrap(),
+            before_stock
+        );
+        assert_eq!(psbt.serialize(), original);
+    }
+
+    mod state_bytes {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/state_bytes.rs"
+        ));
+    }
+
+    #[test]
+    fn byte_state_runtime_checkout_drop_and_snapshot_restore() {
+        use state_bytes::*;
+        let mut wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let stock_before = strict_stock_bytes(
+            &super::super::idb_store::serialize_stock(wallet.rgb_stock.borrow().as_ref().unwrap())
+                .unwrap(),
+        );
+        let snapshot = wallet.snapshot().unwrap();
+        let snapshot_value = serde_json::to_value(&snapshot).unwrap();
+        let state_before = snapshot_state_bytes(snapshot_value.clone());
+        assert_eq!(snapshot_stock_bytes(&snapshot_value), stock_before);
+        let sequence = wallet
+            .idb_sequence
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let runtime = wallet.rgb_runtime().unwrap();
+        assert!(wallet.rgb_stock.borrow().is_none());
+        assert_eq!(
+            strict_stock_bytes(&super::super::idb_store::serialize_stock(&runtime.stock).unwrap()),
+            stock_before
+        );
+        assert!(matches!(wallet.snapshot(), Err(Error::Persistence { .. })));
+        assert_eq!(
+            wallet
+                .idb_sequence
+                .load(std::sync::atomic::Ordering::SeqCst),
+            sequence
+        );
+        drop(runtime);
+        assert_eq!(
+            strict_stock_bytes(
+                &super::super::idb_store::serialize_stock(
+                    wallet.rgb_stock.borrow().as_ref().unwrap()
+                )
+                .unwrap()
+            ),
+            stock_before
+        );
+        let restored_bytes = serde_json::to_vec(&snapshot).unwrap();
+        wallet
+            .restore_from_snapshot(serde_json::from_slice(&restored_bytes).unwrap())
+            .unwrap();
+        let after = serde_json::to_value(wallet.snapshot().unwrap()).unwrap();
+        assert_eq!(snapshot_stock_bytes(&after), stock_before);
+        assert_eq!(snapshot_state_bytes(after.clone()), state_before);
+        // Sensitivity control: actual BDK derivation changes snapshot state, not stock.
+        wallet._get_new_address(KeychainKind::Internal).unwrap();
+        let changed = serde_json::to_value(wallet.snapshot().unwrap()).unwrap();
+        assert_ne!(snapshot_state_bytes(changed.clone()), state_before);
+        assert_eq!(snapshot_stock_bytes(&changed), stock_before);
+        println!(
+            "THE876_BYTE_STATE {}",
+            serde_json::json!({
+                "boundary": "internal-runtime-snapshot", "stock": stock_before.each_ref().map(|b| receipt(b)),
+                "snapshot_state": receipt(&state_before), "serialized_snapshot": receipt(&restored_bytes),
+                "sequence_before": sequence, "sequence_after_restore_snapshot": after["sequence"]
+            })
+        );
     }
 
     #[test]
@@ -3310,6 +4681,14 @@ mod address_reuse_tests {
     /// `THE802_CONTRACT` on `THE802_SOURCE_TXID:0` (the state after the live
     /// issuance in the THE-800 adverse pair).
     fn seed_seller_source(wallet: &Wallet) {
+        seed_seller_source_amount(wallet, 1000);
+    }
+
+    fn seed_seller_source_amount(wallet: &Wallet, amount: u64) {
+        seed_seller_source_at(wallet, amount, THE802_SOURCE_TXID);
+    }
+
+    fn seed_seller_source_at(wallet: &Wallet, amount: u64, source_txid: &str) {
         use crate::database::memory_db::{
             ActiveValue, DbAssetActMod, DbAssetTransferActMod, DbBatchTransferActMod,
             DbColoringActMod, DbTransferActMod, DbTxoActMod,
@@ -3330,7 +4709,7 @@ mod address_reuse_tests {
         let src_txo = wallet
             .database
             .set_txo(DbTxoActMod {
-                txid: ActiveValue::Set(THE802_SOURCE_TXID.to_string()),
+                txid: ActiveValue::Set(source_txid.to_string()),
                 vout: ActiveValue::Set(0),
                 btc_amount: ActiveValue::Set("20000".to_string()),
                 spent: ActiveValue::Set(false),
@@ -3373,7 +4752,7 @@ mod address_reuse_tests {
                 txo_idx: ActiveValue::Set(src_txo),
                 asset_transfer_idx: ActiveValue::Set(issue_at),
                 r#type: ActiveValue::Set(ColoringType::Receive),
-                assignment: ActiveValue::Set(Assignment::Fungible(1000)),
+                assignment: ActiveValue::Set(Assignment::Fungible(amount)),
                 ..Default::default()
             })
             .unwrap();
@@ -3456,6 +4835,15 @@ mod address_reuse_tests {
             transfers[0].kind
         );
 
+        // THE-803: production list_transfers must report the sent quantity,
+        // while the separate change allocation remains 900.
+        assert_eq!(transfers[0].assignments, vec![Assignment::Fungible(100)]);
+        assert_eq!(transfers[0].change_utxo.as_ref().unwrap().vout, 3);
+        println!(
+            "THE803_TRANSFER_JSON={}",
+            serde_json::to_string(&transfers).unwrap()
+        );
+
         // Idempotent replay: no second batch, no duplicate rows.
         let replay = wallet
             .register_collaborative_outgoing_transfer(
@@ -3475,6 +4863,89 @@ mod address_reuse_tests {
             .filter(|b| b.txid.as_deref() == Some(THE802_COLLAB_TXID))
             .count();
         assert_eq!(collab_batches_after, 1, "replay duplicated the batch row");
+
+        // The real snapshot serialization/restore path used by flush/unlock.
+        // Native tests cannot execute the browser IndexedDB transaction.
+        *wallet.rgb_stock.borrow_mut() = Some(rgbstd::persistence::Stock::in_memory());
+        let snapshot_bytes = serde_json::to_vec(&wallet.snapshot().unwrap()).unwrap();
+        let mut unlocked = make_test_wallet(false);
+        unlocked.wallet_data = wallet.wallet_data.clone();
+        unlocked
+            .restore_from_snapshot(serde_json::from_slice(&snapshot_bytes).unwrap())
+            .unwrap();
+        for _ in 0..3 {
+            let rows = unlocked
+                .list_transfers(
+                    AssetFilter::Id(THE802_CONTRACT.to_string()),
+                    Some(THE802_COLLAB_TXID.to_string()),
+                )
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].idx, transfers[0].idx);
+            assert_eq!(rows[0].batch_transfer_idx, transfers[0].batch_transfer_idx);
+            assert_eq!(rows[0].assignments, vec![Assignment::Fungible(100)]);
+            assert_eq!(rows[0].change_utxo.as_ref().unwrap().vout, 3);
+        }
+        assert!(
+            unlocked
+                .register_collaborative_outgoing_transfer(
+                    THE802_COLLAB_TXID.to_string(),
+                    THE802_CONTRACT.to_string(),
+                    vec![src_outpoint.clone()],
+                    Some((3, 900)),
+                    1,
+                )
+                .unwrap()
+                .is_none()
+        );
+        for (change, confirmations) in [
+            (Some((3, 800)), 1),
+            (Some((4, 900)), 1),
+            (Some((3, 900)), 2),
+        ] {
+            assert!(
+                unlocked
+                    .register_collaborative_outgoing_transfer(
+                        THE802_COLLAB_TXID.to_string(),
+                        THE802_CONTRACT.to_string(),
+                        vec![src_outpoint.clone()],
+                        change,
+                        confirmations,
+                    )
+                    .is_err(),
+                "altered replay must refuse"
+            );
+        }
+        for (asset, inputs) in [
+            (
+                "rgb:unknown-contract-does-not-exist".to_string(),
+                vec![src_outpoint.clone()],
+            ),
+            (
+                THE802_CONTRACT.to_string(),
+                vec![format!("{}:1", THE802_SOURCE_TXID)],
+            ),
+        ] {
+            assert!(
+                unlocked
+                    .register_collaborative_outgoing_transfer(
+                        THE802_COLLAB_TXID.to_string(),
+                        asset,
+                        inputs,
+                        Some((3, 900)),
+                        1,
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            unlocked
+                .database
+                .get_asset_balance(THE802_CONTRACT.to_string(), None, None, None, None, None,)
+                .unwrap()
+                .future,
+            900
+        );
 
         // Fail-closed negatives.
         assert!(
@@ -3516,6 +4987,321 @@ mod address_reuse_tests {
         );
     }
 
+    #[test]
+    fn collaborative_confirmed_accounting_reconciles_spent_input() {
+        use crate::database::memory_db::{ActiveValue, DbBatchTransferActMod};
+        use bdk_wallet::bitcoin::{
+            Amount, BlockHash, Transaction, TxIn, TxOut, absolute, transaction,
+        };
+        use bdk_wallet::chain::{BlockId, ConfirmationBlockTime};
+        use std::sync::Arc;
+
+        let mut wallet = make_test_wallet(false);
+        let script = wallet
+            .bdk_wallet
+            .reveal_next_address(KeychainKind::External)
+            .address
+            .script_pubkey();
+        let source = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: BdkOutPoint {
+                    txid: bdk_wallet::bitcoin::Txid::from_str(THE802_ISSUE_TXID).unwrap(),
+                    vout: 0,
+                },
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(20000),
+                script_pubkey: script.clone(),
+            }],
+        };
+        let source_id = source.compute_txid();
+        seed_seller_source_at(&wallet, 1000, &source_id.to_string());
+        // A thin BDK graph does not prove this known source spent.
+        wallet.reconcile_bdk_txos().unwrap();
+        assert!(!wallet.database.iter_txos().unwrap()[0].spent);
+
+        let spend = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: BdkOutPoint {
+                    txid: source_id,
+                    vout: 0,
+                },
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(19000),
+                script_pubkey: script,
+            }],
+        };
+        let spend_id = spend.compute_txid();
+        let input = format!("{source_id}:0");
+        let batch = wallet
+            .register_collaborative_outgoing_transfer(
+                spend_id.to_string(),
+                THE802_CONTRACT.to_string(),
+                vec![input.clone()],
+                Some((0, 900)),
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        let pending = wallet
+            .get_asset_balance(THE802_CONTRACT.to_string())
+            .unwrap();
+        assert_eq!(
+            (pending.settled, pending.future, pending.spendable),
+            (1000, 900, 0)
+        );
+        wallet
+            .bdk_wallet
+            .apply_unconfirmed_txs([(source.clone(), 1), (spend.clone(), 2)]);
+        wallet.reconcile_bdk_txos().unwrap();
+        let pending = wallet
+            .get_asset_balance(THE802_CONTRACT.to_string())
+            .unwrap();
+        assert_eq!(
+            (pending.settled, pending.future, pending.spendable),
+            (1000, 900, 0)
+        );
+
+        assert!(
+            wallet
+                .database
+                .get_txo(&Outpoint {
+                    txid: source_id.to_string(),
+                    vout: 0
+                })
+                .unwrap()
+                .unwrap()
+                .spent
+        );
+        // Canonical eviction restores the source; absence alone never does.
+        wallet.bdk_wallet.apply_evicted_txs([(spend_id, 3)]);
+        wallet.reconcile_bdk_txos().unwrap();
+        assert!(
+            !wallet
+                .database
+                .get_txo(&Outpoint {
+                    txid: source_id.to_string(),
+                    vout: 0
+                })
+                .unwrap()
+                .unwrap()
+                .spent
+        );
+        let pending = wallet
+            .get_asset_balance(THE802_CONTRACT.to_string())
+            .unwrap();
+        assert_eq!(
+            (pending.settled, pending.future, pending.spendable),
+            (1000, 900, 0)
+        );
+        wallet
+            .bdk_wallet
+            .apply_unconfirmed_txs([(spend.clone(), 4)]);
+        wallet.reconcile_bdk_txos().unwrap();
+
+        // Supply a disposable indexer-equivalent confirmed graph update. No network,
+        // signing or broadcast; the refresh confirmation threshold is supplied here.
+        let block = BlockId {
+            height: 1,
+            hash: BlockHash::from_str(THE802_ISSUE_TXID).unwrap(),
+        };
+        let mut update = bdk_wallet::Update::default();
+        update.chain = Some(wallet.bdk_wallet.latest_checkpoint().push(block).unwrap());
+        for tx in [source, spend] {
+            update.tx_update.anchors.insert((
+                ConfirmationBlockTime {
+                    block_id: block,
+                    confirmation_time: 1000,
+                },
+                tx.compute_txid(),
+            ));
+            update.tx_update.txs.push(Arc::new(tx));
+        }
+        wallet.bdk_wallet.apply_update(update).unwrap();
+        wallet.bdk_wallet.persist(&mut wallet.bdk_database).unwrap();
+        wallet.reconcile_bdk_txos().unwrap();
+        let mut settled: DbBatchTransferActMod = wallet
+            .database
+            .iter_batch_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|b| b.idx == batch)
+            .unwrap()
+            .into();
+        settled.status = ActiveValue::Set(TransferStatus::Settled);
+        wallet.database.update_batch_transfer(&mut settled).unwrap();
+        let balance = wallet
+            .get_asset_balance(THE802_CONTRACT.to_string())
+            .unwrap();
+        println!("THE803_CONFIRMED_BALANCE={balance:?}");
+        println!(
+            "THE803_CONFIRMED_BALANCE_JSON={}",
+            serde_json::to_string(&balance).unwrap()
+        );
+        assert_eq!(
+            (balance.settled, balance.future, balance.spendable),
+            (900, 900, 900)
+        );
+        let btc = wallet.get_btc_balance(None, true).unwrap();
+        assert_eq!(
+            (
+                btc.colored.settled,
+                btc.colored.future,
+                btc.colored.spendable
+            ),
+            (19000, 19000, 19000)
+        );
+        let rows = wallet
+            .list_transfers(
+                AssetFilter::Id(THE802_CONTRACT.to_string()),
+                Some(spend_id.to_string()),
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].assignments, vec![Assignment::Fungible(100)]);
+        assert_eq!(rows[0].status, TransferStatus::Settled);
+        let unspents = wallet.list_unspents(None, true, true).unwrap();
+        assert!(
+            !unspents
+                .iter()
+                .any(|u| u.utxo.outpoint.txid == source_id.to_string())
+        );
+        assert_eq!(unspents.len(), 1);
+        assert_eq!(
+            unspents[0].rgb_allocations[0].assignment,
+            Assignment::Fungible(900)
+        );
+        *wallet.rgb_stock.borrow_mut() = Some(rgbstd::persistence::Stock::in_memory());
+        let bytes = serde_json::to_vec(&wallet.snapshot().unwrap()).unwrap();
+        let mut restored = make_test_wallet(false);
+        restored.wallet_data = wallet.wallet_data.clone();
+        restored
+            .restore_from_snapshot(serde_json::from_slice(&bytes).unwrap())
+            .unwrap();
+        for _ in 0..3 {
+            let b = restored
+                .get_asset_balance(THE802_CONTRACT.to_string())
+                .unwrap();
+            assert_eq!((b.settled, b.future, b.spendable), (900, 900, 900));
+            let r = restored
+                .list_transfers(
+                    AssetFilter::Id(THE802_CONTRACT.to_string()),
+                    Some(spend_id.to_string()),
+                )
+                .unwrap();
+            assert_eq!(r.len(), 1);
+            assert_eq!(r[0].idx, rows[0].idx);
+            assert_eq!(r[0].batch_transfer_idx, rows[0].batch_transfer_idx);
+            assert_eq!(r[0].assignments, rows[0].assignments);
+            let b = restored.get_btc_balance(None, true).unwrap();
+            assert_eq!(b.colored.settled, 19000);
+        }
+        assert!(
+            restored
+                .register_collaborative_outgoing_transfer(
+                    spend_id.to_string(),
+                    THE802_CONTRACT.to_string(),
+                    vec![input.clone()],
+                    Some((0, 900)),
+                    1
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            restored
+                .register_collaborative_outgoing_transfer(
+                    spend_id.to_string(),
+                    THE802_CONTRACT.to_string(),
+                    vec![input],
+                    Some((0, 800)),
+                    1
+                )
+                .is_err()
+        );
+        println!(
+            "THE803_CONFIRMED_TRANSFER_JSON={}",
+            serde_json::to_string(&rows).unwrap()
+        );
+    }
+
+    #[test]
+    fn collaborative_send_projection_checks_exact_fungible_arithmetic() {
+        for (input, change, expected) in [
+            (1000, None, Some(1000)),
+            (u64::MAX, Some(u64::MAX - 100), Some(100)),
+            (1000, Some(1001), None),
+        ] {
+            let wallet = make_test_wallet(false);
+            seed_seller_source_amount(&wallet, input);
+            let registered = wallet.register_collaborative_outgoing_transfer(
+                THE802_COLLAB_TXID.to_string(),
+                THE802_CONTRACT.to_string(),
+                vec![format!("{}:0", THE802_SOURCE_TXID)],
+                change.map(|amount| (3, amount)),
+                1,
+            );
+            if expected.is_none() {
+                assert!(registered.is_err(), "over-change must refuse before writes");
+                assert_eq!(wallet.database.iter_batch_transfers().unwrap().len(), 1);
+                assert_eq!(wallet.database.iter_txos().unwrap().len(), 1);
+                continue;
+            }
+            registered.unwrap();
+            let rows = wallet.list_transfers(
+                AssetFilter::Id(THE802_CONTRACT.to_string()),
+                Some(THE802_COLLAB_TXID.to_string()),
+            );
+            match expected {
+                Some(sent) => assert_eq!(
+                    rows.unwrap()[0].assignments,
+                    vec![Assignment::Fungible(sent)]
+                ),
+                None => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn collaborative_registration_refuses_overflow_without_writes() {
+        let wallet = make_test_wallet(false);
+        seed_seller_source_amount(&wallet, u64::MAX);
+        let original = wallet.database.iter_colorings().unwrap()[0].clone();
+        wallet
+            .database
+            .set_coloring(crate::database::memory_db::DbColoringActMod {
+                txo_idx: crate::database::memory_db::ActiveValue::Set(original.txo_idx),
+                asset_transfer_idx: crate::database::memory_db::ActiveValue::Set(
+                    original.asset_transfer_idx,
+                ),
+                r#type: crate::database::memory_db::ActiveValue::Set(ColoringType::Receive),
+                assignment: crate::database::memory_db::ActiveValue::Set(Assignment::Fungible(1)),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            wallet
+                .register_collaborative_outgoing_transfer(
+                    THE802_COLLAB_TXID.to_string(),
+                    THE802_CONTRACT.to_string(),
+                    vec![format!("{}:0", THE802_SOURCE_TXID)],
+                    Some((3, 900)),
+                    1,
+                )
+                .is_err()
+        );
+        assert_eq!(wallet.database.iter_batch_transfers().unwrap().len(), 1);
+        assert_eq!(wallet.database.iter_txos().unwrap().len(), 1);
+        assert_eq!(wallet.database.iter_transfers().unwrap().len(), 1);
+    }
+
     /// (b) persistence: restoring a durable snapshot must not leave the local
     /// sequence counter behind it, or the next flush is rejected as stale by
     /// `idb_store::save_snapshot` and the whole session's writes are dropped.
@@ -3527,6 +5313,7 @@ mod address_reuse_tests {
         *wallet.rgb_stock.borrow_mut() = Some(rgbstd::persistence::Stock::in_memory());
 
         let snapshot = WalletSnapshot {
+            btcx_pending_fill_v1: None,
             sequence: 7,
             db: crate::database::memory_db::InMemoryDb::new(),
             bdk_changeset: None,
@@ -3545,5 +5332,32 @@ mod address_reuse_tests {
             "restored durable sequence 7 but next snapshot sequence is {next}; \
              save_snapshot would reject it as stale and drop the write"
         );
+    }
+}
+
+// Snapshot sequence exhaustion must not wrap to an apparently fresh writer.
+fn next_snapshot_sequence(sequence: &std::sync::atomic::AtomicU64) -> Result<u64, Error> {
+    use std::sync::atomic::Ordering;
+    sequence
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            current.checked_add(1)
+        })
+        .map(|previous| previous + 1)
+        .map_err(|_| Error::Persistence {
+            details: "wallet snapshot sequence exhausted".to_owned(),
+        })
+}
+
+#[cfg(test)]
+mod snapshot_sequence_tests {
+    use super::next_snapshot_sequence;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn sequence_exhaustion_refuses_without_wrapping() {
+        let sequence = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(next_snapshot_sequence(&sequence).unwrap(), u64::MAX);
+        assert!(next_snapshot_sequence(&sequence).is_err());
+        assert_eq!(sequence.load(Ordering::SeqCst), u64::MAX);
     }
 }

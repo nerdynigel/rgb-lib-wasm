@@ -69,6 +69,46 @@ pub struct WasmWallet {
 
 #[wasm_bindgen]
 impl WasmWallet {
+    /// Export prospective RGB transfers without consuming, persisting, signing or broadcasting.
+    /// The caller must independently validate all recipients against its reviewed transaction.
+    #[wasm_bindgen(js_name = "colorPsbtAndExport")]
+    pub fn color_psbt_and_export(
+        &self,
+        psbt: &str,
+        coloring_info_json: &str,
+    ) -> Result<JsValue, JsValue> {
+        use rgb_lib_wasm::FileContent;
+        #[derive(Serialize)]
+        struct Export {
+            psbt: String,
+            consignments: Vec<Vec<u8>>,
+        }
+        let mut psbt = psbt
+            .parse::<rgb_lib_wasm::bitcoin::psbt::Psbt>()
+            .map_err(|e| JsValue::from_str(&format!("Invalid PSBT: {e}")))?;
+        let info = serde_json::from_str(coloring_info_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid ColoringInfo: {e}")))?;
+        let wallet = self
+            .inner
+            .try_borrow()
+            .map_err(|_| JsValue::from_str("Wallet already in use"))?;
+        let transfers = wallet
+            .color_psbt_and_export(&mut psbt, info)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let mut consignments = Vec::with_capacity(transfers.len());
+        for transfer in transfers {
+            let mut bytes = vec![];
+            transfer
+                .save(&mut bytes)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            consignments.push(bytes);
+        }
+        to_js(&Export {
+            psbt: psbt.to_string(),
+            consignments,
+        })
+    }
+
     /// Create a new RGB wallet from a JSON-encoded WalletData.
     #[wasm_bindgen(constructor)]
     pub fn new(wallet_data_json: &str) -> Result<WasmWallet, JsValue> {
@@ -857,4 +897,24 @@ pub fn validate_consignment_offchain(
     )
     .map_err(|e| JsValue::from_str(&e.to_string()))?;
     to_js(&result)
+}
+
+/// Inspect validated canonical transfer bytes against the exact colored transaction.
+/// Returns facts only; does not authorize spending or access wallet state.
+#[wasm_bindgen(js_name = "inspectTransferOffchain")]
+pub fn inspect_transfer_offchain(
+    consignment_bytes: &[u8],
+    colored_transaction: &[u8],
+    network: &str,
+) -> Result<JsValue, JsValue> {
+    let network = network
+        .parse::<rgb_lib_wasm::BitcoinNetwork>()
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let facts = rgb_lib_wasm::wallet::rust_only::inspect_transfer_offchain(
+        consignment_bytes,
+        colored_transaction,
+        network,
+    )
+    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    to_js(&facts)
 }

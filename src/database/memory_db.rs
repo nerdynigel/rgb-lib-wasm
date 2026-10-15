@@ -1160,7 +1160,13 @@ impl InMemoryDb {
             .filter_map(
                 |t| match t.related_transfers(&asset_transfers, &batch_transfers) {
                     Ok((at, bt)) => {
-                        if bt.status.waiting_confirmations() {
+                        // Count the invoice's requested assignment only BEFORE the
+                        // consignment is imported (waiting counterparty). Once
+                        // imported (waiting confirmations) the receive is already
+                        // counted via its pending txo allocation in
+                        // `ass_pending_incoming`; counting the requested
+                        // assignment here too would double the amount.
+                        if bt.status.waiting_counterparty() {
                             if at.asset_id.as_deref() != Some(asset_id.as_str()) {
                                 return None;
                             }
