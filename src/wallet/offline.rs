@@ -3593,6 +3593,9 @@ impl Wallet {
         use crate::bitcoin::transaction::{OutPoint, TxIn, TxOut, Version};
         use crate::bitcoin::{hashes::Hash, Amount, ScriptBuf, Sequence, Transaction, Txid, Witness};
         let mut wallet = address_reuse_tests::make_test_wallet(false);
+        // The address-only constructor intentionally leaves stock absent. Install
+        // initial TEST stock before the normal consumer-persistence handoff.
+        *wallet.rgb_stock.borrow_mut() = Some(rgbstd::persistence::Stock::in_memory());
         let funding_tx = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,

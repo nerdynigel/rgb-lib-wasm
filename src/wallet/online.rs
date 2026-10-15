@@ -2854,6 +2854,11 @@ impl Wallet {
                     asset_schema,
                     valid_contract,
                     valid_consignment,
+                    // A local exact-byte receipt can be previewed and then
+                    // applied later on the authoritative engine. Bind metadata
+                    // to its existing receive event, never the invocation clock.
+                    // Network receives retain ordinary discovery-time metadata.
+                    local_only.then_some(batch_transfer.created_at),
                 )?;
             }
 
@@ -4387,3 +4392,7 @@ impl Wallet {
         Ok(res)
     }
 }
+
+#[cfg(all(test, feature = "test-fixtures"))]
+#[path = "receipt_metadata_tests.rs"]
+mod receipt_metadata_tests;

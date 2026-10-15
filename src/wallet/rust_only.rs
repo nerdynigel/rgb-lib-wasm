@@ -446,6 +446,7 @@ impl Wallet {
         asset_schema: AssetSchema,
         valid_contract: ValidContract,
         valid_transfer: ValidTransfer,
+        added_at: Option<i64>,
     ) -> Result<(), Error> {
         let timestamp = valid_contract.genesis.timestamp;
         let local_asset_data = match &asset_schema {
@@ -515,7 +516,7 @@ impl Wallet {
         self.add_asset_to_db(
             contract_id.to_string(),
             &asset_schema,
-            None,
+            added_at,
             timestamp,
             local_asset_data,
         )?;
