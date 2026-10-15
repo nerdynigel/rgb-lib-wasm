@@ -157,7 +157,7 @@ pub(super) fn project(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use bdk_wallet::bitcoin::{TxIn, absolute, transaction};
 
@@ -271,7 +271,7 @@ mod tests {
         };
         (wallet, tx, prevouts, inclusion)
     }
-    fn fixture() -> (
+    pub(in crate::wallet) fn fixture() -> (
         Wallet,
         BdkTransaction,
         BTreeMap<OutPoint, TxOut>,

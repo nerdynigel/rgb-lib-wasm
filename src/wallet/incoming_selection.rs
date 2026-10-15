@@ -26,7 +26,7 @@ fn unique_indices(indices: impl Iterator<Item = i32>) -> Result<(), Error> {
 }
 
 /// Exact DB relationship checks, with no lookup that panics on corrupt rows.
-fn select<'a>(
+pub(super) fn select<'a>(
     db: &'a DbData,
     recipient: &str,
     contract: &str,

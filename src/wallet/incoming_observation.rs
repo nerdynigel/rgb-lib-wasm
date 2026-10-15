@@ -33,7 +33,7 @@ fn mined_position(status: &TxStatus, tip: u32, required: u8) -> Result<WitnessOr
 
 // Include the live BDK stage: snapshot_for_review carries the persisted BDK
 // changeset, which alone cannot detect a changed but not yet persisted graph.
-fn complete_source(wallet: &Wallet) -> Result<serde_json::Value, Error> {
+pub(super) fn complete_source(wallet: &Wallet) -> Result<serde_json::Value, Error> {
     serde_json::to_value((wallet.snapshot_for_review()?, wallet.bdk_wallet.staged()))
         .map_err(|_| refuse())
 }
@@ -42,14 +42,15 @@ pub(super) struct FrozenIncoming {
     pub(super) source: serde_json::Value,
     pub(super) resolver: PreFetchResolver,
     pub(super) transfer: ValidTransfer,
-    pub(super) bdk_post: ChangeSet,
+    pub(super) post: super::idb_store::WalletSnapshot,
 }
 
 impl Wallet {
     /// Validate an exact pending witness receipt against one unchanged indexer
     /// chain view and complete RGB history. The transaction must be the exact
     /// independently accepted witness, including its Bitcoin witness bytes.
-    /// This performs GETs only, without Stock/BDK/DB mutation, persistence,
+    /// Network work uses GETs only. Stock/BDK/DB projection is detached, without
+    /// active-state mutation, persistence,
     /// sequence allocation, signing or a settlement acknowledgement. It grants
     /// no consuming authority and is deliberately not wired to execution.
     pub async fn require_confirmed_pending_witness_receive(
@@ -289,11 +290,23 @@ impl Wallet {
             &prevouts,
             inclusion.ok_or_else(refuse)?,
         )?;
+        let post = super::incoming_post::project(
+            self,
+            recipient,
+            contract,
+            outpoint,
+            units,
+            transaction,
+            &validated,
+            &resolver,
+            bdk_post,
+            &source,
+        )?;
         Ok(FrozenIncoming {
             source,
             resolver,
             transfer: validated,
-            bdk_post,
+            post,
         })
     }
 }

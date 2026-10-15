@@ -11,6 +11,8 @@ mod incoming_history;
 #[cfg(feature = "esplora")]
 mod incoming_observation;
 #[cfg(feature = "esplora")]
+mod incoming_post;
+#[cfg(feature = "esplora")]
 mod incoming_selection;
 mod input_availability;
 pub(crate) mod memory_store;
