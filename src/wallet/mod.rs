@@ -6,6 +6,8 @@ pub(crate) mod backup;
 pub mod idb_store;
 #[cfg(feature = "esplora")]
 mod incoming_history;
+#[cfg(feature = "esplora")]
+mod incoming_selection;
 mod input_availability;
 pub(crate) mod memory_store;
 pub(crate) mod offline;
