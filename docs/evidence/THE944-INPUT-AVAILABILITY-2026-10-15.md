@@ -1,7 +1,7 @@
 # THE-944 designated-input local availability query
 
 PARTIAL candidate source; no financial release or acceptance uplift.
-Authority: [Chief scope reconciliation](https://paperclip.ing/THE/issues/THE-944#comment-65616366-9555-4be6-a412-e9ee7dd22c57), saved direction revision `6a224162-fc29-4d0e-9a3c-fb4e2e07dd95`.
+Authority: [Chief scope reconciliation](/THE/issues/THE-944#comment-65616366-9555-4be6-a412-e9ee7dd22c57), saved direction revision `6a224162-fc29-4d0e-9a3c-fb4e2e07dd95`.
 Existing branch `feat/the-876-transfer-export`, PR3; predecessor
 `073e2d10c23fb5e3b0dd36730a0dc506ae717115` independently matched origin before publication.
 
