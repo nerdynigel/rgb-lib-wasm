@@ -3641,7 +3641,7 @@ pub(crate) mod address_reuse_tests {
         )
         .unwrap();
         let mut bdk_database: BdkPersister = super::super::memory_store::MemoryStore::new();
-        let bdk_wallet = BdkWallet::create(desc_colored, desc_vanilla)
+        BdkWallet::create(desc_colored, desc_vanilla)
             .network(bdk_network)
             .create_wallet(&mut bdk_database)
             .unwrap();
@@ -3660,35 +3660,29 @@ pub(crate) mod address_reuse_tests {
             reuse_addresses: reuse,
         };
 
-        let drain = slog::Discard;
-        let logger = Logger::root(drain, o!());
-
-        Wallet {
-            consumer_owned_persistence: false,
+        // Exercise the established complete-state constructor rather than
+        // duplicating the Wallet layout (including its Arc-backed database).
+        // This is local TEST setup only: no storage, keys export or schema import.
+        let (stash, state, index) =
+            super::super::idb_store::serialize_stock(&rgbstd::persistence::Stock::in_memory())
+                .unwrap();
+        let snapshot = super::super::idb_store::WalletSnapshot {
             btcx_pending_fill_v1: None,
-            wallet_data: wd,
-            logger,
-            _logger_guard: (),
-            watch_only: false,
-            database: Arc::new(crate::database::memory_db::InMemoryDb::new()),
-            wallet_dir: PathBuf::from(":memory:"),
-            bdk_wallet,
-            bdk_database,
-            reuse_address_index: HashMap::new(),
-            #[cfg(feature = "esplora")]
-            wasm_proxy_client: crate::api::proxy::WasmProxyClient::new().unwrap(),
-            #[cfg(feature = "esplora")]
-            online_data: None,
-            #[cfg(feature = "esplora")]
+            sequence: 0,
+            db: crate::database::memory_db::InMemoryDb::new(),
+            bdk_changeset: bdk_database.get_data().clone(),
             transfer_artifacts: HashMap::new(),
-            #[cfg(feature = "esplora")]
             received_consignments: HashMap::new(),
-            idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(None)),
-            vss_client: None,
-            last_vss_backup_error: std::cell::RefCell::new(None),
-        }
+            stock_stash_b64: Some(stash),
+            stock_state_b64: Some(state),
+            stock_index_b64: Some(index),
+            reuse_address_index: HashMap::new(),
+        };
+        let wallet = Wallet::restore_existing_snapshot(wd, snapshot).unwrap();
+        // Keep the original fixture precondition: tests explicitly install stock
+        // when they need a complete RGB engine; address-only tests need none.
+        wallet.rgb_stock.borrow_mut().take();
+        wallet
     }
 
     #[test]
