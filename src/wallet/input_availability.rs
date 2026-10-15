@@ -8,6 +8,100 @@ fn unavailable() -> Error {
 }
 
 impl Wallet {
+    /// Prove a designated vanilla BTC prevout is currently indexed, unspent and
+    /// wallet owned, with the exact authenticated value/script supplied by the caller.
+    /// Refuse any locally known RGB assignment or unresolved RGB reservation on
+    /// ANY proposed input. Foreign state unknown to this engine is not certified.
+    /// Read-only local evidence, not chain synchronization, reservation or consent.
+    pub fn require_available_btc_input(
+        &self,
+        designated: OutPoint,
+        expected: &TxOut,
+        inputs: &[OutPoint],
+    ) -> Result<(), Error> {
+        let refuse = || Error::InvalidColoringInfo {
+            details: "designated BTC input is not proven locally available".into(),
+        };
+        if expected.value.to_sat() == 0
+            || inputs.is_empty()
+            || inputs.len() > 1024
+            || self.btcx_pending_fill_v1.is_some()
+        {
+            return Err(refuse());
+        }
+        let unique: HashSet<_> = inputs.iter().copied().collect();
+        if unique.len() != inputs.len() || !unique.contains(&designated) {
+            return Err(refuse());
+        }
+        let local = self
+            .bdk_wallet
+            .list_unspent()
+            .find(|output| output.outpoint == designated)
+            .ok_or_else(refuse)?;
+        if local.txout != *expected || !self.is_local_script(&expected.script_pubkey) {
+            return Err(refuse());
+        }
+        let stock = self.rgb_stock.try_borrow().map_err(|_| refuse())?;
+        let stock = stock.as_ref().ok_or_else(refuse)?;
+        let db = self.database.get_db_data(false)?;
+        let pending_scripts = self.database.iter_pending_witness_scripts()?;
+        if pending_scripts
+            .iter()
+            .any(|p| p.script == expected.script_pubkey.to_hex_string())
+        {
+            return Err(refuse());
+        }
+        for input in inputs {
+            let matching: Vec<_> = db
+                .txos
+                .iter()
+                .filter(|txo| txo.txid == input.txid.to_string() && txo.vout == input.vout)
+                .collect();
+            if matching.len() > 1 {
+                return Err(refuse());
+            }
+            for txo in matching {
+                if txo.spent
+                    || !txo.exists
+                    || txo.pending_witness
+                    || (*input == designated
+                        && txo.btc_amount.parse::<u64>().ok() != Some(expected.value.to_sat()))
+                {
+                    return Err(refuse());
+                }
+                // Do not ignore a failed/unknown coloring: this BTC-only input
+                // has no reason to carry any RGB provenance at all.
+                if db.colorings.iter().any(|c| c.txo_idx == txo.idx) {
+                    return Err(refuse());
+                }
+                let allocations = self.database.get_rgb_allocations(
+                    vec![txo.clone()],
+                    Some(db.colorings.clone()),
+                    Some(db.batch_transfers.clone()),
+                    Some(db.asset_transfers.clone()),
+                    Some(db.transfers.clone()),
+                )?;
+                if allocations
+                    .iter()
+                    .any(|a| a.pending_blinded != 0 || !a.rgb_allocations.is_empty())
+                {
+                    return Err(refuse());
+                }
+            }
+            for info in stock.contracts().map_err(InternalError::from)? {
+                if stock
+                    .contract_assignments_for(info.id, [*input])
+                    .map_err(InternalError::from)?
+                    .values()
+                    .any(|states| !states.is_empty())
+                {
+                    return Err(refuse());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Check one designated RGB input against this engine's current database and stock.
     /// `inputs` must be the complete transaction input set (bounded to 1024).
     /// The designated input must contain exactly `amount` fungible units of `contract`;
@@ -181,6 +275,209 @@ mod tests {
             .unwrap();
         let contract = ContractId::from_str(&asset.asset_id).unwrap();
         (wallet, OutPoint::new(tx.compute_txid(), 0), contract)
+    }
+
+    fn btc_fixture() -> (Wallet, OutPoint, TxOut) {
+        let mut wallet = super::super::offline::address_reuse_tests::make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        let script_pubkey = wallet
+            .bdk_wallet
+            .reveal_next_address(KeychainKind::Internal)
+            .address
+            .script_pubkey();
+        let output = TxOut {
+            value: BdkAmount::from_sat(50_000),
+            script_pubkey,
+        };
+        let tx = crate::bitcoin::Transaction {
+            version: crate::bitcoin::transaction::Version::TWO,
+            lock_time: crate::bitcoin::absolute::LockTime::ZERO,
+            input: vec![crate::bitcoin::TxIn {
+                previous_output: OutPoint::new(
+                    crate::bitcoin::Txid::from_str(&"01".repeat(32)).unwrap(),
+                    0,
+                ),
+                ..Default::default()
+            }],
+            output: vec![output.clone()],
+        };
+        let outpoint = OutPoint::new(tx.compute_txid(), 0);
+        wallet.bdk_wallet.apply_unconfirmed_txs([(tx, 1)]);
+        (wallet, outpoint, output)
+    }
+
+    #[test]
+    fn btc_input_requires_exact_bdk_owned_unspent_without_mutation() {
+        let (wallet, input, output) = btc_fixture();
+        let before = serde_json::to_vec(&wallet.snapshot_for_review().unwrap()).unwrap();
+        for _ in 0..3 {
+            wallet
+                .require_available_btc_input(input, &output, &[input])
+                .unwrap();
+        }
+        assert_eq!(
+            before,
+            serde_json::to_vec(&wallet.snapshot_for_review().unwrap()).unwrap()
+        );
+        let mut changed = output.clone();
+        changed.value = BdkAmount::from_sat(49_999);
+        assert!(
+            wallet
+                .require_available_btc_input(input, &changed, &[input])
+                .is_err()
+        );
+        changed = output.clone();
+        changed.script_pubkey = ScriptBuf::new();
+        assert!(
+            wallet
+                .require_available_btc_input(input, &changed, &[input])
+                .is_err()
+        );
+        let (other, _, _) = btc_fixture();
+        assert!(
+            other
+                .require_available_btc_input(input, &output, &[input])
+                .is_err()
+        );
+        for inputs in [vec![], vec![input, input], vec![input; 1025]] {
+            assert!(
+                wallet
+                    .require_available_btc_input(input, &output, &inputs)
+                    .is_err()
+            );
+        }
+        let absent = OutPoint::new(input.txid, 1);
+        assert!(
+            wallet
+                .require_available_btc_input(absent, &output, &[absent])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn btc_input_refuses_database_conflict_and_pending_receiving_script() {
+        use crate::database::memory_db::DbPendingWitnessScriptActMod;
+        for flag in ["spent", "missing", "pending", "receiving", "amount"] {
+            let (wallet, input, output) = btc_fixture();
+            wallet
+                .database
+                .set_txo(DbTxoActMod {
+                    txid: ActiveValue::Set(input.txid.to_string()),
+                    vout: ActiveValue::Set(input.vout),
+                    btc_amount: ActiveValue::Set(if flag == "amount" {
+                        "1".into()
+                    } else {
+                        output.value.to_sat().to_string()
+                    }),
+                    spent: ActiveValue::Set(flag == "spent"),
+                    exists: ActiveValue::Set(flag != "missing"),
+                    pending_witness: ActiveValue::Set(flag == "pending"),
+                    ..Default::default()
+                })
+                .unwrap();
+            if flag == "receiving" {
+                wallet
+                    .database
+                    .set_pending_witness_script(DbPendingWitnessScriptActMod {
+                        script: ActiveValue::Set(output.script_pubkey.to_hex_string()),
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
+            let before = serde_json::to_vec(&wallet.snapshot_for_review().unwrap()).unwrap();
+            assert!(
+                wallet
+                    .require_available_btc_input(input, &output, &[input])
+                    .is_err(),
+                "{flag}"
+            );
+            assert_eq!(
+                before,
+                serde_json::to_vec(&wallet.snapshot_for_review().unwrap()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn btc_input_refuses_actual_graph_spend_and_retained_obligation() {
+        let (mut wallet, input, output) = btc_fixture();
+        wallet.btcx_pending_fill_v1 = Some(super::super::pending_fill::storage_fixture());
+        assert!(
+            wallet
+                .require_available_btc_input(input, &output, &[input])
+                .is_err()
+        );
+        wallet.btcx_pending_fill_v1 = None;
+        let spend = crate::bitcoin::Transaction {
+            version: crate::bitcoin::transaction::Version::TWO,
+            lock_time: crate::bitcoin::absolute::LockTime::ZERO,
+            input: vec![crate::bitcoin::TxIn {
+                previous_output: input,
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: BdkAmount::from_sat(49_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        wallet.bdk_wallet.apply_unconfirmed_txs([(spend, 2)]);
+        assert!(
+            wallet
+                .require_available_btc_input(input, &output, &[input])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn btc_input_refuses_rgb_input_and_detached_stock() {
+        let (wallet, input, output) = btc_fixture();
+        let stock = wallet.rgb_stock.borrow_mut().take();
+        assert!(
+            wallet
+                .require_available_btc_input(input, &output, &[input])
+                .is_err()
+        );
+        *wallet.rgb_stock.borrow_mut() = stock;
+        let borrow = wallet.rgb_stock.borrow_mut();
+        assert!(
+            wallet
+                .require_available_btc_input(input, &output, &[input])
+                .is_err()
+        );
+        drop(borrow);
+        // Use real issued stock/DB state on a second input of the SAME engine.
+        let (mut rgb_wallet, rgb_input, _) = fixture();
+        let script_pubkey = rgb_wallet
+            .bdk_wallet
+            .reveal_next_address(KeychainKind::Internal)
+            .address
+            .script_pubkey();
+        let btc_output = TxOut {
+            value: BdkAmount::from_sat(50_000),
+            script_pubkey,
+        };
+        let tx = crate::bitcoin::Transaction {
+            version: crate::bitcoin::transaction::Version::TWO,
+            lock_time: crate::bitcoin::absolute::LockTime::ZERO,
+            input: vec![crate::bitcoin::TxIn {
+                previous_output: OutPoint::new(
+                    crate::bitcoin::Txid::from_str(&"01".repeat(32)).unwrap(),
+                    0,
+                ),
+                ..Default::default()
+            }],
+            output: vec![btc_output.clone()],
+        };
+        let btc_input = OutPoint::new(tx.compute_txid(), 0);
+        rgb_wallet.bdk_wallet.apply_unconfirmed_txs([(tx, 1)]);
+        rgb_wallet
+            .require_available_btc_input(btc_input, &btc_output, &[btc_input])
+            .unwrap();
+        assert!(
+            rgb_wallet
+                .require_available_btc_input(btc_input, &btc_output, &[rgb_input, btc_input])
+                .is_err()
+        );
     }
 
     #[test]
