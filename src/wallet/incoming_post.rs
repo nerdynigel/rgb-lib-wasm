@@ -319,15 +319,71 @@ mod tests {
 
     #[test]
     fn valid_nia_transfer_projects_full_checkpoint_without_active_mutation() {
-        valid_nia_case(false);
+        valid_nia_case(false, None);
     }
 
     #[test]
     fn valid_nia_private_one_use_consumer_matches_complete_projection() {
-        valid_nia_case(true);
+        valid_nia_case(true, None);
     }
 
-    fn valid_nia_case(consume: bool) {
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn configured_indexer_observation_matches_complete_nia_projection() {
+        valid_nia_case(
+            false,
+            Some(super::super::incoming_test_indexer::Fault::None),
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn configured_indexer_changed_witness_refuses_complete_source_unchanged() {
+        valid_nia_case(
+            false,
+            Some(super::super::incoming_test_indexer::Fault::Witness),
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn configured_indexer_changed_tip_refuses_complete_source_unchanged() {
+        valid_nia_case(false, Some(super::super::incoming_test_indexer::Fault::Tip));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn configured_indexer_changed_inclusion_refuses_complete_source_unchanged() {
+        valid_nia_case(
+            false,
+            Some(super::super::incoming_test_indexer::Fault::Inclusion),
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn configured_indexer_wrong_network_refuses_complete_source_unchanged() {
+        valid_nia_case(
+            false,
+            Some(super::super::incoming_test_indexer::Fault::Network),
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn configured_indexer_missing_previous_refuses_complete_source_unchanged() {
+        valid_nia_case(
+            false,
+            Some(super::super::incoming_test_indexer::Fault::MissingPrevious),
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    use super::super::incoming_test_indexer::Fault as ObservationFault;
+    #[cfg(target_arch = "wasm32")]
+    type ObservationFault = ();
+
+    fn valid_nia_case(consume: bool, observation: Option<ObservationFault>) {
         use super::super::rust_only::{AssetColoringInfo, ColoringInfo};
         let (mut wallet, mut tx, prevouts, inclusion) =
             super::super::incoming_bdk::tests::fixture();
@@ -590,6 +646,46 @@ mod tests {
             post.sequence,
             wallet.snapshot_for_review().unwrap().sequence
         );
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(fault) = observation {
+            let bytes = wallet.received_consignments.get(recipient).unwrap().clone();
+            let observed = super::super::incoming_test_indexer::observe(
+                &mut wallet,
+                recipient,
+                contract,
+                receipt,
+                &bytes,
+                &tx,
+                fault,
+            );
+            assert_eq!(
+                source(&wallet),
+                original,
+                "network observation cannot mutate source"
+            );
+            if fault == super::super::incoming_test_indexer::Fault::None {
+                let frozen = observed.expect("configured indexer accepts exact NIA observation");
+                assert_eq!(
+                    serde_json::to_value(&frozen.post).unwrap(),
+                    serde_json::to_value(&post).unwrap()
+                );
+                wallet.use_consumer_owned_persistence().unwrap();
+                let actual =
+                    super::super::incoming_application::PreparedIncoming::new(&mut wallet, frozen)
+                        .unwrap()
+                        .apply()
+                        .unwrap();
+                assert_eq!(
+                    serde_json::to_value(actual).unwrap(),
+                    serde_json::to_value(&post).unwrap()
+                );
+            } else {
+                assert!(observed.is_err());
+            }
+            return;
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = observation;
         if consume {
             let (bdk, update) =
                 super::super::incoming_bdk::project_with_update(&wallet, &tx, &prevouts, inclusion)

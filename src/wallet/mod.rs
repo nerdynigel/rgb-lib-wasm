@@ -16,6 +16,8 @@ mod incoming_observation;
 mod incoming_post;
 #[cfg(feature = "esplora")]
 mod incoming_selection;
+#[cfg(all(test, feature = "esplora", not(target_arch = "wasm32")))]
+mod incoming_test_indexer;
 mod input_availability;
 pub(crate) mod memory_store;
 pub(crate) mod offline;

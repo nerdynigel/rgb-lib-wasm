@@ -260,7 +260,7 @@ pub(super) mod tests {
                 .bdk_wallet
                 .apply_unconfirmed_txs([(funding.clone(), 1)]);
         }
-        let external_point = OutPoint::new(Txid::from_str(&"03".repeat(32)).unwrap(), 0);
+        let external_point = OutPoint::new(foreign_funding().compute_txid(), 0);
         let prevouts = BTreeMap::from([
             (point, funding.output[0].clone()),
             (external_point, output(ScriptBuf::new(), 5_000)),
@@ -281,6 +281,12 @@ pub(super) mod tests {
             confirmation_time: 1_700_000_000,
         };
         (wallet, tx, prevouts, inclusion)
+    }
+    pub(in crate::wallet) fn foreign_funding() -> BdkTransaction {
+        transaction(
+            vec![OutPoint::new(Txid::from_str(&"03".repeat(32)).unwrap(), 0)],
+            vec![output(ScriptBuf::new(), 5_000)],
+        )
     }
     pub(in crate::wallet) fn fixture() -> (
         Wallet,
