@@ -159,9 +159,21 @@ impl super::Wallet {
     pub fn matches_backup_state(&self, bytes: &[u8], password: &str) -> Result<bool, Error> {
         let (public, ciphertext) = decode_backup(bytes)?;
         let plaintext = decrypt_payload(ciphertext, password, &public)?;
-        let payload: WalletBackupPayload =
+        let mut payload: WalletBackupPayload =
             serde_json::from_slice(&plaintext).map_err(|_| Error::InvalidBackup)?;
         self.check_backup_identity(&payload)?;
+        // Normal unlock reveals the next public address. It must not make a
+        // completed restore look like a different financial history. Permit
+        // only monotonic public derivation/cache growth and keep the live BDK
+        // state intact; transactions, chain, descriptors and network must match.
+        if let (Some(expected), Some(actual)) =
+            (&mut payload.bdk_changeset, self.bdk_database.get_data())
+        {
+            if !derivation_covers(&actual.indexer, &expected.indexer) {
+                return Ok(false);
+            }
+            expected.indexer = actual.indexer.clone();
+        }
         let mut expected = serde_json::to_value(payload).map_err(InternalError::from)?;
         let mut actual: serde_json::Value =
             serde_json::from_slice(&self.serialize_backup_payload()?)
@@ -251,6 +263,26 @@ impl super::Wallet {
             }
         }
     }
+}
+
+fn derivation_covers(
+    actual: &bdk_wallet::chain::indexer::keychain_txout::ChangeSet,
+    expected: &bdk_wallet::chain::indexer::keychain_txout::ChangeSet,
+) -> bool {
+    expected.last_revealed.iter().all(|(id, index)| {
+        actual
+            .last_revealed
+            .get(id)
+            .is_some_and(|current| current >= index)
+    }) && expected.spk_cache.iter().all(|(id, cache)| {
+        cache.iter().all(|(index, script)| {
+            actual
+                .spk_cache
+                .get(id)
+                .and_then(|current| current.get(index))
+                == Some(script)
+        })
+    })
 }
 
 use super::vss::{VssBackupClient, VssBackupConfig, VssBackupInfo};
@@ -393,6 +425,31 @@ impl super::Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_comparison_only_allows_monotonic_public_derivation_growth() {
+        use bdk_wallet::chain::{DescriptorId, indexer::keychain_txout::ChangeSet};
+        let id: DescriptorId = "11".repeat(32).parse().unwrap();
+        let mut expected = ChangeSet::default();
+        expected.last_revealed.insert(id, 1);
+        expected
+            .spk_cache
+            .entry(id)
+            .or_default()
+            .insert(0, crate::bitcoin::ScriptBuf::from_bytes(vec![0x51]));
+        let mut actual = expected.clone();
+        actual.last_revealed.insert(id, 2);
+        assert!(derivation_covers(&actual, &expected));
+        actual.last_revealed.insert(id, 0);
+        assert!(!derivation_covers(&actual, &expected));
+        actual.last_revealed.insert(id, 2);
+        actual
+            .spk_cache
+            .get_mut(&id)
+            .unwrap()
+            .insert(0, crate::bitcoin::ScriptBuf::from_bytes(vec![0x52]));
+        assert!(!derivation_covers(&actual, &expected));
+    }
 
     #[test]
     fn oversized_envelope_length_is_refused() {

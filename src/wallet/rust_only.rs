@@ -184,6 +184,74 @@ impl Wallet {
         Ok(found.remove(0))
     }
 
+    /// Independently validate every historical RGB witness against the live
+    /// indexer. Only the current not-yet-broadcast proposal may be tentative.
+    /// No chain is reconstructed from the sender's self-reported history.
+    pub async fn validate_external_transfer_ancestry(
+        &self,
+        bytes: &[u8],
+        txid: String,
+    ) -> Result<(), Error> {
+        if self.online_data.is_none() {
+            return Err(Error::Offline);
+        }
+        let expected_genesis =
+            bitcoin::blockdata::constants::genesis_block(BdkNetwork::from(self.bitcoin_network()))
+                .block_hash()
+                .to_string();
+        if self.indexer().block_hash(0).await? != expected_genesis {
+            return Err(Error::InvalidConsignment);
+        }
+        if bytes.len() > 2_097_152 {
+            return Err(Error::InvalidConsignment);
+        }
+        let transfer = RgbTransfer::load(bytes).map_err(InternalError::from)?;
+        if transfer.bundles.len() > 112 {
+            return Err(Error::InvalidConsignment);
+        }
+        let mut cache = HashMap::new();
+        for bundle in &transfer.bundles {
+            let id = bundle.pub_witness.txid();
+            if cache.contains_key(&id) {
+                continue;
+            }
+            if id.to_string() == txid {
+                let current = bundle
+                    .pub_witness
+                    .tx()
+                    .cloned()
+                    .ok_or(Error::InvalidConsignment)?;
+                cache.insert(id, WitnessStatus::Resolved(current, WitnessOrd::Tentative));
+                continue;
+            }
+            let bitcoin_id = Txid::from_str(&id.to_string()).map_err(|_| Error::InvalidTxid)?;
+            let (tx, height, timestamp) = self
+                .indexer()
+                .get_tx_with_status(&bitcoin_id)
+                .await?
+                .ok_or(Error::InvalidConsignment)?;
+            let height = height
+                .and_then(NonZeroU32::new)
+                .ok_or(Error::InvalidConsignment)?;
+            let timestamp = i64::try_from(timestamp.ok_or(Error::InvalidConsignment)?)
+                .map_err(|_| Error::InvalidConsignment)?;
+            let position =
+                WitnessPos::bitcoin(height, timestamp).ok_or(Error::InvalidConsignment)?;
+            cache.insert(id, WitnessStatus::Resolved(tx, WitnessOrd::Mined(position)));
+        }
+        let resolver = crate::utils::PreFetchResolver::new(cache, self.chain_net());
+        let schema = AssetSchema::try_from(transfer.schema_id())?;
+        let config = ValidationConfig {
+            chain_net: self.chain_net(),
+            trusted_typesystem: schema.types(),
+            ..Default::default()
+        };
+        transfer
+            .validate(&resolver, &config)
+            .map_err(|_| Error::InvalidConsignment)?;
+        Ok(())
+    }
+
     /// Return all contract IDs currently held in the RGB stock.
     pub fn rgb_contract_ids(&self) -> Result<Vec<ContractId>, Error> {
         let runtime = self.rgb_runtime()?;
