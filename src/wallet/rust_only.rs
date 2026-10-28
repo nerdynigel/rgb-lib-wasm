@@ -55,6 +55,203 @@ pub struct ValidateConsignmentResult {
 }
 
 impl Wallet {
+    /// Standard contract export: genesis/schema metadata, no wallet keys or
+    /// invented asset identity. This grants no ownership or spending authority.
+    pub fn export_nia_contract(&self, asset_id: String) -> Result<Vec<u8>, Error> {
+        let id = ContractId::from_str(&asset_id).map_err(|_| Error::InvalidAssignment)?;
+        let runtime = self.rgb_runtime()?;
+        if AssetSchema::get_from_contract_id(id, &runtime)? != AssetSchema::Nia {
+            return Err(Error::InvalidAssignment);
+        }
+        let contract = runtime.export_contract(id)?;
+        let mut bytes = Vec::new();
+        contract.save(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Validate/import standard NIA genesis metadata into the actual engine.
+    /// No allocations are credited; balances still require owned DB outpoints.
+    pub async fn import_nia_contract(
+        &mut self,
+        bytes: &[u8],
+        expected: String,
+        precision: u8,
+    ) -> Result<(), Error> {
+        if bytes.len() > 2_097_152 {
+            return Err(Error::InvalidConsignment);
+        }
+        let contract = rgbstd::containers::Contract::load(bytes).map_err(InternalError::from)?;
+        if contract.contract_id().to_string() != expected
+            || AssetSchema::try_from(contract.schema_id())? != AssetSchema::Nia
+        {
+            return Err(Error::InvalidConsignment);
+        }
+        let config = ValidationConfig {
+            chain_net: self.chain_net(),
+            trusted_typesystem: AssetSchema::Nia.types(),
+            ..Default::default()
+        };
+        let valid = contract
+            .validate(&DumbResolver, &config)
+            .map_err(|_| Error::InvalidConsignment)?;
+        let nia = NiaWrapper::with(valid.contract_data());
+        let spec = nia.spec();
+        let actual_precision: u8 = spec.precision.into();
+        if precision != actual_precision || nia.contract_terms().media.is_some() {
+            return Err(Error::InvalidConsignment);
+        }
+        if let Ok(existing) = self.database.check_asset_exists(expected.clone()) {
+            let id = ContractId::from_str(&expected).map_err(|_| Error::InvalidConsignment)?;
+            if !self.rgb_contract_ids()?.contains(&id)
+                || existing.schema != AssetSchema::Nia
+                || existing.precision != precision
+            {
+                return Err(Error::InvalidConsignment);
+            }
+            return self.flush().await;
+        }
+        let data = LocalAssetData {
+            name: spec.name().to_string(),
+            ticker: Some(spec.ticker().to_string()),
+            precision,
+            details: spec.details().map(|v| v.to_string()),
+            media_idx: None,
+            initial_supply: nia.total_issued_supply().into(),
+            max_supply: None,
+            known_circulating_supply: None,
+            reject_list_url: None,
+        };
+        let timestamp = valid.genesis.timestamp;
+        let mut runtime = self.rgb_runtime()?;
+        runtime.import_contract(valid, &DumbResolver)?;
+        drop(runtime);
+        self.add_asset_to_db(expected, &AssetSchema::Nia, None, timestamp, data)?;
+        self.flush().await
+    }
+
+    /// Standard RGB validation plus exact terminal transition facts. Ancestors
+    /// are validated normally; they are never mistaken for the current fill.
+    pub fn inspect_external_transfer(
+        &self,
+        bytes: &[u8],
+        txid: String,
+        expected: String,
+    ) -> Result<serde_json::Value, Error> {
+        use bitcoin::hashes::{Hash as _, sha256};
+        if bytes.len() > 2_097_152 {
+            return Err(Error::InvalidConsignment);
+        }
+        let validation = validate_consignment_offchain(bytes, &txid, self.bitcoin_network())?;
+        if !validation.valid {
+            return Err(Error::InvalidConsignment);
+        }
+        let transfer = RgbTransfer::load(bytes).map_err(InternalError::from)?;
+        if transfer.contract_id().to_string() != expected
+            || AssetSchema::try_from(transfer.schema_id())? != AssetSchema::Nia
+        {
+            return Err(Error::InvalidConsignment);
+        }
+        let mut found = Vec::new();
+        for bundle in &transfer.bundles {
+            if bundle.pub_witness.txid().to_string() != txid {
+                continue;
+            }
+            for known in &bundle.bundle.known_transitions {
+                if known.transition.contract_id.to_string() != expected {
+                    continue;
+                }
+                let mut allocations = BTreeMap::new();
+                for typed in known.transition.assignments.values() {
+                    for assignment in typed.as_fungible() {
+                        let (seal, state) =
+                            assignment.as_revealed().ok_or(Error::InvalidAssignment)?;
+                        if allocations
+                            .insert(seal.vout.into_u32().to_string(), state.as_u64().to_string())
+                            .is_some()
+                        {
+                            return Err(Error::InvalidAssignment);
+                        }
+                    }
+                }
+                found.push(serde_json::json!({"contract_id":expected,"txid":txid,
+                    "transition_id":known.opid.to_string(),"bundle_id":bundle.bundle.bundle_id().to_string(),
+                    "consignment_digest":<sha256::Hash as bitcoin::hashes::Hash>::hash(bytes).to_string(),"allocations":allocations,"valid":true}));
+            }
+        }
+        if found.len() != 1 {
+            return Err(Error::InvalidConsignment);
+        }
+        Ok(found.remove(0))
+    }
+
+    /// Independently validate every historical RGB witness against the live
+    /// indexer. Only the current not-yet-broadcast proposal may be tentative.
+    /// No chain is reconstructed from the sender's self-reported history.
+    pub async fn validate_external_transfer_ancestry(
+        &self,
+        bytes: &[u8],
+        txid: String,
+    ) -> Result<(), Error> {
+        if self.online_data.is_none() {
+            return Err(Error::Offline);
+        }
+        let expected_genesis =
+            bitcoin::blockdata::constants::genesis_block(BdkNetwork::from(self.bitcoin_network()))
+                .block_hash()
+                .to_string();
+        if self.indexer().block_hash(0).await? != expected_genesis {
+            return Err(Error::InvalidConsignment);
+        }
+        if bytes.len() > 2_097_152 {
+            return Err(Error::InvalidConsignment);
+        }
+        let transfer = RgbTransfer::load(bytes).map_err(InternalError::from)?;
+        if transfer.bundles.len() > 112 {
+            return Err(Error::InvalidConsignment);
+        }
+        let mut cache = HashMap::new();
+        for bundle in &transfer.bundles {
+            let id = bundle.pub_witness.txid();
+            if cache.contains_key(&id) {
+                continue;
+            }
+            if id.to_string() == txid {
+                let current = bundle
+                    .pub_witness
+                    .tx()
+                    .cloned()
+                    .ok_or(Error::InvalidConsignment)?;
+                cache.insert(id, WitnessStatus::Resolved(current, WitnessOrd::Tentative));
+                continue;
+            }
+            let bitcoin_id = Txid::from_str(&id.to_string()).map_err(|_| Error::InvalidTxid)?;
+            let (tx, height, timestamp) = self
+                .indexer()
+                .get_tx_with_status(&bitcoin_id)
+                .await?
+                .ok_or(Error::InvalidConsignment)?;
+            let height = height
+                .and_then(NonZeroU32::new)
+                .ok_or(Error::InvalidConsignment)?;
+            let timestamp = i64::try_from(timestamp.ok_or(Error::InvalidConsignment)?)
+                .map_err(|_| Error::InvalidConsignment)?;
+            let position =
+                WitnessPos::bitcoin(height, timestamp).ok_or(Error::InvalidConsignment)?;
+            cache.insert(id, WitnessStatus::Resolved(tx, WitnessOrd::Mined(position)));
+        }
+        let resolver = crate::utils::PreFetchResolver::new(cache, self.chain_net());
+        let schema = AssetSchema::try_from(transfer.schema_id())?;
+        let config = ValidationConfig {
+            chain_net: self.chain_net(),
+            trusted_typesystem: schema.types(),
+            ..Default::default()
+        };
+        transfer
+            .validate(&resolver, &config)
+            .map_err(|_| Error::InvalidConsignment)?;
+        Ok(())
+    }
+
     /// Return all contract IDs currently held in the RGB stock.
     pub fn rgb_contract_ids(&self) -> Result<Vec<ContractId>, Error> {
         let runtime = self.rgb_runtime()?;
@@ -121,29 +318,33 @@ impl Wallet {
             let mut asset_transition_builder =
                 runtime.transition_builder(contract_id, "transfer")?;
 
-            let mut asset_available_amt = 0;
+            let mut asset_available_amt = 0u64;
             for (_, opout_state_map) in
                 runtime.contract_assignments_for(contract_id, prev_outputs.iter().copied())?
             {
                 for (opout, state) in opout_state_map {
                     if let AllocatedState::Amount(amt) = &state {
-                        asset_available_amt += amt.as_u64();
+                        asset_available_amt = asset_available_amt
+                            .checked_add(amt.as_u64())
+                            .ok_or(Error::InvalidAssignment)?;
                     }
                     asset_transition_builder = asset_transition_builder.add_input(opout, state)?;
                 }
             }
 
             let mut beneficiaries = vec![];
-            let mut sending_amt = 0;
+            let mut sending_amt = 0u64;
             for (mut vout, amount) in asset_coloring_info.output_map {
                 if amount == 0 {
                     continue;
                 }
                 if opreturn_first {
-                    vout += 1;
+                    vout = vout.checked_add(1).ok_or(Error::InvalidAssignment)?;
                 }
-                sending_amt += amount;
-                if vout as usize > psbt.outputs.len() {
+                sending_amt = sending_amt
+                    .checked_add(amount)
+                    .ok_or(Error::InvalidAssignment)?;
+                if vout as usize >= psbt.outputs.len() {
                     return Err(Error::InvalidColoringInfo {
                         details: s!("invalid vout in output_map, does not exist in the given PSBT"),
                     });
@@ -261,6 +462,49 @@ impl Wallet {
         self.flush().await?;
 
         info!(self.logger, "Color PSBT and consume completed");
+        Ok(transfers)
+    }
+
+    /// Create one consignment per contract from a fascia **without consuming it**.
+    ///
+    /// This is the non-mutating counterpart of
+    /// [`color_psbt_and_consume`](Wallet::color_psbt_and_consume): it builds the
+    /// same transfers from the fascia's own witness identity, but leaves the
+    /// authoritative RGB runtime untouched. The sender's allocation is therefore
+    /// not consumed until the caller explicitly commits the fascia (for example
+    /// after the corresponding Bitcoin transaction has been broadcast).
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn create_transfers_from_fascia(
+        &self,
+        fascia: &Fascia,
+        asset_beneficiaries: &AssetBeneficiariesMap,
+    ) -> Result<Vec<RgbTransfer>, Error> {
+        info!(self.logger, "Creating transfers from fascia...");
+        let witness_txid = fascia.witness_id();
+        let runtime = self.rgb_runtime()?;
+        let mut transfers = vec![];
+        for (contract_id, beneficiaries) in asset_beneficiaries.clone() {
+            let mut beneficiaries_witness = vec![];
+            let mut beneficiaries_blinded = vec![];
+            for builder_seal in beneficiaries {
+                match builder_seal {
+                    BuilderSeal::Revealed(seal) => {
+                        let explicit_seal = ExplicitSeal::with(witness_txid, seal.vout);
+                        beneficiaries_witness.push(explicit_seal);
+                    }
+                    BuilderSeal::Concealed(secret_seal) => beneficiaries_blinded.push(secret_seal),
+                };
+            }
+            transfers.push(runtime.transfer_from_fascia(
+                contract_id,
+                beneficiaries_witness,
+                beneficiaries_blinded,
+                fascia,
+            )?);
+        }
+        info!(self.logger, "Create transfers from fascia completed");
         Ok(transfers)
     }
 

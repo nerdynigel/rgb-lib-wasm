@@ -653,6 +653,13 @@ impl RgbRuntime {
             .map_err(InternalError::from)
     }
 
+    pub(crate) fn export_contract(
+        &self,
+        id: ContractId,
+    ) -> Result<rgbstd::containers::Contract, InternalError> {
+        self.stock.export_contract(id).map_err(InternalError::from)
+    }
+
     pub(crate) fn import_kit(&mut self, kit: ValidKit) -> Result<Status, InternalError> {
         self.stock.import_kit(kit).map_err(InternalError::from)
     }

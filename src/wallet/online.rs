@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::api::proxy::WasmProxyClient;
+use bitcoin::hashes::{Hash as _, sha256};
 
 const SCHEMAS_SUPPORTING_INFLATION: [database::enums::AssetSchema; 1] = [AssetSchema::Ifa];
 
@@ -182,6 +183,56 @@ pub(crate) struct TransferArtifacts {
     pub(crate) asset_infos: BTreeMap<String, InfoAssetTransfer>,
     pub(crate) consignment_bytes: HashMap<String, Vec<u8>>,
     pub(crate) signed_psbt: Option<String>,
+    /// Externally constructed collaborative RGB send state (if any). Persisted so
+    /// the prepared operation survives a reload/reopen before finalisation.
+    #[serde(default)]
+    pub(crate) external_send: Option<ExternalSendArtifact>,
+}
+
+/// Durable lifecycle state of an externally constructed RGB send.
+///
+/// `Prepared -> BroadcastRecorded -> Finalized`. The prepared state holds the
+/// immutable input needed to re-validate and finalise the exact transaction; the
+/// transition to `Finalized` is only persisted after the fascia is consumed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub(crate) enum ExternalSendStatus {
+    #[default]
+    Prepared,
+    BroadcastRecorded,
+    Finalized,
+    Conflicted,
+}
+
+/// Immutable, reload-safe data for one externally constructed RGB send.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ExternalSendArtifact {
+    /// Exact colored PSBT, retained before acknowledging preparation. Never
+    /// re-color or guess replacement bytes after a lost acknowledgement.
+    #[serde(default)]
+    pub(crate) prepared_psbt: String,
+    /// Canonical serialisation of the exact prepared transaction (hex). Used for
+    /// exact equality on finalise, not merely the txid.
+    pub(crate) expected_tx_hex: String,
+    /// The exact RGB fascia as canonical JSON (serde).
+    pub(crate) fascia_json: String,
+    /// Deterministic digest of the declared recipient map, so a same-txid
+    /// prepare with different recipients is detected as a conflict rather than
+    /// treated as an idempotent retry.
+    pub(crate) recipients_digest: String,
+    pub(crate) status: ExternalSendStatus,
+    /// Independently indexer-confirmed conflicting Bitcoin spend; original
+    /// transaction, fascia and consignments remain retained permanently.
+    #[serde(default)]
+    pub(crate) conflict_txid: Option<String>,
+}
+
+/// Stable result of preparing an externally constructed RGB send.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExternalSendPrepareResult {
+    /// Transaction id of the prepared external send.
+    pub txid: String,
+    /// Batch transfer index of the prepared operation.
+    pub batch_transfer_idx: i32,
 }
 
 async fn pending_consignment_matches(
@@ -1361,7 +1412,7 @@ impl Wallet {
                 && !(u
                     .rgb_allocations
                     .iter()
-                    .any(|a| !a.incoming && a.status.waiting_counterparty()))
+                    .any(|a| !a.incoming && a.status.pending()))
                 && !u.utxo.pending_witness
                 && u.pending_blinded == 0
                 && u.utxo.exists
@@ -1576,7 +1627,24 @@ impl Wallet {
         let tx = self
             ._broadcast_tx(signed_psbt.extract_tx().map_err(InternalError::from)?)
             .await?;
+        self.record_broadcast_transaction(tx.clone(), skip_sync)
+            .await?;
+        Ok(tx)
+    }
 
+    /// Apply an already externally broadcast transaction to the wallet's local
+    /// BDK graph and DB **without rebroadcasting it**.
+    ///
+    /// Factored out of [`_broadcast_psbt`](Wallet::_broadcast_psbt) so an
+    /// externally constructed collaborative transaction can be recorded locally
+    /// after it has been broadcast by the coordinator/other participant. Never
+    /// calls the network broadcast primitive. Safe to call again for the same
+    /// exact transaction (BDK graph insertion is idempotent).
+    pub(crate) async fn record_broadcast_transaction(
+        &mut self,
+        tx: BdkTransaction,
+        skip_sync: bool,
+    ) -> Result<(), Error> {
         let internal_unspents_outpoints: Vec<(String, u32)> = self
             .internal_unspents()
             .map(|u| (u.outpoint.txid.to_string(), u.outpoint.vout))
@@ -1588,13 +1656,11 @@ impl Wallet {
             if internal_unspents_outpoints.contains(&(txid.clone(), vout)) {
                 continue;
             }
-            let mut db_txo: DbTxoActMod = self
-                .database
-                .get_txo(&Outpoint { txid, vout })?
-                .expect("outpoint should be in the DB")
-                .into();
-            db_txo.spent = ActiveValue::Set(true);
-            self.database.update_txo(db_txo)?;
+            if let Some(db_txo) = self.database.get_txo(&Outpoint { txid, vout })? {
+                let mut db_txo: DbTxoActMod = db_txo.into();
+                db_txo.spent = ActiveValue::Set(true);
+                self.database.update_txo(db_txo)?;
+            }
         }
 
         if !skip_sync {
@@ -1613,7 +1679,756 @@ impl Wallet {
             .apply_unconfirmed_txs([(tx.clone(), last_seen)]);
         self.bdk_wallet.persist(&mut self.bdk_database)?;
 
-        Ok(tx)
+        Ok(())
+    }
+
+    /// Look up the batch transfer belonging to a transaction id, if any.
+    ///
+    /// Distinguishes "no operation" (`None`) from an existing operation so
+    /// callers can implement idempotent replay vs. conflicting reuse by
+    /// comparing the immutable prepared data, not merely record presence.
+    pub(crate) fn batch_transfer_by_txid(
+        &self,
+        txid: &str,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
+        let db_data = self.database.get_db_data(false)?;
+        Ok(db_data
+            .batch_transfers
+            .into_iter()
+            .find(|b| b.txid.as_deref() == Some(txid)))
+    }
+
+    /// Canonical, witness-stripped serialisation of a transaction. The txid only
+    /// commits to the non-witness serialisation, so this is the exact identity of
+    /// the transaction's economic content and is what external-send finalisation
+    /// compares (never the txid alone).
+    fn tx_stripped_hex(tx: &BdkTransaction) -> String {
+        let mut stripped = tx.clone();
+        for input in stripped.input.iter_mut() {
+            input.witness = bitcoin::Witness::default();
+        }
+        hex::encode(bitcoin::consensus::encode::serialize(&stripped))
+    }
+
+    /// Prepare an externally constructed collaborative RGB send.
+    ///
+    /// Validates the externally built PSBT against its colouring `Fascia` and the
+    /// wallet's own RGB state, builds the same high-level transfer bookkeeping the
+    /// normal send path would create, persists the exact expected transaction and
+    /// the fascia, and marks the operation `Prepared`. It NEVER signs, broadcasts
+    /// or consumes the fascia.
+    ///
+    /// Identical retries are idempotent; a conflicting operation for the same
+    /// transaction id is rejected without altering the original.
+    #[allow(clippy::arc_with_non_send_sync)] // wasm32 is single-threaded; matches the wallet DB owner
+    pub async fn prepare_external_rgb_send(
+        &mut self,
+        recipient_map: HashMap<String, Vec<Recipient>>,
+        psbt: &Psbt,
+        fascia: &Fascia,
+        min_confirmations: u8,
+    ) -> Result<ExternalSendPrepareResult, Error> {
+        info!(self.logger, "Preparing external RGB send...");
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        let witness_txid = fascia.witness_id().to_string();
+        if txid != witness_txid {
+            return Err(Error::ExternalSendTxMismatch {
+                expected: witness_txid,
+                got: txid,
+            });
+        }
+        if !psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .any(|o| o.script_pubkey.is_op_return())
+        {
+            return Err(Error::Internal {
+                details: s!("external PSBT must carry its RGB commitment OP_RETURN"),
+            });
+        }
+        if psbt.modifiable_outputs() {
+            return Err(Error::Internal {
+                details: s!("external PSBT outputs must be unmodifiable"),
+            });
+        }
+
+        let expected_tx_hex = Self::tx_stripped_hex_from_unsigned(&psbt.unsigned_tx);
+        let fascia_json = serde_json::to_string(fascia).map_err(InternalError::from)?;
+        let recipients_digest = Self::recipients_digest(&recipient_map)?;
+
+        // Idempotency / conflict: prove the retry is the same operation by the
+        // immutable prepared data (transaction, fascia AND declared recipients),
+        // not mere record presence.
+        if let Some(existing) = self.batch_transfer_by_txid(&txid)? {
+            let same = self
+                .transfer_artifacts
+                .get(&txid)
+                .and_then(|a| a.external_send.as_ref())
+                .map(|art| {
+                    art.expected_tx_hex == expected_tx_hex
+                        && art.fascia_json == fascia_json
+                        && art.recipients_digest == recipients_digest
+                })
+                .unwrap_or(false);
+            if same && !existing.status.failed() && existing.min_confirmations == min_confirmations
+            {
+                self.flush().await?;
+                return Ok(ExternalSendPrepareResult {
+                    txid,
+                    batch_transfer_idx: existing.idx,
+                });
+            }
+            return Err(Error::ExternalSendConflict { txid });
+        }
+
+        let chainnet: ChainNet = self.bitcoin_network().into();
+        let input_outpoints: Vec<OutPoint> = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|i| i.previous_output)
+            .collect();
+        let data = self.database.get_db_data(false)?;
+        let utxos = self.database.get_unspent_txos(data.txos.clone())?;
+        let available = self.database.get_rgb_allocations(
+            utxos,
+            Some(data.colorings),
+            Some(data.batch_transfers),
+            Some(data.asset_transfers),
+            Some(data.transfers),
+        )?;
+        for unspent in &available {
+            if input_outpoints.iter().any(|outpoint| {
+                unspent.utxo.outpoint().txid == outpoint.txid.to_string()
+                    && unspent.utxo.outpoint().vout == outpoint.vout
+            }) && unspent.rgb_allocations.iter().any(|a| a.status.pending())
+            {
+                return Err(Error::ExternalSendConflict { txid });
+            }
+        }
+
+        let mut transfers: BTreeMap<String, InfoAssetTransfer> = BTreeMap::new();
+        let mut btc_change: Option<BtcChange> = None;
+        let mut consignment_bytes = HashMap::new();
+
+        // This deliberately narrow external-send profile supports one NIA
+        // transfer. Additional bundles/hidden transitions must not escape the
+        // recipient and input accounting below.
+        if recipient_map.len() != 1 || fascia.bundles().len() != 1 {
+            return Err(Error::InvalidRecipientMap);
+        }
+
+        for (asset_id, recipients) in &recipient_map {
+            if recipients.is_empty() {
+                return Err(Error::InvalidRecipientMap);
+            }
+            let contract_id = ContractId::from_str(asset_id).map_err(|e| Error::Internal {
+                details: e.to_string(),
+            })?;
+            let bundle = fascia.bundles().get(&contract_id).ok_or_else(|| {
+                Error::ExternalSendRecipientMismatch {
+                    asset_id: asset_id.clone(),
+                }
+            })?;
+            if bundle.known_transitions.len() != 1
+                || self.database.check_asset_exists(asset_id.clone())?.schema != AssetSchema::Nia
+            {
+                return Err(Error::InvalidRecipientMap);
+            }
+            let transition = bundle
+                .known_transitions
+                .iter()
+                .map(|kt| &kt.transition)
+                .find(|t| t.contract_id == contract_id)
+                .ok_or_else(|| Error::ExternalSendRecipientMismatch {
+                    asset_id: asset_id.clone(),
+                })?;
+            let consumed_opouts: HashSet<Opout> = transition.inputs().iter().copied().collect();
+            let mut owned_opouts = HashSet::new();
+
+            let mut assignments_spent: TxoAssignments = HashMap::new();
+            let mut txo_map: HashMap<i32, Outpoint> = HashMap::new();
+            let mut consumed = AssignmentsCollection::default();
+            let runtime = self.rgb_runtime()?;
+            for (seal, opout_state_map) in
+                runtime.contract_assignments_for(contract_id, input_outpoints.iter().copied())?
+            {
+                let outpoint = seal.to_outpoint();
+                let db_outpoint = Outpoint {
+                    txid: outpoint.txid.to_string(),
+                    vout: outpoint.vout,
+                };
+                for (opout, state) in opout_state_map {
+                    if consumed_opouts.contains(&opout) {
+                        owned_opouts.insert(opout);
+                        if !matches!(state, AllocatedState::Amount(_)) || opout.ty != OS_ASSET {
+                            return Err(Error::InvalidAssignment);
+                        }
+                        if let AllocatedState::Amount(amount) = &state {
+                            consumed
+                                .fungible
+                                .checked_add(amount.as_u64())
+                                .ok_or(Error::InvalidAssignment)?;
+                        }
+                        consumed.add_opout_state(&opout, &state);
+                        let txo_idx = self
+                            .database
+                            .get_txo(&db_outpoint)?
+                            .ok_or(Error::Internal {
+                                details: s!("consumed RGB outpoint missing from DB"),
+                            })?
+                            .idx;
+                        txo_map.insert(txo_idx, db_outpoint.clone());
+                        assignments_spent
+                            .entry(txo_idx)
+                            .or_default()
+                            .push(Assignment::from_opout_and_state(opout, &state));
+                    }
+                }
+            }
+            drop(runtime);
+            if assignments_spent.is_empty() || owned_opouts != consumed_opouts {
+                return Err(Error::ExternalSendRecipientMismatch {
+                    asset_id: asset_id.clone(),
+                });
+            }
+
+            let mut revealed_outputs: Vec<(u32, u64, u64)> = vec![];
+            let mut concealed: Vec<SecretSeal> = vec![];
+            for typed in transition.assignments.values() {
+                for assignment in typed.as_fungible() {
+                    match assignment.as_revealed() {
+                        Some((seal, state)) => revealed_outputs.push((
+                            seal.vout.into_u32(),
+                            state.as_u64(),
+                            seal.blinding,
+                        )),
+                        None => concealed.push(assignment.to_confidential_seal()),
+                    }
+                }
+            }
+            if !concealed.is_empty() {
+                return Err(Error::ExternalSendUndeclaredBeneficiary {
+                    asset_id: asset_id.clone(),
+                });
+            }
+
+            let mut local_recipients: Vec<LocalRecipient> = vec![];
+            let mut needed = AssignmentsCollection::default();
+            let mut matched: Vec<(u32, u64)> = vec![];
+            for recipient in recipients {
+                let amount = match recipient.assignment {
+                    Assignment::Fungible(a) => a,
+                    _ => return Err(Error::InvalidAssignment),
+                };
+                let xchainnet = XChainNet::<Beneficiary>::from_str(&recipient.recipient_id)
+                    .map_err(|_| Error::InvalidRecipientID)?;
+                if xchainnet.chain_network() != chainnet {
+                    return Err(Error::InvalidRecipientNetwork);
+                }
+                let script_buf = match xchainnet.into_inner() {
+                    Beneficiary::WitnessVout(pay2vout, _) => pay2vout.to_script(),
+                    Beneficiary::BlindedSeal(_) => {
+                        return Err(Error::ExternalSendRecipientMismatch {
+                            asset_id: asset_id.clone(),
+                        });
+                    }
+                };
+                let (vout, amount_sat) = psbt
+                    .unsigned_tx
+                    .output
+                    .iter()
+                    .enumerate()
+                    .find(|(_, o)| o.script_pubkey == script_buf)
+                    .map(|(i, o)| (i as u32, o.value.to_sat()))
+                    .ok_or_else(|| Error::ExternalSendRecipientMismatch {
+                        asset_id: asset_id.clone(),
+                    })?;
+                let blinding = revealed_outputs
+                    .iter()
+                    .find(|(v, a, _)| *v == vout && *a == amount)
+                    .map(|(_, _, b)| *b)
+                    .ok_or_else(|| Error::ExternalSendAmountMismatch {
+                        asset_id: asset_id.clone(),
+                    })?;
+                if matched.iter().any(|(v, _)| *v == vout) {
+                    return Err(Error::InvalidRecipientMap);
+                }
+
+                let mut transport_endpoints: Vec<LocalTransportEndpoint> = vec![];
+                let mut found_valid = false;
+                for endpoint_str in &recipient.transport_endpoints {
+                    let transport_endpoint = TransportEndpoint::new(endpoint_str.clone())?;
+                    let mut local = LocalTransportEndpoint {
+                        transport_type: transport_endpoint.transport_type,
+                        endpoint: transport_endpoint.endpoint.clone(),
+                        used: false,
+                        usable: false,
+                    };
+                    if crate::utils::check_proxy_async(&transport_endpoint.endpoint)
+                        .await
+                        .is_ok()
+                    {
+                        local.usable = true;
+                        found_valid = true;
+                    }
+                    transport_endpoints.push(local);
+                }
+                if !found_valid {
+                    return Err(Error::InvalidTransportEndpoints {
+                        details: s!("no valid transport endpoints"),
+                    });
+                }
+
+                needed.fungible = needed
+                    .fungible
+                    .checked_add(amount)
+                    .ok_or(Error::InvalidAssignment)?;
+                matched.push((vout, amount));
+                local_recipients.push(LocalRecipient {
+                    recipient_id: recipient.recipient_id.clone(),
+                    local_recipient_data: LocalRecipientData::Witness(LocalWitnessData {
+                        amount_sat,
+                        blinding: Some(blinding),
+                        vout,
+                    }),
+                    assignment: recipient.assignment.clone(),
+                    transport_endpoints,
+                });
+            }
+
+            if consumed.fungible < needed.fungible {
+                return Err(Error::ExternalSendAmountMismatch {
+                    asset_id: asset_id.clone(),
+                });
+            }
+            let total = revealed_outputs
+                .iter()
+                .try_fold(0u64, |sum, (_, value, _)| {
+                    sum.checked_add(*value).ok_or(Error::InvalidAssignment)
+                })?;
+            if total != consumed.fungible
+                || revealed_outputs.len() != recipients.len() + usize::from(total > needed.fungible)
+            {
+                return Err(Error::InvalidAssignment);
+            }
+            let change = consumed.change(&needed);
+
+            let undeclared = revealed_outputs
+                .iter()
+                .filter(|(v, a, _)| {
+                    !matched.iter().any(|(mv, ma)| mv == v && ma == a)
+                        && !(change.fungible > 0 && *a == change.fungible)
+                })
+                .count();
+            if undeclared > 0 {
+                return Err(Error::ExternalSendUndeclaredBeneficiary {
+                    asset_id: asset_id.clone(),
+                });
+            }
+
+            let change = if change.fungible > 0 {
+                let vout = revealed_outputs
+                    .iter()
+                    .find(|(v, a, _)| {
+                        !matched.iter().any(|(mv, _)| mv == v) && *a == change.fungible
+                    })
+                    .map(|(v, _, _)| *v)
+                    .ok_or_else(|| Error::ExternalSendChangeAmbiguous {
+                        asset_id: asset_id.clone(),
+                    })?;
+                let out = psbt.unsigned_tx.output.get(vout as usize).ok_or_else(|| {
+                    Error::ExternalSendChangeAmbiguous {
+                        asset_id: asset_id.clone(),
+                    }
+                })?;
+                if !self.bdk_wallet.is_mine(out.script_pubkey.clone()) {
+                    return Err(Error::ExternalSendChangeAmbiguous {
+                        asset_id: asset_id.clone(),
+                    });
+                }
+                if btc_change.is_none() {
+                    btc_change = Some(BtcChange {
+                        vout,
+                        amount: out.value.to_sat(),
+                    });
+                }
+                change
+            } else {
+                AssignmentsCollection::default()
+            };
+
+            let asset = self.database.check_asset_exists(asset_id.clone())?;
+            // Preserve the actual standard consignment before any DB mutation.
+            // No runtime-only recipe is needed after a crash or export/import.
+            let beneficiaries = revealed_outputs
+                .iter()
+                .map(|(vout, _, blinding)| {
+                    BuilderSeal::Revealed(GraphSeal::with_blinded_vout(*vout, *blinding))
+                })
+                .collect();
+            let built = self.create_transfers_from_fascia(
+                fascia,
+                &BTreeMap::from([(contract_id, beneficiaries)]),
+            )?;
+            let mut bytes = Vec::new();
+            built
+                .first()
+                .ok_or(Error::InvalidAssignment)?
+                .save(&mut bytes)?;
+            let validation = super::rust_only::validate_consignment_offchain(
+                &bytes,
+                &txid,
+                self.bitcoin_network(),
+            )?;
+            if !validation.valid {
+                return Err(Error::InvalidAssignment);
+            }
+            consignment_bytes.insert(asset_id.clone(), bytes);
+            transfers.insert(
+                asset_id.clone(),
+                InfoAssetTransfer {
+                    asset_info: AssetInfo {
+                        contract_id,
+                        reject_list_url: asset.reject_list_url,
+                    },
+                    recipients: local_recipients,
+                    asset_spend: AssetSpend {
+                        txo_map,
+                        assignments_collected: consumed.clone(),
+                        input_btc_amt: 0,
+                    },
+                    change,
+                    original_assignments_needed: needed.clone(),
+                    assignments_needed: needed,
+                    assignments_spent,
+                    main_transition: TypeOfTransition::Transfer,
+                },
+            );
+        }
+
+        let before_db = self.database.as_ref().clone();
+        let saved = self._save_transfers(
+            txid.clone(),
+            &transfers,
+            HashMap::new(),
+            None,
+            btc_change,
+            TransferStatus::Initiated,
+            min_confirmations,
+        );
+        let batch_transfer_idx = match saved {
+            Ok(idx) => idx,
+            Err(error) => {
+                self.database = Arc::new(before_db);
+                return Err(error);
+            }
+        };
+
+        self.transfer_artifacts.insert(
+            txid.clone(),
+            TransferArtifacts {
+                asset_infos: transfers,
+                consignment_bytes,
+                external_send: Some(ExternalSendArtifact {
+                    prepared_psbt: psbt.to_string(),
+                    expected_tx_hex,
+                    fascia_json,
+                    recipients_digest,
+                    status: ExternalSendStatus::Prepared,
+                    conflict_txid: None,
+                }),
+                ..Default::default()
+            },
+        );
+        self.flush().await?;
+
+        info!(self.logger, "Prepare external RGB send completed");
+        Ok(ExternalSendPrepareResult {
+            txid,
+            batch_transfer_idx,
+        })
+    }
+
+    /// Read the exact durable external-send artifacts. Public transaction and
+    /// standard RGB evidence only; no key material or synthetic balances.
+    pub fn external_rgb_send_data(&self, txid: String) -> Result<serde_json::Value, Error> {
+        let artifacts = self
+            .transfer_artifacts
+            .get(&txid)
+            .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
+        let state = artifacts
+            .external_send
+            .as_ref()
+            .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
+        let mut transfers = BTreeMap::new();
+        for (id, bytes) in &artifacts.consignment_bytes {
+            let transfer = RgbTransfer::load(&bytes[..]).map_err(InternalError::from)?;
+            transfers.insert(
+                id.clone(),
+                serde_json::to_value(transfer).map_err(InternalError::from)?,
+            );
+        }
+        Ok(
+            serde_json::json!({"txid":txid,"status":state.status,"conflict_txid":state.conflict_txid,"psbt":state.prepared_psbt,"fascia":state.fascia_json,
+            "consignments":artifacts.consignment_bytes,"transfers":transfers}),
+        )
+    }
+
+    /// Explicit delivery of the persisted standard consignment. A transport
+    /// failure is returned; it never signs, broadcasts or changes balances.
+    pub async fn post_external_rgb_consignments(&self, txid: String) -> Result<(), Error> {
+        let artifacts = self
+            .transfer_artifacts
+            .get(&txid)
+            .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
+        if artifacts
+            .external_send
+            .as_ref()
+            .is_none_or(|s| s.status == ExternalSendStatus::Conflicted)
+        {
+            return Err(Error::ExternalSendUnknown { txid });
+        }
+        for (id, info) in &artifacts.asset_infos {
+            let bytes = artifacts
+                .consignment_bytes
+                .get(id)
+                .ok_or(Error::InvalidAssignment)?;
+            for recipient in &info.recipients {
+                let LocalRecipientData::Witness(witness) = &recipient.local_recipient_data else {
+                    return Err(Error::InvalidRecipientMap);
+                };
+                let endpoint = recipient
+                    .transport_endpoints
+                    .iter()
+                    .find(|e| e.usable)
+                    .ok_or(Error::InvalidRecipientMap)?;
+                self.post_consignment(
+                    &endpoint.endpoint,
+                    recipient.recipient_id.clone(),
+                    bytes,
+                    txid.clone(),
+                    Some(witness.vout),
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn tx_stripped_hex_from_unsigned(tx: &bitcoin::Transaction) -> String {
+        let mut stripped = tx.clone();
+        for input in stripped.input.iter_mut() {
+            input.witness = bitcoin::Witness::default();
+        }
+        hex::encode(bitcoin::consensus::encode::serialize(&stripped))
+    }
+
+    /// Deterministic digest of a declared recipient map (sorted by asset id).
+    fn recipients_digest(recipient_map: &HashMap<String, Vec<Recipient>>) -> Result<String, Error> {
+        let sorted: BTreeMap<&String, &Vec<Recipient>> = recipient_map.iter().collect();
+        // Fail closed: never fall back to a constant digest, which could make two
+        // different recipient declarations look like an idempotent retry.
+        let bytes = serde_json::to_vec(&sorted).map_err(InternalError::from)?;
+        Ok(<sha256::Hash as bitcoin::hashes::Hash>::hash(&bytes).to_string())
+    }
+
+    /// Finalize a prepared externally constructed RGB send.
+    ///
+    /// Requires the exact prepared transaction (canonical, witness-stripped
+    /// equality — not just the txid) and that it is observable through the
+    /// indexer. Records the transaction locally without rebroadcasting, consumes
+    /// the exact persisted fascia, advances the transfer and marks the operation
+    /// `Finalized`. Safe to repeat: an already-finalized operation returns
+    /// idempotent success without consuming again.
+    pub async fn finalize_external_rgb_send(
+        &mut self,
+        txid: String,
+        tx: &BdkTransaction,
+    ) -> Result<OperationResult, Error> {
+        info!(self.logger, "Finalizing external RGB send...");
+        if tx.compute_txid().to_string() != txid {
+            return Err(Error::ExternalSendTxMismatch {
+                expected: txid,
+                got: tx.compute_txid().to_string(),
+            });
+        }
+        let artifact = self
+            .transfer_artifacts
+            .get(&txid)
+            .and_then(|a| a.external_send.clone())
+            .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
+        let existing = self
+            .batch_transfer_by_txid(&txid)?
+            .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
+
+        if artifact.status == ExternalSendStatus::Conflicted {
+            return Err(Error::ExternalSendConflict { txid });
+        }
+        // Idempotent: already finalized -> return safely without consuming again.
+        if artifact.status == ExternalSendStatus::Finalized {
+            self.flush().await?;
+            return Ok(OperationResult {
+                txid,
+                batch_transfer_idx: existing.idx,
+            });
+        }
+
+        // Exact transaction equality: canonical witness-stripped serialisation.
+        if Self::tx_stripped_hex(tx) != artifact.expected_tx_hex {
+            return Err(Error::ExternalSendTxMismatch {
+                expected: artifact.expected_tx_hex,
+                got: Self::tx_stripped_hex(tx),
+            });
+        }
+
+        let fascia: Fascia =
+            serde_json::from_str(&artifact.fascia_json).map_err(InternalError::from)?;
+        if fascia.witness_id().to_string() != txid {
+            return Err(Error::ExternalSendTxMismatch {
+                expected: txid,
+                got: fascia.witness_id().to_string(),
+            });
+        }
+        if self.indexer().get_tx_confirmations(&txid).await?.is_none() {
+            return Err(Error::ExternalSendTxNotObserved { txid });
+        }
+        let (observed, _, _) = self
+            .indexer()
+            .get_tx_with_status(&tx.compute_txid())
+            .await?
+            .ok_or_else(|| Error::ExternalSendTxNotObserved { txid: txid.clone() })?;
+        if bitcoin::consensus::serialize(&observed) != bitcoin::consensus::serialize(tx) {
+            return Err(Error::ExternalSendTxMismatch {
+                expected: s!("exact indexer-observed transaction"),
+                got: s!("different witness bytes"),
+            });
+        }
+
+        // Record the externally broadcast transaction locally (no rebroadcast).
+        self.record_broadcast_transaction(tx.clone(), false).await?;
+        if let Some(art) = self
+            .transfer_artifacts
+            .get_mut(&txid)
+            .and_then(|a| a.external_send.as_mut())
+        {
+            art.status = ExternalSendStatus::BroadcastRecorded;
+        }
+        self.flush().await?;
+
+        // Consume the exact persisted fascia (idempotent for the same transition).
+        let mut runtime = self.rgb_runtime()?;
+        runtime.consume_fascia(fascia, None)?;
+        drop(runtime);
+
+        // Advance the transfer state and mark finalized.
+        let mut updated: DbBatchTransferActMod = existing.into();
+        updated.txid = ActiveValue::Set(Some(txid.clone()));
+        updated.status = ActiveValue::Set(TransferStatus::WaitingConfirmations);
+        let batch_transfer_idx = self.database.update_batch_transfer(&mut updated)?.idx;
+
+        if let Some(art) = self
+            .transfer_artifacts
+            .get_mut(&txid)
+            .and_then(|a| a.external_send.as_mut())
+        {
+            art.status = ExternalSendStatus::Finalized;
+        }
+        self.flush().await?;
+
+        info!(self.logger, "Finalize external RGB send completed");
+        Ok(OperationResult {
+            txid,
+            batch_transfer_idx,
+        })
+    }
+
+    /// REGTEST-only recovery after a different independently confirmed Bitcoin
+    /// transaction makes this unconsumed external proposal impossible. No timeout,
+    /// missing ACK, caller assertion or unconfirmed conflict can release RGB state.
+    /// Only DB reservations are retired; Stock was never consumed in Prepared.
+    pub async fn reconcile_external_rgb_conflict(
+        &mut self,
+        txid: String,
+        conflicting: &BdkTransaction,
+    ) -> Result<OperationResult, Error> {
+        if self.bitcoin_network() != BitcoinNetwork::Regtest || self.online_data.is_none() {
+            return Err(Error::InvalidConsignment);
+        }
+        let genesis =
+            bitcoin::blockdata::constants::genesis_block(BdkNetwork::from(self.bitcoin_network()))
+                .block_hash()
+                .to_string();
+        if self.indexer().block_hash(0).await? != genesis {
+            return Err(Error::InvalidConsignment);
+        }
+        let artifact = self
+            .transfer_artifacts
+            .get(&txid)
+            .and_then(|a| a.external_send.clone())
+            .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
+        let conflict_id = conflicting.compute_txid().to_string();
+        let original = Psbt::from_str(&artifact.prepared_psbt).map_err(InternalError::from)?;
+        if !distinct_input_conflict(&original.unsigned_tx, conflicting) {
+            return Err(Error::ExternalSendConflict { txid });
+        }
+        if self
+            .indexer()
+            .get_tx_confirmations(&conflict_id)
+            .await?
+            .unwrap_or(0)
+            < 1
+        {
+            return Err(Error::ExternalSendTxNotObserved { txid: conflict_id });
+        }
+        let (observed, height, _) = self
+            .indexer()
+            .get_tx_with_status(&conflicting.compute_txid())
+            .await?
+            .ok_or_else(|| Error::ExternalSendTxNotObserved {
+                txid: conflict_id.clone(),
+            })?;
+        if height.unwrap_or(0) == 0
+            || bitcoin::consensus::serialize(&observed)
+                != bitcoin::consensus::serialize(conflicting)
+        {
+            return Err(Error::ExternalSendConflict { txid });
+        }
+        let existing = self
+            .batch_transfer_by_txid(&txid)?
+            .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
+        if artifact.status == ExternalSendStatus::Conflicted {
+            if artifact.conflict_txid.as_deref() != Some(&conflict_id) || !existing.status.failed()
+            {
+                return Err(Error::ExternalSendConflict { txid });
+            }
+            self.flush().await?;
+            return Ok(OperationResult {
+                txid,
+                batch_transfer_idx: existing.idx,
+            });
+        }
+        if artifact.status != ExternalSendStatus::Prepared
+            || existing.status != TransferStatus::Initiated
+        {
+            return Err(Error::ExternalSendConflict { txid });
+        }
+        let mut updated: DbBatchTransferActMod = existing.into();
+        updated.status = ActiveValue::Set(TransferStatus::Failed);
+        let idx = self.database.update_batch_transfer(&mut updated)?.idx;
+        let value = self
+            .transfer_artifacts
+            .get_mut(&txid)
+            .and_then(|a| a.external_send.as_mut())
+            .ok_or(Error::InvalidConsignment)?;
+        value.status = ExternalSendStatus::Conflicted;
+        value.conflict_txid = Some(conflict_id);
+        self.flush().await?;
+        Ok(OperationResult {
+            txid,
+            batch_transfer_idx: idx,
+        })
     }
 
     /// Prepare a transaction to create new UTXOs for RGB allocations (wasm32 async).
@@ -4087,5 +4902,47 @@ impl Wallet {
 
         info!(self.logger, "List unspents vanilla completed");
         Ok(res)
+    }
+}
+
+/// A different txid spending an original input. A changed witness of the same
+/// transaction is not a cancellation, and an unrelated spend proves nothing.
+fn distinct_input_conflict(original: &BdkTransaction, conflicting: &BdkTransaction) -> bool {
+    original.compute_txid() != conflicting.compute_txid()
+        && original.input.iter().any(|old| {
+            conflicting
+                .input
+                .iter()
+                .any(|new| new.previous_output == old.previous_output)
+        })
+}
+#[cfg(test)]
+mod external_conflict_identity_tests {
+    use super::*;
+    #[test]
+    fn requires_a_distinct_competing_transaction_not_an_unrelated_or_witness_variant() {
+        let tx = BdkTransaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        assert!(!distinct_input_conflict(&tx, &tx));
+        let mut witness = tx.clone();
+        witness.input[0].witness = bitcoin::Witness::from_slice(&[vec![0; 64]]);
+        assert!(!distinct_input_conflict(&tx, &witness));
+        let mut competing = tx.clone();
+        competing.output[0].value = bitcoin::Amount::from_sat(900);
+        assert!(distinct_input_conflict(&tx, &competing));
+        competing.input[0].previous_output.vout = 1;
+        assert!(!distinct_input_conflict(&tx, &competing));
     }
 }
