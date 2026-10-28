@@ -140,18 +140,42 @@ pub(crate) fn decode_backup(data: &[u8]) -> Result<(BackupPubData, &[u8]), Error
         return Err(Error::InvalidBackup);
     }
     let pub_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if data.len() < 4 + pub_len {
+    let end = 4usize.checked_add(pub_len).ok_or(Error::InvalidBackup)?;
+    if pub_len > 4096 || data.len() < end || data.len() > 16_777_216 {
         return Err(Error::InvalidBackup);
     }
     let pub_data: BackupPubData =
-        serde_json::from_slice(&data[4..4 + pub_len]).map_err(|_| Error::InvalidBackup)?;
-    let ciphertext = &data[4 + pub_len..];
+        serde_json::from_slice(&data[4..end]).map_err(|_| Error::InvalidBackup)?;
+    let ciphertext = &data[end..];
     Ok((pub_data, ciphertext))
 }
 
 use strict_encoding::StrictSerialize;
 
 impl super::Wallet {
+    /// Read-only exact-state check for a lost restore acknowledgement. Only
+    /// backup bookkeeping timestamps/counters are excluded; every financial
+    /// record, BDK changeset, Stock byte and pending artifact must match.
+    pub fn matches_backup_state(&self, bytes: &[u8], password: &str) -> Result<bool, Error> {
+        let (public, ciphertext) = decode_backup(bytes)?;
+        let plaintext = decrypt_payload(ciphertext, password, &public)?;
+        let payload: WalletBackupPayload =
+            serde_json::from_slice(&plaintext).map_err(|_| Error::InvalidBackup)?;
+        self.check_backup_identity(&payload)?;
+        let mut expected = serde_json::to_value(payload).map_err(InternalError::from)?;
+        let mut actual: serde_json::Value =
+            serde_json::from_slice(&self.serialize_backup_payload()?)
+                .map_err(InternalError::from)?;
+        for value in [&mut expected, &mut actual] {
+            let db = value
+                .get_mut("db")
+                .and_then(|v| v.as_object_mut())
+                .ok_or(Error::InvalidBackup)?;
+            db.remove("backup_info");
+            db.remove("next_backup_info_idx");
+        }
+        Ok(expected == actual)
+    }
     /// Create an encrypted backup of the wallet state.
     /// Returns the backup as bytes (password-protected).
     pub fn backup(&self, password: &str) -> Result<Vec<u8>, Error> {
@@ -369,6 +393,14 @@ impl super::Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_envelope_length_is_refused() {
+        assert!(matches!(
+            decode_backup(&[255, 255, 255, 255, 0]),
+            Err(Error::InvalidBackup)
+        ));
+    }
 
     #[test]
     fn backup_payload_preserves_pending_external_and_received_bytes() {
