@@ -200,6 +200,7 @@ pub(crate) enum ExternalSendStatus {
     Prepared,
     BroadcastRecorded,
     Finalized,
+    Conflicted,
 }
 
 /// Immutable, reload-safe data for one externally constructed RGB send.
@@ -219,6 +220,10 @@ pub(crate) struct ExternalSendArtifact {
     /// treated as an idempotent retry.
     pub(crate) recipients_digest: String,
     pub(crate) status: ExternalSendStatus,
+    /// Independently indexer-confirmed conflicting Bitcoin spend; original
+    /// transaction, fascia and consignments remain retained permanently.
+    #[serde(default)]
+    pub(crate) conflict_txid: Option<String>,
 }
 
 /// Stable result of preparing an externally constructed RGB send.
@@ -1921,6 +1926,7 @@ impl Wallet {
                     fascia_json,
                     recipients_digest,
                     status: ExternalSendStatus::Prepared,
+                    conflict_txid: None,
                 }),
                 ..Default::default()
             },
@@ -1954,7 +1960,7 @@ impl Wallet {
             );
         }
         Ok(
-            serde_json::json!({"txid":txid,"status":state.status,"psbt":state.prepared_psbt,"fascia":state.fascia_json,
+            serde_json::json!({"txid":txid,"status":state.status,"conflict_txid":state.conflict_txid,"psbt":state.prepared_psbt,"fascia":state.fascia_json,
             "consignments":artifacts.consignment_bytes,"transfers":transfers}),
         )
     }
@@ -1966,7 +1972,11 @@ impl Wallet {
             .transfer_artifacts
             .get(&txid)
             .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
-        if artifacts.external_send.is_none() {
+        if artifacts
+            .external_send
+            .as_ref()
+            .is_none_or(|s| s.status == ExternalSendStatus::Conflicted)
+        {
             return Err(Error::ExternalSendUnknown { txid });
         }
         for (id, info) in &artifacts.asset_infos {
@@ -2042,6 +2052,9 @@ impl Wallet {
             .batch_transfer_by_txid(&txid)?
             .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
 
+        if artifact.status == ExternalSendStatus::Conflicted {
+            return Err(Error::ExternalSendConflict { txid });
+        }
         // Idempotent: already finalized -> return safely without consuming again.
         if artifact.status == ExternalSendStatus::Finalized {
             self.flush().await?;
@@ -2117,6 +2130,93 @@ impl Wallet {
         Ok(OperationResult {
             txid,
             batch_transfer_idx,
+        })
+    }
+
+    /// REGTEST-only recovery after a different independently confirmed Bitcoin
+    /// transaction makes this unconsumed external proposal impossible. No timeout,
+    /// missing ACK, caller assertion or unconfirmed conflict can release RGB state.
+    /// Only DB reservations are retired; Stock was never consumed in Prepared.
+    pub async fn reconcile_external_rgb_conflict(
+        &mut self,
+        txid: String,
+        conflicting: &BdkTransaction,
+    ) -> Result<OperationResult, Error> {
+        if self.bitcoin_network() != BitcoinNetwork::Regtest || self.online_data.is_none() {
+            return Err(Error::InvalidConsignment);
+        }
+        let genesis =
+            bitcoin::blockdata::constants::genesis_block(BdkNetwork::from(self.bitcoin_network()))
+                .block_hash()
+                .to_string();
+        if self.indexer().block_hash(0).await? != genesis {
+            return Err(Error::InvalidConsignment);
+        }
+        let artifact = self
+            .transfer_artifacts
+            .get(&txid)
+            .and_then(|a| a.external_send.clone())
+            .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
+        let conflict_id = conflicting.compute_txid().to_string();
+        let original = Psbt::from_str(&artifact.prepared_psbt).map_err(InternalError::from)?;
+        if !distinct_input_conflict(&original.unsigned_tx, conflicting) {
+            return Err(Error::ExternalSendConflict { txid });
+        }
+        if self
+            .indexer()
+            .get_tx_confirmations(&conflict_id)
+            .await?
+            .unwrap_or(0)
+            < 1
+        {
+            return Err(Error::ExternalSendTxNotObserved { txid: conflict_id });
+        }
+        let (observed, height, _) = self
+            .indexer()
+            .get_tx_with_status(&conflicting.compute_txid())
+            .await?
+            .ok_or_else(|| Error::ExternalSendTxNotObserved {
+                txid: conflict_id.clone(),
+            })?;
+        if height.unwrap_or(0) == 0
+            || bitcoin::consensus::serialize(&observed)
+                != bitcoin::consensus::serialize(conflicting)
+        {
+            return Err(Error::ExternalSendConflict { txid });
+        }
+        let existing = self
+            .batch_transfer_by_txid(&txid)?
+            .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
+        if artifact.status == ExternalSendStatus::Conflicted {
+            if artifact.conflict_txid.as_deref() != Some(&conflict_id) || !existing.status.failed()
+            {
+                return Err(Error::ExternalSendConflict { txid });
+            }
+            self.flush().await?;
+            return Ok(OperationResult {
+                txid,
+                batch_transfer_idx: existing.idx,
+            });
+        }
+        if artifact.status != ExternalSendStatus::Prepared
+            || existing.status != TransferStatus::Initiated
+        {
+            return Err(Error::ExternalSendConflict { txid });
+        }
+        let mut updated: DbBatchTransferActMod = existing.into();
+        updated.status = ActiveValue::Set(TransferStatus::Failed);
+        let idx = self.database.update_batch_transfer(&mut updated)?.idx;
+        let value = self
+            .transfer_artifacts
+            .get_mut(&txid)
+            .and_then(|a| a.external_send.as_mut())
+            .ok_or(Error::InvalidConsignment)?;
+        value.status = ExternalSendStatus::Conflicted;
+        value.conflict_txid = Some(conflict_id);
+        self.flush().await?;
+        Ok(OperationResult {
+            txid,
+            batch_transfer_idx: idx,
         })
     }
 
@@ -4591,5 +4691,47 @@ impl Wallet {
 
         info!(self.logger, "List unspents vanilla completed");
         Ok(res)
+    }
+}
+
+/// A different txid spending an original input. A changed witness of the same
+/// transaction is not a cancellation, and an unrelated spend proves nothing.
+fn distinct_input_conflict(original: &BdkTransaction, conflicting: &BdkTransaction) -> bool {
+    original.compute_txid() != conflicting.compute_txid()
+        && original.input.iter().any(|old| {
+            conflicting
+                .input
+                .iter()
+                .any(|new| new.previous_output == old.previous_output)
+        })
+}
+#[cfg(test)]
+mod external_conflict_identity_tests {
+    use super::*;
+    #[test]
+    fn requires_a_distinct_competing_transaction_not_an_unrelated_or_witness_variant() {
+        let tx = BdkTransaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        assert!(!distinct_input_conflict(&tx, &tx));
+        let mut witness = tx.clone();
+        witness.input[0].witness = bitcoin::Witness::from_slice(&[vec![0; 64]]);
+        assert!(!distinct_input_conflict(&tx, &witness));
+        let mut competing = tx.clone();
+        competing.output[0].value = bitcoin::Amount::from_sat(900);
+        assert!(distinct_input_conflict(&tx, &competing));
+        competing.input[0].previous_output.vout = 1;
+        assert!(!distinct_input_conflict(&tx, &competing));
     }
 }
