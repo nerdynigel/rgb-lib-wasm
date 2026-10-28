@@ -205,6 +205,10 @@ pub(crate) enum ExternalSendStatus {
 /// Immutable, reload-safe data for one externally constructed RGB send.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct ExternalSendArtifact {
+    /// Exact colored PSBT, retained before acknowledging preparation. Never
+    /// re-color or guess replacement bytes after a lost acknowledgement.
+    #[serde(default)]
+    pub(crate) prepared_psbt: String,
     /// Canonical serialisation of the exact prepared transaction (hex). Used for
     /// exact equality on finalise, not merely the txid.
     pub(crate) expected_tx_hex: String,
@@ -1912,6 +1916,7 @@ impl Wallet {
                 asset_infos: transfers,
                 consignment_bytes,
                 external_send: Some(ExternalSendArtifact {
+                    prepared_psbt: psbt.to_string(),
                     expected_tx_hex,
                     fascia_json,
                     recipients_digest,
@@ -1948,8 +1953,10 @@ impl Wallet {
                 serde_json::to_value(transfer).map_err(InternalError::from)?,
             );
         }
-        Ok(serde_json::json!({"txid":txid,"status":state.status,
-            "consignments":artifacts.consignment_bytes,"transfers":transfers}))
+        Ok(
+            serde_json::json!({"txid":txid,"status":state.status,"psbt":state.prepared_psbt,"fascia":state.fascia_json,
+            "consignments":artifacts.consignment_bytes,"transfers":transfers}),
+        )
     }
 
     /// Explicit delivery of the persisted standard consignment. A transport

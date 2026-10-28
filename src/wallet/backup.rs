@@ -376,6 +376,7 @@ mod tests {
         let artifacts = TransferArtifacts {
             consignment_bytes: std::collections::HashMap::from([("asset".into(), vec![1, 2, 3])]),
             external_send: Some(ExternalSendArtifact {
+                prepared_psbt: "exact-colored-psbt".into(),
                 expected_tx_hex: "010203".into(),
                 fascia_json: "{}".into(),
                 recipients_digest: "bound-recipients".into(),
