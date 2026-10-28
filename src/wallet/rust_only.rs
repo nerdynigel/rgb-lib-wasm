@@ -55,6 +55,135 @@ pub struct ValidateConsignmentResult {
 }
 
 impl Wallet {
+    /// Standard contract export: genesis/schema metadata, no wallet keys or
+    /// invented asset identity. This grants no ownership or spending authority.
+    pub fn export_nia_contract(&self, asset_id: String) -> Result<Vec<u8>, Error> {
+        let id = ContractId::from_str(&asset_id).map_err(|_| Error::InvalidAssignment)?;
+        let runtime = self.rgb_runtime()?;
+        if AssetSchema::get_from_contract_id(id, &runtime)? != AssetSchema::Nia {
+            return Err(Error::InvalidAssignment);
+        }
+        let contract = runtime.export_contract(id)?;
+        let mut bytes = Vec::new();
+        contract.save(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Validate/import standard NIA genesis metadata into the actual engine.
+    /// No allocations are credited; balances still require owned DB outpoints.
+    pub async fn import_nia_contract(
+        &mut self,
+        bytes: &[u8],
+        expected: String,
+        precision: u8,
+    ) -> Result<(), Error> {
+        if bytes.len() > 2_097_152 {
+            return Err(Error::InvalidConsignment);
+        }
+        let contract = rgbstd::containers::Contract::load(bytes).map_err(InternalError::from)?;
+        if contract.contract_id().to_string() != expected
+            || AssetSchema::try_from(contract.schema_id())? != AssetSchema::Nia
+        {
+            return Err(Error::InvalidConsignment);
+        }
+        let config = ValidationConfig {
+            chain_net: self.chain_net(),
+            trusted_typesystem: AssetSchema::Nia.types(),
+            ..Default::default()
+        };
+        let valid = contract
+            .validate(&DumbResolver, &config)
+            .map_err(|_| Error::InvalidConsignment)?;
+        let nia = NiaWrapper::with(valid.contract_data());
+        let spec = nia.spec();
+        let actual_precision: u8 = spec.precision.into();
+        if precision != actual_precision || nia.contract_terms().media.is_some() {
+            return Err(Error::InvalidConsignment);
+        }
+        if let Ok(existing) = self.database.check_asset_exists(expected.clone()) {
+            let id = ContractId::from_str(&expected).map_err(|_| Error::InvalidConsignment)?;
+            if !self.rgb_contract_ids()?.contains(&id)
+                || existing.schema != AssetSchema::Nia
+                || existing.precision != precision
+            {
+                return Err(Error::InvalidConsignment);
+            }
+            return self.flush().await;
+        }
+        let data = LocalAssetData {
+            name: spec.name().to_string(),
+            ticker: Some(spec.ticker().to_string()),
+            precision,
+            details: spec.details().map(|v| v.to_string()),
+            media_idx: None,
+            initial_supply: nia.total_issued_supply().into(),
+            max_supply: None,
+            known_circulating_supply: None,
+            reject_list_url: None,
+        };
+        let timestamp = valid.genesis.timestamp;
+        let mut runtime = self.rgb_runtime()?;
+        runtime.import_contract(valid, &DumbResolver)?;
+        drop(runtime);
+        self.add_asset_to_db(expected, &AssetSchema::Nia, None, timestamp, data)?;
+        self.flush().await
+    }
+
+    /// Standard RGB validation plus exact terminal transition facts. Ancestors
+    /// are validated normally; they are never mistaken for the current fill.
+    pub fn inspect_external_transfer(
+        &self,
+        bytes: &[u8],
+        txid: String,
+        expected: String,
+    ) -> Result<serde_json::Value, Error> {
+        use bitcoin::hashes::{Hash as _, sha256};
+        if bytes.len() > 2_097_152 {
+            return Err(Error::InvalidConsignment);
+        }
+        let validation = validate_consignment_offchain(bytes, &txid, self.bitcoin_network())?;
+        if !validation.valid {
+            return Err(Error::InvalidConsignment);
+        }
+        let transfer = RgbTransfer::load(bytes).map_err(InternalError::from)?;
+        if transfer.contract_id().to_string() != expected
+            || AssetSchema::try_from(transfer.schema_id())? != AssetSchema::Nia
+        {
+            return Err(Error::InvalidConsignment);
+        }
+        let mut found = Vec::new();
+        for bundle in &transfer.bundles {
+            if bundle.pub_witness.txid().to_string() != txid {
+                continue;
+            }
+            for known in &bundle.bundle.known_transitions {
+                if known.transition.contract_id.to_string() != expected {
+                    continue;
+                }
+                let mut allocations = BTreeMap::new();
+                for typed in known.transition.assignments.values() {
+                    for assignment in typed.as_fungible() {
+                        let (seal, state) =
+                            assignment.as_revealed().ok_or(Error::InvalidAssignment)?;
+                        if allocations
+                            .insert(seal.vout.into_u32().to_string(), state.as_u64().to_string())
+                            .is_some()
+                        {
+                            return Err(Error::InvalidAssignment);
+                        }
+                    }
+                }
+                found.push(serde_json::json!({"contract_id":expected,"txid":txid,
+                    "transition_id":known.opid.to_string(),"bundle_id":bundle.bundle.bundle_id().to_string(),
+                    "consignment_digest":<sha256::Hash as bitcoin::hashes::Hash>::hash(bytes).to_string(),"allocations":allocations,"valid":true}));
+            }
+        }
+        if found.len() != 1 {
+            return Err(Error::InvalidConsignment);
+        }
+        Ok(found.remove(0))
+    }
+
     /// Return all contract IDs currently held in the RGB stock.
     pub fn rgb_contract_ids(&self) -> Result<Vec<ContractId>, Error> {
         let runtime = self.rgb_runtime()?;
