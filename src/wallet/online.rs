@@ -1192,7 +1192,7 @@ impl Wallet {
                 && !(u
                     .rgb_allocations
                     .iter()
-                    .any(|a| !a.incoming && a.status.waiting_counterparty()))
+                    .any(|a| !a.incoming && a.status.pending()))
                 && !u.utxo.pending_witness
                 && u.pending_blinded == 0
                 && u.utxo.exists
@@ -1500,6 +1500,7 @@ impl Wallet {
     ///
     /// Identical retries are idempotent; a conflicting operation for the same
     /// transaction id is rejected without altering the original.
+    #[allow(clippy::arc_with_non_send_sync)] // wasm32 is single-threaded; matches the wallet DB owner
     pub async fn prepare_external_rgb_send(
         &mut self,
         recipient_map: HashMap<String, Vec<Recipient>>,
@@ -1550,7 +1551,9 @@ impl Wallet {
                         && art.recipients_digest == recipients_digest
                 })
                 .unwrap_or(false);
-            if same && !existing.status.failed() {
+            if same && !existing.status.failed() && existing.min_confirmations == min_confirmations
+            {
+                self.flush().await?;
                 return Ok(ExternalSendPrepareResult {
                     txid,
                     batch_transfer_idx: existing.idx,
@@ -1566,9 +1569,35 @@ impl Wallet {
             .iter()
             .map(|i| i.previous_output)
             .collect();
+        let data = self.database.get_db_data(false)?;
+        let utxos = self.database.get_unspent_txos(data.txos.clone())?;
+        let available = self.database.get_rgb_allocations(
+            utxos,
+            Some(data.colorings),
+            Some(data.batch_transfers),
+            Some(data.asset_transfers),
+            Some(data.transfers),
+        )?;
+        for unspent in &available {
+            if input_outpoints.iter().any(|outpoint| {
+                unspent.utxo.outpoint().txid == outpoint.txid.to_string()
+                    && unspent.utxo.outpoint().vout == outpoint.vout
+            }) && unspent.rgb_allocations.iter().any(|a| a.status.pending())
+            {
+                return Err(Error::ExternalSendConflict { txid });
+            }
+        }
 
         let mut transfers: BTreeMap<String, InfoAssetTransfer> = BTreeMap::new();
         let mut btc_change: Option<BtcChange> = None;
+        let mut consignment_bytes = HashMap::new();
+
+        // This deliberately narrow external-send profile supports one NIA
+        // transfer. Additional bundles/hidden transitions must not escape the
+        // recipient and input accounting below.
+        if recipient_map.len() != 1 || fascia.bundles().len() != 1 {
+            return Err(Error::InvalidRecipientMap);
+        }
 
         for (asset_id, recipients) in &recipient_map {
             if recipients.is_empty() {
@@ -1582,6 +1611,11 @@ impl Wallet {
                     asset_id: asset_id.clone(),
                 }
             })?;
+            if bundle.known_transitions.len() != 1
+                || self.database.check_asset_exists(asset_id.clone())?.schema != AssetSchema::Nia
+            {
+                return Err(Error::InvalidRecipientMap);
+            }
             let transition = bundle
                 .known_transitions
                 .iter()
@@ -1591,6 +1625,7 @@ impl Wallet {
                     asset_id: asset_id.clone(),
                 })?;
             let consumed_opouts: HashSet<Opout> = transition.inputs().iter().copied().collect();
+            let mut owned_opouts = HashSet::new();
 
             let mut assignments_spent: TxoAssignments = HashMap::new();
             let mut txo_map: HashMap<i32, Outpoint> = HashMap::new();
@@ -1606,6 +1641,16 @@ impl Wallet {
                 };
                 for (opout, state) in opout_state_map {
                     if consumed_opouts.contains(&opout) {
+                        owned_opouts.insert(opout);
+                        if !matches!(state, AllocatedState::Amount(_)) || opout.ty != OS_ASSET {
+                            return Err(Error::InvalidAssignment);
+                        }
+                        if let AllocatedState::Amount(amount) = &state {
+                            consumed
+                                .fungible
+                                .checked_add(amount.as_u64())
+                                .ok_or(Error::InvalidAssignment)?;
+                        }
                         consumed.add_opout_state(&opout, &state);
                         let txo_idx = self
                             .database
@@ -1623,7 +1668,7 @@ impl Wallet {
                 }
             }
             drop(runtime);
-            if assignments_spent.is_empty() {
+            if assignments_spent.is_empty() || owned_opouts != consumed_opouts {
                 return Err(Error::ExternalSendRecipientMismatch {
                     asset_id: asset_id.clone(),
                 });
@@ -1687,6 +1732,9 @@ impl Wallet {
                     .ok_or_else(|| Error::ExternalSendAmountMismatch {
                         asset_id: asset_id.clone(),
                     })?;
+                if matched.iter().any(|(v, _)| *v == vout) {
+                    return Err(Error::InvalidRecipientMap);
+                }
 
                 let mut transport_endpoints: Vec<LocalTransportEndpoint> = vec![];
                 let mut found_valid = false;
@@ -1713,7 +1761,10 @@ impl Wallet {
                     });
                 }
 
-                recipient.assignment.add_to_assignments(&mut needed);
+                needed.fungible = needed
+                    .fungible
+                    .checked_add(amount)
+                    .ok_or(Error::InvalidAssignment)?;
                 matched.push((vout, amount));
                 local_recipients.push(LocalRecipient {
                     recipient_id: recipient.recipient_id.clone(),
@@ -1731,6 +1782,16 @@ impl Wallet {
                 return Err(Error::ExternalSendAmountMismatch {
                     asset_id: asset_id.clone(),
                 });
+            }
+            let total = revealed_outputs
+                .iter()
+                .try_fold(0u64, |sum, (_, value, _)| {
+                    sum.checked_add(*value).ok_or(Error::InvalidAssignment)
+                })?;
+            if total != consumed.fungible
+                || revealed_outputs.len() != recipients.len() + usize::from(total > needed.fungible)
+            {
+                return Err(Error::InvalidAssignment);
             }
             let change = consumed.change(&needed);
 
@@ -1779,6 +1840,32 @@ impl Wallet {
             };
 
             let asset = self.database.check_asset_exists(asset_id.clone())?;
+            // Preserve the actual standard consignment before any DB mutation.
+            // No runtime-only recipe is needed after a crash or export/import.
+            let beneficiaries = revealed_outputs
+                .iter()
+                .map(|(vout, _, blinding)| {
+                    BuilderSeal::Revealed(GraphSeal::with_blinded_vout(*vout, *blinding))
+                })
+                .collect();
+            let built = self.create_transfers_from_fascia(
+                fascia,
+                &BTreeMap::from([(contract_id, beneficiaries)]),
+            )?;
+            let mut bytes = Vec::new();
+            built
+                .first()
+                .ok_or(Error::InvalidAssignment)?
+                .save(&mut bytes)?;
+            let validation = super::rust_only::validate_consignment_offchain(
+                &bytes,
+                &txid,
+                self.bitcoin_network(),
+            )?;
+            if !validation.valid {
+                return Err(Error::InvalidAssignment);
+            }
+            consignment_bytes.insert(asset_id.clone(), bytes);
             transfers.insert(
                 asset_id.clone(),
                 InfoAssetTransfer {
@@ -1801,7 +1888,8 @@ impl Wallet {
             );
         }
 
-        let batch_transfer_idx = self._save_transfers(
+        let before_db = self.database.as_ref().clone();
+        let saved = self._save_transfers(
             txid.clone(),
             &transfers,
             HashMap::new(),
@@ -1809,11 +1897,20 @@ impl Wallet {
             btc_change,
             TransferStatus::Initiated,
             min_confirmations,
-        )?;
+        );
+        let batch_transfer_idx = match saved {
+            Ok(idx) => idx,
+            Err(error) => {
+                self.database = Arc::new(before_db);
+                return Err(error);
+            }
+        };
 
         self.transfer_artifacts.insert(
             txid.clone(),
             TransferArtifacts {
+                asset_infos: transfers,
+                consignment_bytes,
                 external_send: Some(ExternalSendArtifact {
                     expected_tx_hex,
                     fascia_json,
@@ -1830,6 +1927,66 @@ impl Wallet {
             txid,
             batch_transfer_idx,
         })
+    }
+
+    /// Read the exact durable external-send artifacts. Public transaction and
+    /// standard RGB evidence only; no key material or synthetic balances.
+    pub fn external_rgb_send_data(&self, txid: String) -> Result<serde_json::Value, Error> {
+        let artifacts = self
+            .transfer_artifacts
+            .get(&txid)
+            .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
+        let state = artifacts
+            .external_send
+            .as_ref()
+            .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
+        let mut transfers = BTreeMap::new();
+        for (id, bytes) in &artifacts.consignment_bytes {
+            let transfer = RgbTransfer::load(&bytes[..]).map_err(InternalError::from)?;
+            transfers.insert(
+                id.clone(),
+                serde_json::to_value(transfer).map_err(InternalError::from)?,
+            );
+        }
+        Ok(serde_json::json!({"txid":txid,"status":state.status,
+            "consignments":artifacts.consignment_bytes,"transfers":transfers}))
+    }
+
+    /// Explicit delivery of the persisted standard consignment. A transport
+    /// failure is returned; it never signs, broadcasts or changes balances.
+    pub async fn post_external_rgb_consignments(&self, txid: String) -> Result<(), Error> {
+        let artifacts = self
+            .transfer_artifacts
+            .get(&txid)
+            .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
+        if artifacts.external_send.is_none() {
+            return Err(Error::ExternalSendUnknown { txid });
+        }
+        for (id, info) in &artifacts.asset_infos {
+            let bytes = artifacts
+                .consignment_bytes
+                .get(id)
+                .ok_or(Error::InvalidAssignment)?;
+            for recipient in &info.recipients {
+                let LocalRecipientData::Witness(witness) = &recipient.local_recipient_data else {
+                    return Err(Error::InvalidRecipientMap);
+                };
+                let endpoint = recipient
+                    .transport_endpoints
+                    .iter()
+                    .find(|e| e.usable)
+                    .ok_or(Error::InvalidRecipientMap)?;
+                self.post_consignment(
+                    &endpoint.endpoint,
+                    recipient.recipient_id.clone(),
+                    bytes,
+                    txid.clone(),
+                    Some(witness.vout),
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     fn tx_stripped_hex_from_unsigned(tx: &bitcoin::Transaction) -> String {
@@ -1880,6 +2037,7 @@ impl Wallet {
 
         // Idempotent: already finalized -> return safely without consuming again.
         if artifact.status == ExternalSendStatus::Finalized {
+            self.flush().await?;
             return Ok(OperationResult {
                 txid,
                 batch_transfer_idx: existing.idx,
@@ -1904,6 +2062,17 @@ impl Wallet {
         }
         if self.indexer().get_tx_confirmations(&txid).await?.is_none() {
             return Err(Error::ExternalSendTxNotObserved { txid });
+        }
+        let (observed, _, _) = self
+            .indexer()
+            .get_tx_with_status(&tx.compute_txid())
+            .await?
+            .ok_or_else(|| Error::ExternalSendTxNotObserved { txid: txid.clone() })?;
+        if bitcoin::consensus::serialize(&observed) != bitcoin::consensus::serialize(tx) {
+            return Err(Error::ExternalSendTxMismatch {
+                expected: s!("exact indexer-observed transaction"),
+                got: s!("different witness bytes"),
+            });
         }
 
         // Record the externally broadcast transaction locally (no rebroadcast).

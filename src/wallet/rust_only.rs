@@ -121,29 +121,33 @@ impl Wallet {
             let mut asset_transition_builder =
                 runtime.transition_builder(contract_id, "transfer")?;
 
-            let mut asset_available_amt = 0;
+            let mut asset_available_amt = 0u64;
             for (_, opout_state_map) in
                 runtime.contract_assignments_for(contract_id, prev_outputs.iter().copied())?
             {
                 for (opout, state) in opout_state_map {
                     if let AllocatedState::Amount(amt) = &state {
-                        asset_available_amt += amt.as_u64();
+                        asset_available_amt = asset_available_amt
+                            .checked_add(amt.as_u64())
+                            .ok_or(Error::InvalidAssignment)?;
                     }
                     asset_transition_builder = asset_transition_builder.add_input(opout, state)?;
                 }
             }
 
             let mut beneficiaries = vec![];
-            let mut sending_amt = 0;
+            let mut sending_amt = 0u64;
             for (mut vout, amount) in asset_coloring_info.output_map {
                 if amount == 0 {
                     continue;
                 }
                 if opreturn_first {
-                    vout += 1;
+                    vout = vout.checked_add(1).ok_or(Error::InvalidAssignment)?;
                 }
-                sending_amt += amount;
-                if vout as usize > psbt.outputs.len() {
+                sending_amt = sending_amt
+                    .checked_add(amount)
+                    .ok_or(Error::InvalidAssignment)?;
+                if vout as usize >= psbt.outputs.len() {
                     return Err(Error::InvalidColoringInfo {
                         details: s!("invalid vout in output_map, does not exist in the given PSBT"),
                     });

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 use crate::error::InternalError;
 
-pub(crate) const BACKUP_VERSION: u8 = 1;
+pub(crate) const BACKUP_VERSION: u8 = 2;
 /// 24-byte nonce for XChaCha20Poly1305 (single-shot mode).
 const NONCE_LEN: usize = 24;
 
@@ -28,6 +28,10 @@ pub(crate) struct BackupPubData {
 /// The serializable wallet state that gets encrypted.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct WalletBackupPayload {
+    /// Identity binds the encrypted state to the wallet that may restore it.
+    /// Older backups without this field cannot be used for external-L1 recovery.
+    #[serde(default)]
+    pub(crate) wallet_identity: Option<(String, String, String)>,
     pub(crate) db: crate::database::memory_db::InMemoryDb,
     pub(crate) bdk_changeset: Option<bdk_wallet::ChangeSet>,
     /// Strict-encoded MemStash, base64
@@ -39,6 +43,11 @@ pub(crate) struct WalletBackupPayload {
     /// Pinned derivation index per keychain for address reuse.
     #[serde(default)]
     pub(crate) reuse_address_index: std::collections::HashMap<bdk_wallet::KeychainKind, u32>,
+    #[serde(default)]
+    pub(crate) transfer_artifacts:
+        std::collections::HashMap<String, super::online::TransferArtifacts>,
+    #[serde(default)]
+    pub(crate) received_consignments: std::collections::HashMap<String, Vec<u8>>,
 }
 
 /// Derive a 32-byte key from password + salt using Scrypt.
@@ -103,6 +112,9 @@ pub(crate) fn decrypt_payload(
     let key = derive_key(password, &pub_data.salt)?;
     let nonce_bytes =
         hex::decode(&pub_data.nonce).map_err(|e| InternalError::HexError(e.to_string()))?;
+    if nonce_bytes.len() != NONCE_LEN {
+        return Err(Error::InvalidBackup);
+    }
     let nonce = GenericArray::from_slice(&nonce_bytes);
 
     let cipher = XChaCha20Poly1305::new(&key);
@@ -137,8 +149,7 @@ pub(crate) fn decode_backup(data: &[u8]) -> Result<(BackupPubData, &[u8]), Error
     Ok((pub_data, ciphertext))
 }
 
-use rgbstd::persistence::{MemIndex, MemStash, MemState};
-use strict_encoding::{StrictDeserialize, StrictSerialize};
+use strict_encoding::StrictSerialize;
 
 impl super::Wallet {
     /// Create an encrypted backup of the wallet state.
@@ -166,55 +177,39 @@ impl super::Wallet {
         // 3. Deserialize payload
         let payload: WalletBackupPayload =
             serde_json::from_slice(&payload_json).map_err(|_| Error::InvalidBackup)?;
+        self.check_backup_identity(&payload)?;
 
-        // 4. Restore InMemoryDb + BDK via existing snapshot mechanism
+        self.install_backup_payload(payload)?;
+        self.trigger_auto_backup();
+        Ok(())
+    }
+
+    // Decode and validate the entire snapshot in a temporary instance. Invalid
+    // Stock/BDK data must never leave the live wallet half-restored.
+    fn install_backup_payload(&mut self, payload: WalletBackupPayload) -> Result<(), Error> {
+        self.check_backup_identity(&payload)?;
+        // Device recovery is permitted only into an empty engine. Never
+        // overwrite newer financial state or discard unresolved obligations.
+        let current = self.database.get_db_data(false)?;
+        if !current.batch_transfers.is_empty() || !current.txos.is_empty() {
+            return Err(Error::InvalidBackup);
+        }
         let snapshot = super::idb_store::WalletSnapshot {
             sequence: 0,
             db: payload.db,
             bdk_changeset: payload.bdk_changeset,
-            transfer_artifacts: Default::default(),
-            received_consignments: Default::default(),
-            stock_stash_b64: None,
-            stock_state_b64: None,
-            stock_index_b64: None,
+            transfer_artifacts: payload.transfer_artifacts,
+            received_consignments: payload.received_consignments,
+            stock_stash_b64: Some(payload.stock_stash_b64),
+            stock_state_b64: Some(payload.stock_state_b64),
+            stock_index_b64: Some(payload.stock_index_b64),
             reuse_address_index: payload.reuse_address_index,
         };
-        self.restore_from_snapshot(snapshot)?;
-
-        // 5. Restore RGB stock from strict-encoded components
-        let stash_bytes = general_purpose::STANDARD
-            .decode(&payload.stock_stash_b64)
-            .map_err(InternalError::from)?;
-        let state_bytes = general_purpose::STANDARD
-            .decode(&payload.stock_state_b64)
-            .map_err(InternalError::from)?;
-        let index_bytes = general_purpose::STANDARD
-            .decode(&payload.stock_index_b64)
-            .map_err(InternalError::from)?;
-
-        const MAX: usize = u32::MAX as usize;
-        let stash = MemStash::from_strict_serialized::<MAX>(
-            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(stash_bytes)
-                .map_err(|e| InternalError::StockError(e.to_string()))?,
-        )
-        .map_err(|e| InternalError::StockError(e.to_string()))?;
-        let state = MemState::from_strict_serialized::<MAX>(
-            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(state_bytes)
-                .map_err(|e| InternalError::StockError(e.to_string()))?,
-        )
-        .map_err(|e| InternalError::StockError(e.to_string()))?;
-        let index = MemIndex::from_strict_serialized::<MAX>(
-            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(index_bytes)
-                .map_err(|e| InternalError::StockError(e.to_string()))?,
-        )
-        .map_err(|e| InternalError::StockError(e.to_string()))?;
-
-        let stock = rgbstd::persistence::Stock::with(stash, state, index);
-        *self.rgb_stock.borrow_mut() = Some(stock);
-
-        // Persist restored state to IndexedDB so it survives page reloads
-        self.trigger_auto_backup();
-
+        let mut candidate = Self::new(self.wallet_data.clone())?;
+        candidate.restore_from_snapshot(snapshot)?;
+        candidate.idb_sequence = self.idb_sequence.clone();
+        candidate.vss_client = self.vss_client.take();
+        *self = candidate;
         Ok(())
     }
 
@@ -295,54 +290,11 @@ impl super::Wallet {
         let payload_json = client.download_backup().await?;
         let payload: WalletBackupPayload =
             serde_json::from_slice(&payload_json).map_err(|_| Error::InvalidBackup)?;
+        self.check_backup_identity(&payload)?;
 
-        let snapshot = super::idb_store::WalletSnapshot {
-            sequence: 0,
-            db: payload.db,
-            bdk_changeset: payload.bdk_changeset,
-            transfer_artifacts: Default::default(),
-            received_consignments: Default::default(),
-            stock_stash_b64: None,
-            stock_state_b64: None,
-            stock_index_b64: None,
-            reuse_address_index: payload.reuse_address_index,
-        };
-        self.restore_from_snapshot(snapshot)?;
-
-        const MAX: usize = u32::MAX as usize;
-        let stash_bytes = general_purpose::STANDARD
-            .decode(&payload.stock_stash_b64)
-            .map_err(InternalError::from)?;
-        let state_bytes = general_purpose::STANDARD
-            .decode(&payload.stock_state_b64)
-            .map_err(InternalError::from)?;
-        let index_bytes = general_purpose::STANDARD
-            .decode(&payload.stock_index_b64)
-            .map_err(InternalError::from)?;
-
-        let stash = MemStash::from_strict_serialized::<MAX>(
-            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(stash_bytes)
-                .map_err(|e| InternalError::StockError(e.to_string()))?,
-        )
-        .map_err(|e| InternalError::StockError(e.to_string()))?;
-        let state = MemState::from_strict_serialized::<MAX>(
-            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(state_bytes)
-                .map_err(|e| InternalError::StockError(e.to_string()))?,
-        )
-        .map_err(|e| InternalError::StockError(e.to_string()))?;
-        let index = MemIndex::from_strict_serialized::<MAX>(
-            amplify::confinement::Confined::<Vec<u8>, 0, MAX>::try_from(index_bytes)
-                .map_err(|e| InternalError::StockError(e.to_string()))?,
-        )
-        .map_err(|e| InternalError::StockError(e.to_string()))?;
-
-        let stock = rgbstd::persistence::Stock::with(stash, state, index);
-        *self.rgb_stock.borrow_mut() = Some(stock);
-
-        // Persist restored state to IndexedDB so it survives page reloads
-        self.trigger_auto_backup();
-
-        Ok(())
+        self.install_backup_payload(payload)?;
+        // Acknowledgement is conditional on the actual IDB commit.
+        self.flush().await
     }
 
     /// Query VSS backup status.
@@ -384,21 +336,98 @@ impl super::Wallet {
         drop(stock_ref);
 
         let payload = WalletBackupPayload {
+            wallet_identity: Some(self.backup_identity()),
             db: self.database.as_ref().clone(),
             bdk_changeset: self.bdk_database.get_data().clone(),
             stock_stash_b64: general_purpose::STANDARD.encode(stash_bytes.as_unconfined()),
             stock_state_b64: general_purpose::STANDARD.encode(state_bytes.as_unconfined()),
             stock_index_b64: general_purpose::STANDARD.encode(index_bytes.as_unconfined()),
             reuse_address_index: self.reuse_address_index.clone(),
+            transfer_artifacts: self.transfer_artifacts.clone(),
+            received_consignments: self.received_consignments.clone(),
         };
 
         serde_json::to_vec(&payload).map_err(|e| InternalError::from(e).into())
+    }
+
+    fn backup_identity(&self) -> (String, String, String) {
+        (
+            self.wallet_data.bitcoin_network.to_string(),
+            self.wallet_data.account_xpub_vanilla.clone(),
+            self.wallet_data.account_xpub_colored.clone(),
+        )
+    }
+
+    fn check_backup_identity(&self, payload: &WalletBackupPayload) -> Result<(), Error> {
+        if payload.wallet_identity.as_ref() != Some(&self.backup_identity()) {
+            return Err(Error::InvalidBackup);
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_payload_preserves_pending_external_and_received_bytes() {
+        use super::super::online::{ExternalSendArtifact, ExternalSendStatus, TransferArtifacts};
+        let artifacts = TransferArtifacts {
+            consignment_bytes: std::collections::HashMap::from([("asset".into(), vec![1, 2, 3])]),
+            external_send: Some(ExternalSendArtifact {
+                expected_tx_hex: "010203".into(),
+                fascia_json: "{}".into(),
+                recipients_digest: "bound-recipients".into(),
+                status: ExternalSendStatus::BroadcastRecorded,
+            }),
+            ..Default::default()
+        };
+        let payload = WalletBackupPayload {
+            wallet_identity: Some((
+                "regtest".into(),
+                "vanilla-xpub".into(),
+                "colored-xpub".into(),
+            )),
+            db: crate::database::memory_db::InMemoryDb::new(),
+            bdk_changeset: None,
+            stock_stash_b64: "stash".into(),
+            stock_state_b64: "state".into(),
+            stock_index_b64: "index".into(),
+            reuse_address_index: Default::default(),
+            transfer_artifacts: std::collections::HashMap::from([(
+                "transaction".into(),
+                artifacts,
+            )]),
+            received_consignments: std::collections::HashMap::from([(
+                "recipient".into(),
+                vec![4, 5, 6],
+            )]),
+        };
+        let encoded = serde_json::to_vec(&payload).unwrap();
+        let restored: WalletBackupPayload = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored.wallet_identity, payload.wallet_identity);
+        let pending = &restored.transfer_artifacts["transaction"];
+        assert_eq!(
+            pending.external_send.as_ref().unwrap().status,
+            ExternalSendStatus::BroadcastRecorded
+        );
+        assert_eq!(pending.consignment_bytes["asset"], vec![1, 2, 3]);
+        assert_eq!(restored.received_consignments["recipient"], vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn malformed_nonce_is_refused_without_panic() {
+        let pub_data = BackupPubData {
+            salt: "dGVzdHNhbHQ".into(),
+            nonce: "00".into(),
+            version: BACKUP_VERSION,
+        };
+        assert!(matches!(
+            decrypt_payload(b"ciphertext", "test-password", &pub_data),
+            Err(Error::InvalidBackup)
+        ));
+    }
 
     #[test]
     fn encrypt_decrypt_round_trip() {
