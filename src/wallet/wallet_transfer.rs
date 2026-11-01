@@ -175,6 +175,129 @@ fn validate_request(r: &mut WalletRgbSendRequest) -> Result<ValidatedRequest, Er
 }
 
 impl Wallet {
+    /// Immutable native preparation facts from the standard RGB construction,
+    /// independent of later public balance projections or reservation rows.
+    fn wallet_rgb_original_input_units(&self, txid: &str) -> Result<BTreeMap<String, u64>, Error> {
+        let artifacts = self.transfer_artifacts.get(txid).ok_or_else(invalid)?;
+        let external = artifacts.external_send.as_ref().ok_or_else(invalid)?;
+        let binding = external.wallet_transfer.as_ref().ok_or_else(invalid)?;
+        let mut request: WalletRgbSendRequest =
+            serde_json::from_str(&binding.request_json).map_err(|_| invalid())?;
+        validate_request(&mut request)?;
+        if artifacts.asset_infos.len() != 1 {
+            return Err(invalid());
+        }
+        let info = artifacts
+            .asset_infos
+            .get(&request.asset_id)
+            .ok_or_else(invalid)?;
+        let psbt = Psbt::from_str(&external.prepared_psbt)?;
+        let points = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|i| i.previous_output.to_string())
+            .collect::<HashSet<_>>();
+        if points.is_empty()
+            || points.len() > 128
+            || points.len() != psbt.unsigned_tx.input.len()
+            || info.asset_info.contract_id.to_string() != request.asset_id
+            || info.main_transition != TypeOfTransition::Transfer
+            || info.asset_spend.txo_map.is_empty()
+            || info.asset_spend.txo_map.len() > 128
+            || info.asset_spend.txo_map.len() != info.assignments_spent.len()
+            || info.original_assignments_needed
+                != (AssignmentsCollection {
+                    fungible: request.amount,
+                    ..Default::default()
+                })
+        {
+            return Err(invalid());
+        }
+        let mut units = BTreeMap::new();
+        let mut total = 0u64;
+        for (idx, point) in &info.asset_spend.txo_map {
+            let assignments = info.assignments_spent.get(idx).ok_or_else(invalid)?;
+            if assignments.is_empty()
+                || assignments.len() > 4096
+                || !points.contains(&point.to_string())
+            {
+                return Err(invalid());
+            }
+            let mut amount = 0u64;
+            for assignment in assignments {
+                let Assignment::Fungible(value) = assignment else {
+                    return Err(invalid());
+                };
+                if *value == 0 {
+                    return Err(invalid());
+                }
+                amount = amount.checked_add(*value).ok_or_else(invalid)?;
+            }
+            total = total.checked_add(amount).ok_or_else(invalid)?;
+            if units.insert(point.to_string(), amount).is_some() {
+                return Err(invalid());
+            }
+        }
+        if info.asset_spend.assignments_collected
+            != (AssignmentsCollection {
+                fungible: total,
+                ..Default::default()
+            })
+            || total < request.amount
+        {
+            return Err(invalid());
+        }
+        Ok(units)
+    }
+
+    /// Stock is unchanged by prepare/sign. Refuse if any original RGB state was
+    /// consumed, changed or supplemented on these inputs before authorization.
+    /// This also protects against burning another contract received meanwhile.
+    fn assert_wallet_rgb_stock_inputs(&self, txid: &str, psbt: &Psbt) -> Result<(), Error> {
+        let expected = self.wallet_rgb_original_input_units(txid)?;
+        let artifacts = &self.transfer_artifacts[txid];
+        let asset = artifacts.asset_infos.keys().next().ok_or_else(invalid)?;
+        let runtime = self.rgb_runtime()?;
+        let contracts = runtime
+            .contracts()?
+            .into_iter()
+            .take(4097)
+            .map(|c| c.id)
+            .collect::<Vec<_>>();
+        if contracts.len() > 4096 {
+            return Err(invalid());
+        }
+        let points = psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|i| i.previous_output)
+            .collect::<Vec<_>>();
+        let mut actual = BTreeMap::<String, u64>::new();
+        for contract in contracts {
+            for (seal, states) in
+                runtime.contract_assignments_for(contract, points.iter().copied())?
+            {
+                let point = seal.to_outpoint().to_string();
+                for (opout, state) in states {
+                    if contract.to_string() != *asset || opout.ty != OS_ASSET {
+                        return Err(invalid());
+                    }
+                    let AllocatedState::Amount(amount) = state else {
+                        return Err(invalid());
+                    };
+                    let total = actual.entry(point.clone()).or_default();
+                    *total = total.checked_add(amount.as_u64()).ok_or_else(invalid)?;
+                }
+            }
+        }
+        if actual != expected {
+            return Err(Error::ExternalSendConflict { txid: txid.into() });
+        }
+        Ok(())
+    }
+
     /// All managed native originals reserve their own RGB and fee inputs. The
     /// caller's separate journal exclusions supplement this native protection.
     fn managed_rgb_input_holds(&self, except: Option<&str>) -> Result<HashSet<OutPoint>, Error> {
@@ -374,6 +497,7 @@ impl Wallet {
             &expected_psbt,
             u64::try_from(now().unix_timestamp()).map_err(|_| invalid())?,
         )?;
+        self.assert_wallet_rgb_stock_inputs(&txid, &psbt)?;
         self.transfer_artifacts
             .get_mut(&txid)
             .unwrap()
@@ -390,6 +514,7 @@ impl Wallet {
         if expires_at <= u64::try_from(now().unix_timestamp()).map_err(|_| invalid())? {
             return Err(Error::ExternalSendConflict { txid });
         }
+        self.assert_wallet_rgb_stock_inputs(&txid, &psbt)?;
         let signing_result = self._sign_psbt(&mut psbt, None);
         // Even an errored/partial signing attempt can have produced signatures.
         // Preserve those original bytes before any fallible finalization or
@@ -484,6 +609,7 @@ impl Wallet {
         {
             return self.observe_wallet_rgb_send(online, operation_id).await;
         }
+        self.assert_wallet_rgb_stock_inputs(&txid, &Psbt::from_str(&expected_signed_psbt)?)?;
         self.post_pending_consignments_inner(txid.clone()).await?;
         self.flush().await?;
         let (_, tx, expires_at) = self.wallet_rgb_broadcast_preflight(
@@ -505,6 +631,7 @@ impl Wallet {
         if expires_at <= u64::try_from(now().unix_timestamp()).map_err(|_| invalid())? {
             return Err(Error::ExternalSendConflict { txid });
         }
+        self.assert_wallet_rgb_stock_inputs(&txid, &Psbt::from_str(&expected_signed_psbt)?)?;
         // Deliberately use the existing indexer's single broadcast primitive,
         // without the generic send's retry/txid-only acknowledgement fallback.
         self.indexer()
@@ -989,7 +1116,43 @@ mod tests {
     }
     fn artifact(psbt: &Psbt) -> TransferArtifacts {
         let mut req = request();
+        let point = psbt
+            .unsigned_tx
+            .input
+            .first()
+            .map(|i| i.previous_output)
+            .unwrap_or_else(OutPoint::null);
+        let units = AssignmentsCollection {
+            fungible: req.amount,
+            ..Default::default()
+        };
         TransferArtifacts {
+            asset_infos: BTreeMap::from([(
+                req.asset_id.clone(),
+                InfoAssetTransfer {
+                    asset_info: AssetInfo {
+                        contract_id: ContractId::from_str(&req.asset_id).unwrap(),
+                        reject_list_url: None,
+                    },
+                    recipients: vec![],
+                    asset_spend: AssetSpend {
+                        txo_map: HashMap::from([(
+                            1,
+                            Outpoint {
+                                txid: point.txid.to_string(),
+                                vout: point.vout,
+                            },
+                        )]),
+                        assignments_collected: units.clone(),
+                        input_btc_amt: 0,
+                    },
+                    change: AssignmentsCollection::default(),
+                    original_assignments_needed: units.clone(),
+                    assignments_needed: units,
+                    assignments_spent: HashMap::from([(1, vec![Assignment::Fungible(req.amount)])]),
+                    main_transition: TypeOfTransition::Transfer,
+                },
+            )]),
             external_send: Some(ExternalSendArtifact {
                 prepared_psbt: psbt.to_string(),
                 expected_tx_hex: Wallet::tx_stripped_hex_from_unsigned(&psbt.unsigned_tx),
@@ -1212,7 +1375,7 @@ mod tests {
     #[test]
     fn generic_signing_refuses_managed_original_without_changing_its_records() {
         let mut wallet = empty_wallet();
-        let psbt = unsigned();
+        let psbt = staged_psbt();
         let txid = psbt.unsigned_tx.compute_txid().to_string();
         wallet
             .transfer_artifacts
@@ -1241,6 +1404,75 @@ mod tests {
         assert_eq!(data["batch_transfer_idx"], batch);
         assert!(data.get("transfers").is_none());
         assert_eq!(data["wallet_transfer"]["signing_attempted"], false);
+    }
+    #[test]
+    fn original_rgb_input_facts_preserve_exact_units_and_refuse_corrupt_reservations() {
+        let mut wallet = empty_wallet();
+        let psbt = staged_psbt();
+        retain(&mut wallet, &psbt, TransferStatus::Initiated);
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        let point = psbt.unsigned_tx.input[0].previous_output.to_string();
+        assert_eq!(
+            wallet.wallet_rgb_original_input_units(&txid).unwrap()[&point],
+            3
+        );
+        // No corresponding actual Stock state: the real pre-sign guard refuses.
+        // This is a synthetic input-fact fixture, never a funded RGB consignment.
+        assert!(wallet.assert_wallet_rgb_stock_inputs(&txid, &psbt).is_err());
+        let retained = wallet.transfer_artifacts[&txid].clone();
+        let info = wallet
+            .transfer_artifacts
+            .get_mut(&txid)
+            .unwrap()
+            .asset_infos
+            .get_mut(&request().asset_id)
+            .unwrap();
+        info.assignments_spent
+            .insert(1, vec![Assignment::Fungible(u64::MAX)]);
+        info.asset_spend.assignments_collected.fungible = u64::MAX;
+        assert_eq!(
+            wallet.wallet_rgb_original_input_units(&txid).unwrap()[&point],
+            u64::MAX
+        );
+        let info = wallet
+            .transfer_artifacts
+            .get_mut(&txid)
+            .unwrap()
+            .asset_infos
+            .get_mut(&request().asset_id)
+            .unwrap();
+        info.assignments_spent
+            .get_mut(&1)
+            .unwrap()
+            .push(Assignment::Fungible(1));
+        assert!(wallet.wallet_rgb_original_input_units(&txid).is_err());
+        wallet
+            .transfer_artifacts
+            .insert(txid.clone(), retained.clone());
+        wallet
+            .transfer_artifacts
+            .get_mut(&txid)
+            .unwrap()
+            .asset_infos
+            .get_mut(&request().asset_id)
+            .unwrap()
+            .assignments_spent
+            .clear();
+        assert!(wallet.wallet_rgb_original_input_units(&txid).is_err());
+        wallet.transfer_artifacts.insert(txid.clone(), retained);
+        wallet
+            .transfer_artifacts
+            .get_mut(&txid)
+            .unwrap()
+            .asset_infos
+            .get_mut(&request().asset_id)
+            .unwrap()
+            .asset_spend
+            .txo_map
+            .get_mut(&1)
+            .unwrap()
+            .vout = 2;
+        assert!(wallet.wallet_rgb_original_input_units(&txid).is_err());
     }
     #[test]
     fn dedicated_signing_binds_original_and_refuses_attempt_restore_or_expiry_without_mutation() {
