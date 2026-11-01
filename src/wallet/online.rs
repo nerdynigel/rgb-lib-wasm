@@ -489,6 +489,21 @@ impl TryFrom<TransferStatus> for RefreshTransferStatus {
     }
 }
 
+/// Initiated external proposals are pending reservations, but are not eligible
+/// for normal ACK/confirmation refresh. Only explicit finalization or verified
+/// conflict reconciliation may advance them. A filtered background read must
+/// neither panic nor turn a prepared proposal into an outgoing send.
+fn refresh_filter_matches(
+    status: TransferStatus,
+    incoming: bool,
+    filter: &[RefreshFilter],
+) -> bool {
+    let Ok(status) = RefreshTransferStatus::try_from(status) else {
+        return false;
+    };
+    filter.is_empty() || filter.contains(&RefreshFilter { status, incoming })
+}
+
 impl Wallet {
     pub(crate) fn indexer(&self) -> &Indexer {
         &self.online_data.as_ref().unwrap().indexer
@@ -3579,14 +3594,8 @@ impl Wallet {
     ) -> Result<Option<DbBatchTransfer>, Error> {
         debug!(self.logger, "Refreshing transfer: {:?}", transfer);
         let incoming = transfer.incoming(&db_data.asset_transfers, &db_data.transfers)?;
-        if !filter.is_empty() {
-            let requested = RefreshFilter {
-                status: RefreshTransferStatus::try_from(transfer.status).expect("pending status"),
-                incoming,
-            };
-            if !filter.contains(&requested) {
-                return Ok(None);
-            }
+        if !refresh_filter_matches(transfer.status, incoming, filter) {
+            return Ok(None);
         }
         match transfer.status {
             TransferStatus::WaitingCounterparty => {
@@ -4733,5 +4742,63 @@ mod external_conflict_identity_tests {
         assert!(distinct_input_conflict(&tx, &competing));
         competing.input[0].previous_output.vout = 1;
         assert!(!distinct_input_conflict(&tx, &competing));
+    }
+}
+
+#[cfg(test)]
+mod refresh_filter_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_and_terminal_states_never_enter_normal_refresh() {
+        let incoming = vec![
+            RefreshFilter {
+                status: RefreshTransferStatus::WaitingCounterparty,
+                incoming: true,
+            },
+            RefreshFilter {
+                status: RefreshTransferStatus::WaitingConfirmations,
+                incoming: true,
+            },
+        ];
+        let outgoing = vec![RefreshFilter {
+            status: RefreshTransferStatus::WaitingCounterparty,
+            incoming: false,
+        }];
+        for status in [
+            TransferStatus::Initiated,
+            TransferStatus::Settled,
+            TransferStatus::Failed,
+        ] {
+            for direction in [false, true] {
+                for filter in [&[][..], incoming.as_slice(), outgoing.as_slice()] {
+                    assert!(!refresh_filter_matches(status, direction, filter));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eligible_refresh_preserves_status_and_direction_filters() {
+        for status in [
+            TransferStatus::WaitingCounterparty,
+            TransferStatus::WaitingConfirmations,
+        ] {
+            for incoming in [false, true] {
+                let filter = [RefreshFilter {
+                    status: RefreshTransferStatus::try_from(status).unwrap(),
+                    incoming,
+                }];
+                assert!(refresh_filter_matches(status, incoming, &[]));
+                assert!(refresh_filter_matches(status, incoming, &filter));
+                assert!(!refresh_filter_matches(status, !incoming, &filter));
+                let other = if status == TransferStatus::WaitingCounterparty {
+                    TransferStatus::WaitingConfirmations
+                } else {
+                    TransferStatus::WaitingCounterparty
+                };
+                assert!(!refresh_filter_matches(other, incoming, &filter));
+            }
+        }
     }
 }
