@@ -46,3 +46,5 @@ Compatibility:
 - peer repo update required:YES, explicit SDK facade/build and consumer validation before promotion
 
 Lookup follow-up: require the original native DB batch and return its immutable index/status alongside the exact artifact. A missing batch is an error, not guessed recovery.10focused cases plus the complete125native library tests PASS; format/strict clippy PASS. The original124test checkpoint is retained separately. SDK/financial lifecycle and actual WASM/funded acceptance remain pending; installed pins unchanged.
+
+Wire follow-up: ordinary-send lookup omits raw native transfer graphs, whose u64 JSON numbers must not become rounded JavaScript amounts. Opaque standard consignment/fascia evidence and the exact integer-string request remain.10focused cases/strict clippy/format PASS; complete125case native checkpoint retained. No financial operation, deployed pin or shared market contract changes.

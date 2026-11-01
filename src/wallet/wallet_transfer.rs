@@ -452,6 +452,12 @@ impl Wallet {
             .batch_transfer_by_txid(txid)?
             .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
         let mut data = self.external_rgb_send_data(txid.clone())?;
+        // Native transfer graphs contain u64 amounts encoded as JSON numbers.
+        // Ordinary-send JS receives only opaque consignment/fascia bytes and
+        // the exact integer-string request, never rounded parsed graph amounts.
+        if let Some(object) = data.as_object_mut() {
+            object.remove("transfers");
+        }
         data["wallet_transfer"] = serde_json::to_value(binding).map_err(InternalError::from)?;
         data["batch_transfer_idx"] = serde_json::json!(batch.idx);
         data["batch_status"] = serde_json::to_value(batch.status).map_err(InternalError::from)?;
@@ -700,6 +706,7 @@ mod tests {
         assert_eq!(data["txid"], txid);
         assert_eq!(data["psbt"], psbt.to_string());
         assert_eq!(data["batch_transfer_idx"], batch);
+        assert!(data.get("transfers").is_none());
         assert_eq!(data["wallet_transfer"]["signing_attempted"], false);
     }
     #[test]
