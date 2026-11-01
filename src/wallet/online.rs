@@ -6,6 +6,11 @@ use super::*;
 use crate::api::proxy::WasmProxyClient;
 use bitcoin::hashes::{Hash as _, sha256};
 
+#[path = "wallet_transfer.rs"]
+mod wallet_transfer;
+pub use wallet_transfer::WalletRgbSendRequest;
+use wallet_transfer::WalletTransferBinding;
+
 const SCHEMAS_SUPPORTING_INFLATION: [database::enums::AssetSchema; 1] = [AssetSchema::Ifa];
 
 const TRANSFER_DATA_FILE: &str = "transfer_data.txt";
@@ -201,6 +206,9 @@ pub(crate) enum ExternalSendStatus {
     BroadcastRecorded,
     Finalized,
     Conflicted,
+    /// Explicitly cancelled while still provably unsigned and never restored.
+    /// Original artifacts remain retained; Stock was never consumed.
+    Cancelled,
 }
 
 /// Immutable, reload-safe data for one externally constructed RGB send.
@@ -224,6 +232,10 @@ pub(crate) struct ExternalSendArtifact {
     /// transaction, fascia and consignments remain retained permanently.
     #[serde(default)]
     pub(crate) conflict_txid: Option<String>,
+    /// Wallet-owned ordinary transfer binding. An atomic coordinator proposal
+    /// has no such binding and cannot enter the ordinary-send lifecycle.
+    #[serde(default)]
+    pub(crate) wallet_transfer: Option<WalletTransferBinding>,
 }
 
 /// Stable result of preparing an externally constructed RGB send.
@@ -487,6 +499,21 @@ impl TryFrom<TransferStatus> for RefreshTransferStatus {
             _ => Err("ResfreshStatus only accepts pending statuses"),
         }
     }
+}
+
+/// Initiated external proposals are pending reservations, but are not eligible
+/// for normal ACK/confirmation refresh. Only explicit finalization or verified
+/// conflict reconciliation may advance them. A filtered background read must
+/// neither panic nor turn a prepared proposal into an outgoing send.
+fn refresh_filter_matches(
+    status: TransferStatus,
+    incoming: bool,
+    filter: &[RefreshFilter],
+) -> bool {
+    let Ok(status) = RefreshTransferStatus::try_from(status) else {
+        return false;
+    };
+    filter.is_empty() || filter.contains(&RefreshFilter { status, incoming })
 }
 
 impl Wallet {
@@ -1413,6 +1440,7 @@ impl Wallet {
         signed_psbt: Psbt,
         skip_sync: bool,
     ) -> Result<BdkTransaction, Error> {
+        self.assert_no_managed_rgb_spend(&signed_psbt.unsigned_tx)?;
         let tx = self
             ._broadcast_tx(signed_psbt.extract_tx().map_err(InternalError::from)?)
             .await?;
@@ -1517,6 +1545,19 @@ impl Wallet {
         fascia: &Fascia,
         min_confirmations: u8,
     ) -> Result<ExternalSendPrepareResult, Error> {
+        self.prepare_external_rgb_send_bound(recipient_map, psbt, fascia, min_confirmations, None)
+            .await
+    }
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    async fn prepare_external_rgb_send_bound(
+        &mut self,
+        recipient_map: HashMap<String, Vec<Recipient>>,
+        psbt: &Psbt,
+        fascia: &Fascia,
+        min_confirmations: u8,
+        wallet_transfer: Option<WalletTransferBinding>,
+    ) -> Result<ExternalSendPrepareResult, Error> {
         info!(self.logger, "Preparing external RGB send...");
         let txid = psbt.unsigned_tx.compute_txid().to_string();
         let witness_txid = fascia.witness_id().to_string();
@@ -1558,6 +1599,7 @@ impl Wallet {
                     art.expected_tx_hex == expected_tx_hex
                         && art.fascia_json == fascia_json
                         && art.recipients_digest == recipients_digest
+                        && art.wallet_transfer == wallet_transfer
                 })
                 .unwrap_or(false);
             if same && !existing.status.failed() && existing.min_confirmations == min_confirmations
@@ -1927,6 +1969,7 @@ impl Wallet {
                     recipients_digest,
                     status: ExternalSendStatus::Prepared,
                     conflict_txid: None,
+                    wallet_transfer,
                 }),
                 ..Default::default()
             },
@@ -1972,11 +2015,12 @@ impl Wallet {
             .transfer_artifacts
             .get(&txid)
             .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
-        if artifacts
-            .external_send
-            .as_ref()
-            .is_none_or(|s| s.status == ExternalSendStatus::Conflicted)
-        {
+        if artifacts.external_send.as_ref().is_none_or(|s| {
+            matches!(
+                s.status,
+                ExternalSendStatus::Conflicted | ExternalSendStatus::Cancelled
+            )
+        }) {
             return Err(Error::ExternalSendUnknown { txid });
         }
         for (id, info) in &artifacts.asset_infos {
@@ -2052,7 +2096,10 @@ impl Wallet {
             .batch_transfer_by_txid(&txid)?
             .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
 
-        if artifact.status == ExternalSendStatus::Conflicted {
+        if matches!(
+            artifact.status,
+            ExternalSendStatus::Conflicted | ExternalSendStatus::Cancelled
+        ) {
             return Err(Error::ExternalSendConflict { txid });
         }
         // Idempotent: already finalized -> return safely without consuming again.
@@ -3579,14 +3626,8 @@ impl Wallet {
     ) -> Result<Option<DbBatchTransfer>, Error> {
         debug!(self.logger, "Refreshing transfer: {:?}", transfer);
         let incoming = transfer.incoming(&db_data.asset_transfers, &db_data.transfers)?;
-        if !filter.is_empty() {
-            let requested = RefreshFilter {
-                status: RefreshTransferStatus::try_from(transfer.status).expect("pending status"),
-                incoming,
-            };
-            if !filter.contains(&requested) {
-                return Ok(None);
-            }
+        if !refresh_filter_matches(transfer.status, incoming, filter) {
+            return Ok(None);
         }
         match transfer.status {
             TransferStatus::WaitingCounterparty => {
@@ -3983,6 +4024,19 @@ impl Wallet {
             .compute_txid()
             .to_string();
 
+        // A wallet-owned prepared transfer must never enter this legacy path:
+        // send_end removes artifacts and can dispatch before durable recovery.
+        if self
+            .transfer_artifacts
+            .get(&txid)
+            .and_then(|a| a.external_send.as_ref())
+            .is_some_and(|a| a.wallet_transfer.is_some())
+        {
+            return Err(Error::InvalidPsbt {
+                details: s!("prepared wallet RGB transfer requires its durable send lifecycle"),
+            });
+        }
+
         // Clone data out of transfer_artifacts to avoid borrow conflicts
         let artifacts = self
             .transfer_artifacts
@@ -4112,6 +4166,20 @@ impl Wallet {
     /// must validate the consignment before it is safe to broadcast the funding transaction.
     /// The transfer artifacts remain available for a later [`Wallet::send_end`] call.
     pub async fn post_pending_consignments(&mut self, txid: String) -> Result<(), Error> {
+        if self
+            .transfer_artifacts
+            .get(&txid)
+            .and_then(|a| a.external_send.as_ref())
+            .is_some_and(|a| a.wallet_transfer.is_some())
+        {
+            return Err(Error::ExternalSendConflict { txid });
+        }
+        self.post_pending_consignments_inner(txid).await
+    }
+
+    // The managed ordinary lifecycle enters only after its durable checks.
+    // All other callers continue through the public compatibility guard.
+    async fn post_pending_consignments_inner(&mut self, txid: String) -> Result<(), Error> {
         let artifacts = self
             .transfer_artifacts
             .get_mut(&txid)
@@ -4733,5 +4801,63 @@ mod external_conflict_identity_tests {
         assert!(distinct_input_conflict(&tx, &competing));
         competing.input[0].previous_output.vout = 1;
         assert!(!distinct_input_conflict(&tx, &competing));
+    }
+}
+
+#[cfg(test)]
+mod refresh_filter_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_and_terminal_states_never_enter_normal_refresh() {
+        let incoming = vec![
+            RefreshFilter {
+                status: RefreshTransferStatus::WaitingCounterparty,
+                incoming: true,
+            },
+            RefreshFilter {
+                status: RefreshTransferStatus::WaitingConfirmations,
+                incoming: true,
+            },
+        ];
+        let outgoing = vec![RefreshFilter {
+            status: RefreshTransferStatus::WaitingCounterparty,
+            incoming: false,
+        }];
+        for status in [
+            TransferStatus::Initiated,
+            TransferStatus::Settled,
+            TransferStatus::Failed,
+        ] {
+            for direction in [false, true] {
+                for filter in [&[][..], incoming.as_slice(), outgoing.as_slice()] {
+                    assert!(!refresh_filter_matches(status, direction, filter));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eligible_refresh_preserves_status_and_direction_filters() {
+        for status in [
+            TransferStatus::WaitingCounterparty,
+            TransferStatus::WaitingConfirmations,
+        ] {
+            for incoming in [false, true] {
+                let filter = [RefreshFilter {
+                    status: RefreshTransferStatus::try_from(status).unwrap(),
+                    incoming,
+                }];
+                assert!(refresh_filter_matches(status, incoming, &[]));
+                assert!(refresh_filter_matches(status, incoming, &filter));
+                assert!(!refresh_filter_matches(status, !incoming, &filter));
+                let other = if status == TransferStatus::WaitingCounterparty {
+                    TransferStatus::WaitingConfirmations
+                } else {
+                    TransferStatus::WaitingCounterparty
+                };
+                assert!(!refresh_filter_matches(other, incoming, &filter));
+            }
+        }
     }
 }

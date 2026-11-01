@@ -1,0 +1,18 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-product-rgb-peer)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.49s
+     Running unittests src/lib.rs (/home/nigel/.cache/btcx-asm-release-20261101/rust-target/debug/deps/rgb_lib_wasm-f6780f344ba8f335)
+
+running 10 tests
+test wallet::online::wallet_transfer::tests::monetary_wire_values_are_integer_strings_and_reject_floats ... ok
+test wallet::online::wallet_transfer::tests::wallet_binding_preserves_unknown_sign_and_broadcast_across_snapshot ... ok
+test wallet::online::wallet_transfer::tests::wallet_operation_ids_are_bounded_canonical_uuids ... ok
+test wallet::online::wallet_transfer::tests::historical_external_artifacts_without_wallet_binding_remain_readable ... ok
+test wallet::online::wallet_transfer::tests::rejects_zero_overflow_and_out_of_policy_bounds_before_any_wallet_mutation ... ok
+test wallet::online::wallet_transfer::tests::canonical_request_binds_money_recipient_contract_and_input_exclusions ... ok
+test wallet::online::wallet_transfer::tests::rejects_wrong_network_invalid_identity_duplicate_holds_and_transport_abuse ... ok
+test wallet::online::wallet_transfer::tests::missing_persisted_batch_cannot_be_presented_as_a_recoverable_transfer ... ok
+test wallet::online::wallet_transfer::tests::generic_signing_refuses_managed_original_without_changing_its_records ... ok
+test wallet::online::wallet_transfer::tests::duplicate_operation_ids_in_corrupt_storage_fail_closed_instead_of_guessing ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 115 filtered out; finished in 0.34s
+

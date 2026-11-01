@@ -1,0 +1,11 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-product-rgb-peer)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.96s
+     Running unittests src/lib.rs (/home/nigel/.cache/btcx-asm-release-20261101/rust-target/debug/deps/rgb_lib_wasm-f6780f344ba8f335)
+
+running 3 tests
+test wallet::idb_store::tests::stock_serialize_round_trip_empty ... ok
+test wallet::idb_store::tests::managed_snapshot_blocks_old_readers_and_preserves_original_attempts ... ok
+test wallet::idb_store::tests::stock_serialize_round_trip_with_contract ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 123 filtered out; finished in 0.22s
+

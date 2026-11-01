@@ -1,0 +1,25 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-product-rgb-peer)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.63s
+     Running unittests src/lib.rs (/home/nigel/.cache/btcx-asm-release-20261101/rust-target/debug/deps/rgb_lib_wasm-f6780f344ba8f335)
+
+running 17 tests
+test wallet::online::wallet_transfer::tests::monetary_wire_values_are_integer_strings_and_reject_floats ... ok
+test wallet::online::wallet_transfer::tests::historical_external_artifacts_without_wallet_binding_remain_readable ... ok
+test wallet::online::wallet_transfer::tests::canonical_request_binds_money_recipient_contract_and_input_exclusions ... ok
+test wallet::online::wallet_transfer::tests::rejects_zero_overflow_and_out_of_policy_bounds_before_any_wallet_mutation ... ok
+test wallet::online::wallet_transfer::tests::wallet_binding_preserves_unknown_sign_and_broadcast_across_snapshot ... ok
+test wallet::online::wallet_transfer::tests::wallet_operation_ids_are_bounded_canonical_uuids ... ok
+test wallet::online::wallet_transfer::tests::rejects_wrong_network_invalid_identity_duplicate_holds_and_transport_abuse ... ok
+test wallet::online::wallet_transfer::tests::duplicate_operation_ids_in_corrupt_storage_fail_closed_instead_of_guessing ... ok
+test wallet::online::wallet_transfer::tests::generic_managed_broadcast_refuses_before_network_or_suspension ... ok
+test wallet::online::wallet_transfer::tests::unsigned_expired_cancellation_remains_readable_and_cannot_be_deleted_or_revived ... ok
+test wallet::online::wallet_transfer::tests::native_isolation_refuses_overlapping_originals_but_unsigned_cancel_can_retire_one ... ok
+test wallet::online::wallet_transfer::tests::generic_signing_refuses_managed_original_without_changing_its_records ... ok
+test wallet::online::wallet_transfer::tests::broadcast_preflight_refuses_replay_restore_expiry_and_different_original ... ok
+test wallet::online::wallet_transfer::tests::missing_persisted_batch_cannot_be_presented_as_a_recoverable_transfer ... ok
+test wallet::online::wallet_transfer::tests::dedicated_signing_binds_original_and_refuses_attempt_restore_or_expiry_without_mutation ... ok
+test wallet::online::wallet_transfer::tests::different_transactions_cannot_sign_or_broadcast_either_managed_input ... ok
+test wallet::online::wallet_transfer::tests::original_rgb_input_facts_preserve_exact_units_and_refuse_corrupt_reservations ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 117 filtered out; finished in 0.57s
+

@@ -1936,7 +1936,11 @@ impl Wallet {
         Ok(psbt.to_string())
     }
 
-    fn _sign_psbt(&self, psbt: &mut Psbt, sign_options: Option<SignOptions>) -> Result<(), Error> {
+    pub(super) fn _sign_psbt(
+        &self,
+        psbt: &mut Psbt,
+        sign_options: Option<SignOptions>,
+    ) -> Result<(), Error> {
         let sign_options = sign_options.unwrap_or_default();
         self.bdk_wallet
             .sign(psbt, sign_options)
@@ -1952,6 +1956,11 @@ impl Wallet {
     ) -> Result<String, Error> {
         info!(self.logger, "Signing PSBT...");
         let mut psbt = Psbt::from_str(&unsigned_psbt)?;
+        #[cfg(feature = "esplora")]
+        self.assert_no_managed_rgb_spend(&psbt.unsigned_tx)
+            .map_err(|_| Error::InvalidPsbt {
+                details: s!("wallet RGB transfer inputs require their durable signing lifecycle"),
+            })?;
         self._sign_psbt(&mut psbt, sign_options)?;
         info!(self.logger, "Sign PSBT completed");
         Ok(psbt.to_string())
@@ -2015,6 +2024,15 @@ impl Wallet {
             if !batch_transfer.failed() {
                 return Err(Error::CannotDeleteBatchTransfer);
             }
+            #[cfg(feature = "esplora")]
+            if batch_transfer.txid.as_ref().is_some_and(|txid| {
+                self.transfer_artifacts
+                    .get(txid)
+                    .and_then(|a| a.external_send.as_ref())
+                    .is_some_and(|a| a.wallet_transfer.is_some())
+            }) {
+                return Err(Error::CannotDeleteBatchTransfer);
+            }
 
             let asset_transfers = batch_transfer.get_asset_transfers(&db_data.asset_transfers)?;
 
@@ -2041,6 +2059,15 @@ impl Wallet {
                 .filter(|t| t.failed())
                 .collect();
             for batch_transfer in batch_transfers.iter_mut() {
+                #[cfg(feature = "esplora")]
+                if batch_transfer.txid.as_ref().is_some_and(|txid| {
+                    self.transfer_artifacts
+                        .get(txid)
+                        .and_then(|a| a.external_send.as_ref())
+                        .is_some_and(|a| a.wallet_transfer.is_some())
+                }) {
+                    continue;
+                }
                 let asset_transfers =
                     batch_transfer.get_asset_transfers(&db_data.asset_transfers)?;
                 if no_asset_only {
@@ -3006,7 +3033,14 @@ impl Wallet {
         Ok(super::idb_store::WalletSnapshot {
             sequence: self
                 .idb_sequence
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |sequence| sequence.checked_add(1),
+                )
+                .map_err(|_| Error::Persistence {
+                    details: s!("Wallet snapshot sequence exhausted; preserve current state"),
+                })?
                 + 1,
             db: self.database.as_ref().clone(),
             bdk_changeset: self.bdk_database.get_data().clone(),
@@ -3159,6 +3193,22 @@ mod address_reuse_tests {
     use super::*;
     use crate::keys::generate_keys;
     use crate::utils::{get_descriptors, str_to_xpub};
+
+    #[test]
+    fn snapshot_sequence_exhaustion_refuses_without_wrapping() {
+        let wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        wallet
+            .idb_sequence
+            .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(wallet.snapshot(), Err(Error::Persistence { .. })));
+        assert_eq!(
+            wallet
+                .idb_sequence
+                .load(std::sync::atomic::Ordering::SeqCst),
+            u64::MAX
+        );
+    }
 
     /// Helper: build a minimal Wallet for native tests.
     ///

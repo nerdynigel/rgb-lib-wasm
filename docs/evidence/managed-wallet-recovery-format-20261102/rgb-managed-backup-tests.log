@@ -1,0 +1,19 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-product-rgb-peer)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.19s
+     Running unittests src/lib.rs (/home/nigel/.cache/btcx-asm-release-20261101/rust-target/debug/deps/rgb_lib_wasm-f6780f344ba8f335)
+
+running 11 tests
+test wallet::backup::tests::decode_too_short_fails ... ok
+test wallet::backup::tests::decode_truncated_pub_data_fails ... ok
+test wallet::backup::tests::oversized_envelope_length_is_refused ... ok
+test wallet::backup::tests::restore_comparison_only_allows_monotonic_public_derivation_growth ... ok
+test wallet::backup::tests::encode_decode_round_trip ... ok
+test wallet::backup::tests::malformed_nonce_is_refused_without_panic ... ok
+test wallet::backup::tests::unsupported_version_fails ... ok
+test wallet::backup::tests::encrypt_decrypt_round_trip ... ok
+test wallet::backup::tests::wrong_password_fails ... ok
+test wallet::backup::tests::backup_payload_preserves_pending_external_and_received_bytes ... ok
+test wallet::backup::tests::derive_key_deterministic ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 115 filtered out; finished in 53.45s
+

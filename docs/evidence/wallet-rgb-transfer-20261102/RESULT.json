@@ -1,0 +1,18 @@
+{
+  "scope": "NATIVE_UNFUNDED_PREPARATION_FOUNDATION_NOT_CUSTOMER_SEND_ACCEPTANCE",
+  "parent": "e967aa95f7e66371799a46dd03a61f8409c08e91",
+  "unit_passed": 124,
+  "new_unit_cases": 9,
+  "format": "PASS",
+  "strict_clippy": "PASS",
+  "wasm_or_funded_acceptance": "NOT_RUN",
+  "financial_dispatches": 0,
+  "lab_pins_changed": false,
+  "main_merge": false,
+  "log_sha256": {
+    "rgb-wallet-transfer-foundation-format.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "rgb-wallet-transfer-foundation-clippy.log": "74d0ad3154be726ea8ecdedbcee868984f5e326a24e45aaef03f867e98d4ed20",
+    "rgb-wallet-transfer-foundation-unit.log": "8d7a5abc53e87cd211992794d9b95791ad73f4f2e9009037bca1a76e822fd576",
+    "rgb-wallet-transfer-core-clippy.log": "7f92dae465f5becb3e8c44f35230f607abcb5b1c9217fcd5fa6bea776121751c"
+  }
+}
