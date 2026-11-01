@@ -1952,6 +1952,17 @@ impl Wallet {
     ) -> Result<String, Error> {
         info!(self.logger, "Signing PSBT...");
         let mut psbt = Psbt::from_str(&unsigned_psbt)?;
+        #[cfg(feature = "esplora")]
+        if self
+            .transfer_artifacts
+            .get(&psbt.unsigned_tx.compute_txid().to_string())
+            .and_then(|a| a.external_send.as_ref())
+            .is_some_and(|a| a.wallet_transfer.is_some())
+        {
+            return Err(Error::InvalidPsbt {
+                details: s!("prepared wallet RGB transfer requires its durable signing lifecycle"),
+            });
+        }
         self._sign_psbt(&mut psbt, sign_options)?;
         info!(self.logger, "Sign PSBT completed");
         Ok(psbt.to_string())

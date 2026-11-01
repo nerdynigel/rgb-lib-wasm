@@ -471,6 +471,15 @@ mod tests {
                 fascia_json: "{}".into(),
                 recipients_digest: "bound-recipients".into(),
                 status: ExternalSendStatus::BroadcastRecorded,
+                wallet_transfer: Some(
+                    serde_json::from_value(serde_json::json!({
+                        "operation_id":"01a19805-0462-759b-9050-b9b0feb9da8f",
+                        "request_json":"exact-pending-wallet-request",
+                        "signing_attempted":true,
+                        "broadcast_attempted":true
+                    }))
+                    .unwrap(),
+                ),
             }),
             ..Default::default()
         };
@@ -504,6 +513,15 @@ mod tests {
             ExternalSendStatus::BroadcastRecorded
         );
         assert_eq!(pending.consignment_bytes["asset"], vec![1, 2, 3]);
+        let binding = pending
+            .external_send
+            .as_ref()
+            .unwrap()
+            .wallet_transfer
+            .as_ref()
+            .unwrap();
+        assert_eq!(binding.request_json, "exact-pending-wallet-request");
+        assert!(binding.signing_attempted && binding.broadcast_attempted);
         assert_eq!(restored.received_consignments["recipient"], vec![4, 5, 6]);
     }
 

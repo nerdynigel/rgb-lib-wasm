@@ -6,6 +6,11 @@ use super::*;
 use crate::api::proxy::WasmProxyClient;
 use bitcoin::hashes::{Hash as _, sha256};
 
+#[path = "wallet_transfer.rs"]
+mod wallet_transfer;
+pub use wallet_transfer::WalletRgbSendRequest;
+use wallet_transfer::WalletTransferBinding;
+
 const SCHEMAS_SUPPORTING_INFLATION: [database::enums::AssetSchema; 1] = [AssetSchema::Ifa];
 
 const TRANSFER_DATA_FILE: &str = "transfer_data.txt";
@@ -224,6 +229,10 @@ pub(crate) struct ExternalSendArtifact {
     /// transaction, fascia and consignments remain retained permanently.
     #[serde(default)]
     pub(crate) conflict_txid: Option<String>,
+    /// Wallet-owned ordinary transfer binding. An atomic coordinator proposal
+    /// has no such binding and cannot enter the ordinary-send lifecycle.
+    #[serde(default)]
+    pub(crate) wallet_transfer: Option<WalletTransferBinding>,
 }
 
 /// Stable result of preparing an externally constructed RGB send.
@@ -1532,6 +1541,19 @@ impl Wallet {
         fascia: &Fascia,
         min_confirmations: u8,
     ) -> Result<ExternalSendPrepareResult, Error> {
+        self.prepare_external_rgb_send_bound(recipient_map, psbt, fascia, min_confirmations, None)
+            .await
+    }
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    async fn prepare_external_rgb_send_bound(
+        &mut self,
+        recipient_map: HashMap<String, Vec<Recipient>>,
+        psbt: &Psbt,
+        fascia: &Fascia,
+        min_confirmations: u8,
+        wallet_transfer: Option<WalletTransferBinding>,
+    ) -> Result<ExternalSendPrepareResult, Error> {
         info!(self.logger, "Preparing external RGB send...");
         let txid = psbt.unsigned_tx.compute_txid().to_string();
         let witness_txid = fascia.witness_id().to_string();
@@ -1573,6 +1595,7 @@ impl Wallet {
                     art.expected_tx_hex == expected_tx_hex
                         && art.fascia_json == fascia_json
                         && art.recipients_digest == recipients_digest
+                        && art.wallet_transfer == wallet_transfer
                 })
                 .unwrap_or(false);
             if same && !existing.status.failed() && existing.min_confirmations == min_confirmations
@@ -1942,6 +1965,7 @@ impl Wallet {
                     recipients_digest,
                     status: ExternalSendStatus::Prepared,
                     conflict_txid: None,
+                    wallet_transfer,
                 }),
                 ..Default::default()
             },
@@ -1990,7 +2014,7 @@ impl Wallet {
         if artifacts
             .external_send
             .as_ref()
-            .is_none_or(|s| s.status == ExternalSendStatus::Conflicted)
+            .is_none_or(|s| matches!(s.status, ExternalSendStatus::Conflicted))
         {
             return Err(Error::ExternalSendUnknown { txid });
         }
@@ -2067,7 +2091,7 @@ impl Wallet {
             .batch_transfer_by_txid(&txid)?
             .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
 
-        if artifact.status == ExternalSendStatus::Conflicted {
+        if matches!(artifact.status, ExternalSendStatus::Conflicted) {
             return Err(Error::ExternalSendConflict { txid });
         }
         // Idempotent: already finalized -> return safely without consuming again.
@@ -3991,6 +4015,19 @@ impl Wallet {
             .map_err(InternalError::from)?
             .compute_txid()
             .to_string();
+
+        // A wallet-owned prepared transfer must never enter this legacy path:
+        // send_end removes artifacts and can dispatch before durable recovery.
+        if self
+            .transfer_artifacts
+            .get(&txid)
+            .and_then(|a| a.external_send.as_ref())
+            .is_some_and(|a| a.wallet_transfer.is_some())
+        {
+            return Err(Error::InvalidPsbt {
+                details: s!("prepared wallet RGB transfer requires its durable send lifecycle"),
+            });
+        }
 
         // Clone data out of transfer_artifacts to avoid borrow conflicts
         let artifacts = self
