@@ -206,6 +206,9 @@ pub(crate) enum ExternalSendStatus {
     BroadcastRecorded,
     Finalized,
     Conflicted,
+    /// Explicitly cancelled while still provably unsigned and never restored.
+    /// Original artifacts remain retained; Stock was never consumed.
+    Cancelled,
 }
 
 /// Immutable, reload-safe data for one externally constructed RGB send.
@@ -1437,6 +1440,15 @@ impl Wallet {
         signed_psbt: Psbt,
         skip_sync: bool,
     ) -> Result<BdkTransaction, Error> {
+        let txid = signed_psbt.unsigned_tx.compute_txid().to_string();
+        if self
+            .transfer_artifacts
+            .get(&txid)
+            .and_then(|a| a.external_send.as_ref())
+            .is_some_and(|a| a.wallet_transfer.is_some())
+        {
+            return Err(Error::ExternalSendConflict { txid });
+        }
         let tx = self
             ._broadcast_tx(signed_psbt.extract_tx().map_err(InternalError::from)?)
             .await?;
@@ -2011,11 +2023,12 @@ impl Wallet {
             .transfer_artifacts
             .get(&txid)
             .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
-        if artifacts
-            .external_send
-            .as_ref()
-            .is_none_or(|s| matches!(s.status, ExternalSendStatus::Conflicted))
-        {
+        if artifacts.external_send.as_ref().is_none_or(|s| {
+            matches!(
+                s.status,
+                ExternalSendStatus::Conflicted | ExternalSendStatus::Cancelled
+            )
+        }) {
             return Err(Error::ExternalSendUnknown { txid });
         }
         for (id, info) in &artifacts.asset_infos {
@@ -2091,7 +2104,10 @@ impl Wallet {
             .batch_transfer_by_txid(&txid)?
             .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
 
-        if matches!(artifact.status, ExternalSendStatus::Conflicted) {
+        if matches!(
+            artifact.status,
+            ExternalSendStatus::Conflicted | ExternalSendStatus::Cancelled
+        ) {
             return Err(Error::ExternalSendConflict { txid });
         }
         // Idempotent: already finalized -> return safely without consuming again.
@@ -4158,6 +4174,20 @@ impl Wallet {
     /// must validate the consignment before it is safe to broadcast the funding transaction.
     /// The transfer artifacts remain available for a later [`Wallet::send_end`] call.
     pub async fn post_pending_consignments(&mut self, txid: String) -> Result<(), Error> {
+        if self
+            .transfer_artifacts
+            .get(&txid)
+            .and_then(|a| a.external_send.as_ref())
+            .is_some_and(|a| a.wallet_transfer.is_some())
+        {
+            return Err(Error::ExternalSendConflict { txid });
+        }
+        self.post_pending_consignments_inner(txid).await
+    }
+
+    // The managed ordinary lifecycle enters only after its durable checks.
+    // All other callers continue through the public compatibility guard.
+    async fn post_pending_consignments_inner(&mut self, txid: String) -> Result<(), Error> {
         let artifacts = self
             .transfer_artifacts
             .get_mut(&txid)

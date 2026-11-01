@@ -2030,6 +2030,15 @@ impl Wallet {
             if !batch_transfer.failed() {
                 return Err(Error::CannotDeleteBatchTransfer);
             }
+            #[cfg(feature = "esplora")]
+            if batch_transfer.txid.as_ref().is_some_and(|txid| {
+                self.transfer_artifacts
+                    .get(txid)
+                    .and_then(|a| a.external_send.as_ref())
+                    .is_some_and(|a| a.wallet_transfer.is_some())
+            }) {
+                return Err(Error::CannotDeleteBatchTransfer);
+            }
 
             let asset_transfers = batch_transfer.get_asset_transfers(&db_data.asset_transfers)?;
 
@@ -2056,6 +2065,15 @@ impl Wallet {
                 .filter(|t| t.failed())
                 .collect();
             for batch_transfer in batch_transfers.iter_mut() {
+                #[cfg(feature = "esplora")]
+                if batch_transfer.txid.as_ref().is_some_and(|txid| {
+                    self.transfer_artifacts
+                        .get(txid)
+                        .and_then(|a| a.external_send.as_ref())
+                        .is_some_and(|a| a.wallet_transfer.is_some())
+                }) {
+                    continue;
+                }
                 let asset_transfers =
                     batch_transfer.get_asset_transfers(&db_data.asset_transfers)?;
                 if no_asset_only {

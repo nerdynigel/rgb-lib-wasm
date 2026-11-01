@@ -149,7 +149,9 @@ fn snapshot_write_required(
                     return Err(refused());
                 }
             }
-            ExternalSendStatus::Finalized | ExternalSendStatus::Conflicted => {
+            ExternalSendStatus::Finalized
+            | ExternalSendStatus::Conflicted
+            | ExternalSendStatus::Cancelled => {
                 if new.status != old.status {
                     return Err(refused());
                 }
