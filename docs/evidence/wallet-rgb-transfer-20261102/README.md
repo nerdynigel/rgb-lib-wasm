@@ -44,3 +44,5 @@ Compatibility:
 - rust-lightning:0939f7751fb876e02caec9cd0a778794b81eee9e
 - breaking protocol change:NO (wallet-owned SDK capability, no shared market interface)
 - peer repo update required:YES, explicit SDK facade/build and consumer validation before promotion
+
+Lookup follow-up: require the original native DB batch and return its immutable index/status alongside the exact artifact. A missing batch is an error, not guessed recovery.10focused cases plus the complete125native library tests PASS; format/strict clippy PASS. The original124test checkpoint is retained separately. SDK/financial lifecycle and actual WASM/funded acceptance remain pending; installed pins unchanged.

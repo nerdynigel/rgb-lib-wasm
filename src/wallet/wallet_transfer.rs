@@ -448,8 +448,13 @@ impl Wallet {
             .wallet_transfer
             .as_ref()
             .unwrap();
+        let batch = self
+            .batch_transfer_by_txid(txid)?
+            .ok_or_else(|| Error::ExternalSendUnknown { txid: txid.clone() })?;
         let mut data = self.external_rgb_send_data(txid.clone())?;
         data["wallet_transfer"] = serde_json::to_value(binding).map_err(InternalError::from)?;
+        data["batch_transfer_idx"] = serde_json::json!(batch.idx);
+        data["batch_status"] = serde_json::to_value(batch.status).map_err(InternalError::from)?;
         Ok(data)
     }
 }
@@ -673,6 +678,17 @@ mod tests {
         wallet
             .transfer_artifacts
             .insert(txid.clone(), artifact(&psbt));
+        let batch = wallet
+            .database
+            .set_batch_transfer(DbBatchTransferActMod {
+                txid: ActiveValue::Set(Some(txid.clone())),
+                status: ActiveValue::Set(TransferStatus::Initiated),
+                min_confirmations: ActiveValue::Set(1),
+                created_at: ActiveValue::Set(1),
+                expiration: ActiveValue::Set(Some(100)),
+                ..Default::default()
+            })
+            .unwrap();
         let before = serde_json::to_value(&wallet.transfer_artifacts).unwrap();
         let result = wallet.sign_psbt(psbt.to_string(), None);
         assert!(matches!(result, Err(Error::InvalidPsbt { .. })));
@@ -683,6 +699,7 @@ mod tests {
         let data = wallet.wallet_rgb_send_data(request().operation_id).unwrap();
         assert_eq!(data["txid"], txid);
         assert_eq!(data["psbt"], psbt.to_string());
+        assert_eq!(data["batch_transfer_idx"], batch);
         assert_eq!(data["wallet_transfer"]["signing_attempted"], false);
     }
     #[test]
@@ -713,5 +730,22 @@ mod tests {
         assert!(original.wallet_transfer.is_none());
         assert_eq!(original.status, ExternalSendStatus::Prepared);
         assert_eq!(original.fascia_json, "retained-original-fascia");
+    }
+    #[test]
+    fn missing_persisted_batch_cannot_be_presented_as_a_recoverable_transfer() {
+        let mut wallet = empty_wallet();
+        let psbt = unsigned();
+        wallet
+            .transfer_artifacts
+            .insert(psbt.unsigned_tx.compute_txid().to_string(), artifact(&psbt));
+        let before = serde_json::to_value(&wallet.transfer_artifacts).unwrap();
+        assert!(matches!(
+            wallet.wallet_rgb_send_data(request().operation_id),
+            Err(Error::ExternalSendUnknown { .. })
+        ));
+        assert_eq!(
+            serde_json::to_value(&wallet.transfer_artifacts).unwrap(),
+            before
+        );
     }
 }
