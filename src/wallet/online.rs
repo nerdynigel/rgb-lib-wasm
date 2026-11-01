@@ -1440,15 +1440,7 @@ impl Wallet {
         signed_psbt: Psbt,
         skip_sync: bool,
     ) -> Result<BdkTransaction, Error> {
-        let txid = signed_psbt.unsigned_tx.compute_txid().to_string();
-        if self
-            .transfer_artifacts
-            .get(&txid)
-            .and_then(|a| a.external_send.as_ref())
-            .is_some_and(|a| a.wallet_transfer.is_some())
-        {
-            return Err(Error::ExternalSendConflict { txid });
-        }
+        self.assert_no_managed_rgb_spend(&signed_psbt.unsigned_tx)?;
         let tx = self
             ._broadcast_tx(signed_psbt.extract_tx().map_err(InternalError::from)?)
             .await?;

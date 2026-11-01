@@ -175,13 +175,110 @@ fn validate_request(r: &mut WalletRgbSendRequest) -> Result<ValidatedRequest, Er
 }
 
 impl Wallet {
+    /// All managed native originals reserve their own RGB and fee inputs. The
+    /// caller's separate journal exclusions supplement this native protection.
+    fn managed_rgb_input_holds(&self, except: Option<&str>) -> Result<HashSet<OutPoint>, Error> {
+        if self.transfer_artifacts.len() > 4096 {
+            return Err(invalid());
+        }
+        let mut points = HashSet::new();
+        for (txid, artifacts) in &self.transfer_artifacts {
+            if except == Some(txid.as_str()) {
+                continue;
+            }
+            let Some(external) = artifacts.external_send.as_ref() else {
+                continue;
+            };
+            let Some(binding) = external.wallet_transfer.as_ref() else {
+                continue;
+            };
+            let conflict = || Error::ExternalSendConflict { txid: txid.clone() };
+            let batch = self.batch_transfer_by_txid(txid)?.ok_or_else(conflict)?;
+            if external.status == ExternalSendStatus::Cancelled {
+                if !batch.status.failed()
+                    || binding.restored
+                    || binding.signing_attempted
+                    || binding.broadcast_attempted
+                    || artifacts.signed_psbt.is_some()
+                {
+                    return Err(conflict());
+                }
+                continue;
+            }
+            if external.status == ExternalSendStatus::Conflicted {
+                if !batch.status.failed()
+                    || external
+                        .conflict_txid
+                        .as_ref()
+                        .is_none_or(|id| id == txid || Txid::from_str(id).is_err())
+                {
+                    return Err(conflict());
+                }
+                continue;
+            }
+            if external.prepared_psbt.len() > 524_288 {
+                return Err(conflict());
+            }
+            let original = Psbt::from_str(&external.prepared_psbt).map_err(|_| conflict())?;
+            if original.unsigned_tx.compute_txid().to_string() != *txid
+                || Self::tx_stripped_hex_from_unsigned(&original.unsigned_tx)
+                    != external.expected_tx_hex
+                || original.unsigned_tx.input.is_empty()
+                || original.unsigned_tx.input.len() > 128
+            {
+                return Err(conflict());
+            }
+            points.extend(original.unsigned_tx.input.iter().map(|i| i.previous_output));
+        }
+        Ok(points)
+    }
+
+    /// Generic helpers cannot revive the exact managed transaction or replace it
+    /// with a different transaction spending any of its still-held inputs.
+    pub(in crate::wallet) fn assert_no_managed_rgb_spend(
+        &self,
+        tx: &BdkTransaction,
+    ) -> Result<(), Error> {
+        let txid = tx.compute_txid().to_string();
+        if self
+            .transfer_artifacts
+            .get(&txid)
+            .and_then(|a| a.external_send.as_ref())
+            .is_some_and(|e| e.wallet_transfer.is_some())
+        {
+            return Err(Error::ExternalSendConflict { txid });
+        }
+        let holds = self.managed_rgb_input_holds(None)?;
+        if tx.input.iter().any(|i| holds.contains(&i.previous_output)) {
+            return Err(Error::ExternalSendConflict { txid });
+        }
+        Ok(())
+    }
+
+    fn assert_managed_rgb_input_isolation(
+        &self,
+        tx: &BdkTransaction,
+        own_txid: &str,
+    ) -> Result<(), Error> {
+        let holds = self.managed_rgb_input_holds(Some(own_txid))?;
+        if tx.input.iter().any(|i| holds.contains(&i.previous_output)) {
+            return Err(Error::ExternalSendConflict {
+                txid: own_txid.into(),
+            });
+        }
+        Ok(())
+    }
+
     fn wallet_rgb_signing_preflight(
         &self,
         operation_id: &str,
         expected_psbt: &str,
         now_unix: u64,
     ) -> Result<(String, Psbt, u64), Error> {
-        self.wallet_rgb_unsigned_preflight(operation_id, expected_psbt, Some(now_unix))
+        let original =
+            self.wallet_rgb_unsigned_preflight(operation_id, expected_psbt, Some(now_unix))?;
+        self.assert_managed_rgb_input_isolation(&original.1.unsigned_tx, &original.0)?;
+        Ok(original)
     }
 
     fn wallet_rgb_unsigned_preflight(
@@ -359,6 +456,7 @@ impl Wallet {
         {
             return Err(conflict());
         }
+        self.assert_managed_rgb_input_isolation(&tx, txid)?;
         Ok((txid.clone(), tx, request.expires_at))
     }
 
@@ -574,7 +672,7 @@ impl Wallet {
             return Err(Error::InvalidRecipientNetwork);
         }
         self.check_online(online.clone())?;
-        let valid = validate_request(&mut request)?;
+        let mut valid = validate_request(&mut request)?;
         if let Some((txid, _)) = self.wallet_transfer_by_operation(&request.operation_id)? {
             let txid = txid.clone();
             let art = self.transfer_artifacts[&txid]
@@ -619,6 +717,7 @@ impl Wallet {
         if self.indexer().block_hash(0).await? != genesis {
             return Err(Error::InvalidRecipientNetwork);
         }
+        valid.excluded.extend(self.managed_rgb_input_holds(None)?);
         self.sync(online.clone()).await?;
         let (rate, _, mut unspents, runtime) =
             self._get_transfer_begin_data(online, request.fee_rate)?;
@@ -1270,6 +1369,127 @@ mod tests {
             serde_json::to_value(&wallet.transfer_artifacts).unwrap(),
             before
         );
+    }
+    #[test]
+    fn different_transactions_cannot_sign_or_broadcast_either_managed_input() {
+        let mut wallet = empty_wallet();
+        let mut original = staged_psbt();
+        let fee_input = bitcoin::TxIn {
+            previous_output: OutPoint::from_str(&format!("{}:0", "a".repeat(64))).unwrap(),
+            ..Default::default()
+        };
+        original.unsigned_tx.input.push(fee_input);
+        original.inputs.push(bitcoin::psbt::Input::default());
+        retain(&mut wallet, &original, TransferStatus::Initiated);
+        let held = wallet.managed_rgb_input_holds(None).unwrap();
+        assert_eq!(held.len(), 2);
+        let before = serde_json::to_value(&wallet.transfer_artifacts).unwrap();
+        for index in 0..2 {
+            let mut replacement = original.clone();
+            replacement.unsigned_tx.input = vec![original.unsigned_tx.input[index].clone()];
+            replacement.inputs = vec![original.inputs[index].clone()];
+            replacement.unsigned_tx.output[0].value = bitcoin::Amount::from_sat(1);
+            assert_ne!(
+                replacement.unsigned_tx.compute_txid(),
+                original.unsigned_tx.compute_txid()
+            );
+            assert!(matches!(
+                wallet.sign_psbt(replacement.to_string(), None),
+                Err(Error::InvalidPsbt { .. })
+            ));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            let mut future = std::pin::pin!(wallet._broadcast_psbt(replacement, false));
+            assert!(matches!(
+                std::future::Future::poll(future.as_mut(), &mut context),
+                std::task::Poll::Ready(Err(Error::ExternalSendConflict { .. }))
+            ));
+        }
+        assert_eq!(
+            serde_json::to_value(&wallet.transfer_artifacts).unwrap(),
+            before
+        );
+        let mut unrelated = original.clone();
+        for input in &mut unrelated.unsigned_tx.input {
+            input.previous_output = OutPoint::from_str(&format!("{}:2", "f".repeat(64))).unwrap();
+        }
+        assert!(
+            wallet
+                .assert_no_managed_rgb_spend(&unrelated.unsigned_tx)
+                .is_ok()
+        );
+    }
+    #[test]
+    fn native_isolation_refuses_overlapping_originals_but_unsigned_cancel_can_retire_one() {
+        let mut wallet = empty_wallet();
+        let original = staged_psbt();
+        retain(&mut wallet, &original, TransferStatus::Initiated);
+        let mut other = original.clone();
+        other.unsigned_tx.output[0].value = bitcoin::Amount::from_sat(1);
+        retain(&mut wallet, &other, TransferStatus::Initiated);
+        let other_id = other.unsigned_tx.compute_txid().to_string();
+        let mut other_request = request();
+        other_request.operation_id = "01a19805-0462-759b-9050-b9b0feb9da80".into();
+        wallet
+            .transfer_artifacts
+            .get_mut(&other_id)
+            .unwrap()
+            .external_send
+            .as_mut()
+            .unwrap()
+            .wallet_transfer = Some(validate_request(&mut other_request).unwrap().binding);
+        let id = request().operation_id;
+        assert!(
+            wallet
+                .wallet_rgb_signing_preflight(&id, &original.to_string(), 1_799_999_999)
+                .is_err()
+        );
+        assert!(
+            wallet
+                .wallet_rgb_unsigned_preflight(
+                    &other_request.operation_id,
+                    &other.to_string(),
+                    None
+                )
+                .is_ok()
+        );
+        let mut failed: DbBatchTransferActMod = wallet
+            .batch_transfer_by_txid(&other_id)
+            .unwrap()
+            .unwrap()
+            .into();
+        failed.status = ActiveValue::Set(TransferStatus::Failed);
+        wallet.database.update_batch_transfer(&mut failed).unwrap();
+        wallet
+            .transfer_artifacts
+            .get_mut(&other_id)
+            .unwrap()
+            .external_send
+            .as_mut()
+            .unwrap()
+            .status = ExternalSendStatus::Cancelled;
+        assert!(
+            wallet
+                .wallet_rgb_signing_preflight(&id, &original.to_string(), 1_799_999_999)
+                .is_ok()
+        );
+        // Cancellation releases this proposal's inputs, but never revives its exact original.
+        assert!(
+            wallet
+                .assert_no_managed_rgb_spend(&other.unsigned_tx)
+                .is_err()
+        );
+        wallet
+            .transfer_artifacts
+            .get_mut(&other_id)
+            .unwrap()
+            .external_send
+            .as_mut()
+            .unwrap()
+            .wallet_transfer
+            .as_mut()
+            .unwrap()
+            .signing_attempted = true;
+        assert!(wallet.managed_rgb_input_holds(None).is_err());
     }
     #[test]
     fn broadcast_preflight_refuses_replay_restore_expiry_and_different_original() {
