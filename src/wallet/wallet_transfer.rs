@@ -175,6 +175,120 @@ fn validate_request(r: &mut WalletRgbSendRequest) -> Result<ValidatedRequest, Er
 }
 
 impl Wallet {
+    fn wallet_rgb_signing_preflight(
+        &self,
+        operation_id: &str,
+        expected_psbt: &str,
+        now_unix: u64,
+    ) -> Result<(String, Psbt, u64), Error> {
+        if self.bitcoin_network() != BitcoinNetwork::Regtest {
+            return Err(Error::InvalidRecipientNetwork);
+        }
+        if expected_psbt.len() > 524_288 {
+            return Err(invalid());
+        }
+        let (txid, artifacts) = self
+            .wallet_transfer_by_operation(operation_id)?
+            .ok_or_else(|| Error::ExternalSendUnknown {
+                txid: operation_id.into(),
+            })?;
+        let conflict = || Error::ExternalSendConflict { txid: txid.clone() };
+        let external = artifacts.external_send.as_ref().unwrap();
+        let binding = external.wallet_transfer.as_ref().unwrap();
+        if external.status != ExternalSendStatus::Prepared
+            || binding.restored
+            || binding.signing_attempted
+            || binding.broadcast_attempted
+            || artifacts.signed_psbt.is_some()
+            || expected_psbt != external.prepared_psbt
+        {
+            return Err(conflict());
+        }
+        let mut request: WalletRgbSendRequest =
+            serde_json::from_str(&binding.request_json).map_err(|_| invalid())?;
+        let validated = validate_request(&mut request)?;
+        let batch = self.batch_transfer_by_txid(txid)?.ok_or_else(conflict)?;
+        if request.operation_id != operation_id
+            || request.expires_at <= now_unix
+            || validated.binding.request_json != binding.request_json
+            || batch.status != TransferStatus::Initiated
+            || batch.min_confirmations != request.min_confirmations
+        {
+            return Err(conflict());
+        }
+        let psbt = Psbt::from_str(expected_psbt)?;
+        if psbt.unsigned_tx.compute_txid().to_string() != *txid
+            || Self::tx_stripped_hex_from_unsigned(&psbt.unsigned_tx) != external.expected_tx_hex
+            || psbt.unsigned_tx.input.is_empty()
+            || psbt.unsigned_tx.input.len() > 128
+            || !psbt
+                .unsigned_tx
+                .output
+                .iter()
+                .any(|o| o.script_pubkey.is_op_return())
+        {
+            return Err(conflict());
+        }
+        Ok((txid.clone(), psbt, request.expires_at))
+    }
+
+    /// Sign only the exact wallet-owned preparation the customer reviewed.
+    /// The attempt commits before invoking the established BDK signer, and the
+    /// original signed bytes commit before acknowledgement. A repeated or
+    /// restored attempt is refused; recover/read the original instead.
+    pub async fn sign_wallet_rgb_send(
+        &mut self,
+        online: Online,
+        operation_id: String,
+        expected_psbt: String,
+    ) -> Result<serde_json::Value, Error> {
+        self.check_online(online)?;
+        self.wallet_rgb_signing_preflight(
+            &operation_id,
+            &expected_psbt,
+            u64::try_from(now().unix_timestamp()).map_err(|_| invalid())?,
+        )?;
+        let genesis = bitcoin::blockdata::constants::genesis_block(BdkNetwork::Regtest)
+            .block_hash()
+            .to_string();
+        if self.indexer().block_hash(0).await.map_err(|_| invalid())? != genesis {
+            return Err(Error::InvalidRecipientNetwork);
+        }
+        let (txid, mut psbt, expires_at) = self.wallet_rgb_signing_preflight(
+            &operation_id,
+            &expected_psbt,
+            u64::try_from(now().unix_timestamp()).map_err(|_| invalid())?,
+        )?;
+        self.transfer_artifacts
+            .get_mut(&txid)
+            .unwrap()
+            .external_send
+            .as_mut()
+            .unwrap()
+            .wallet_transfer
+            .as_mut()
+            .unwrap()
+            .signing_attempted = true;
+        self.flush().await?;
+        // Persistence may outlive the approval window. Keep the attempt barrier
+        // but do not invoke the signer after expiry.
+        if expires_at <= u64::try_from(now().unix_timestamp()).map_err(|_| invalid())? {
+            return Err(Error::ExternalSendConflict { txid });
+        }
+        let signing_result = self._sign_psbt(&mut psbt, None);
+        // Even an errored/partial signing attempt can have produced signatures.
+        // Preserve those original bytes before any fallible finalization or
+        // classification; never regenerate them after an unknown outcome.
+        self.transfer_artifacts.get_mut(&txid).unwrap().signed_psbt = Some(psbt.to_string());
+        self.flush().await?;
+        signing_result?;
+        let tx = psbt.clone().extract_tx().map_err(InternalError::from)?;
+        if tx.compute_txid().to_string() != txid || tx.input.iter().any(|i| i.witness.is_empty()) {
+            return Err(Error::CannotFinalizePsbt);
+        }
+        self.wallet_rgb_send_data(operation_id)
+    }
+
     fn wallet_transfer_by_operation(
         &self,
         id: &str,
@@ -466,6 +580,28 @@ impl Wallet {
         data["wallet_transfer"] = serde_json::to_value(binding).map_err(InternalError::from)?;
         data["batch_transfer_idx"] = serde_json::json!(batch.idx);
         data["batch_status"] = serde_json::to_value(batch.status).map_err(InternalError::from)?;
+        data["signed_psbt"] =
+            serde_json::to_value(&artifact.signed_psbt).map_err(InternalError::from)?;
+        data["signed_transaction_hex"] = match &artifact.signed_psbt {
+            None => serde_json::Value::Null,
+            Some(bytes) => {
+                let signed = Psbt::from_str(bytes)?;
+                if signed.unsigned_tx.compute_txid().to_string() != *txid {
+                    return Err(Error::ExternalSendConflict { txid: txid.clone() });
+                }
+                match signed.extract_tx() {
+                    Ok(tx)
+                        if !tx.input.is_empty()
+                            && tx.compute_txid().to_string() == *txid
+                            && tx.input.iter().all(|i| !i.witness.is_empty()) =>
+                    {
+                        serde_json::json!(hex::encode(bitcoin::consensus::serialize(&tx)))
+                    }
+                    _ => serde_json::Value::Null,
+                }
+            }
+        };
+        data["signing_complete"] = serde_json::json!(!data["signed_transaction_hex"].is_null());
         Ok(data)
     }
 }
@@ -714,6 +850,115 @@ mod tests {
         assert_eq!(data["batch_transfer_idx"], batch);
         assert!(data.get("transfers").is_none());
         assert_eq!(data["wallet_transfer"]["signing_attempted"], false);
+    }
+    #[test]
+    fn dedicated_signing_binds_original_and_refuses_attempt_restore_or_expiry_without_mutation() {
+        // Synthetic non-signable transaction: this tests lifecycle/byte guards,
+        // not RGB validity, possession of funds or execution of the signer.
+        let mut wallet = empty_wallet();
+        let psbt = Psbt::from_unsigned_tx(bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn::default()],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(vec![0x6a]),
+            }],
+        })
+        .unwrap();
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        let original = artifact(&psbt);
+        wallet
+            .transfer_artifacts
+            .insert(txid.clone(), original.clone());
+        wallet
+            .database
+            .set_batch_transfer(DbBatchTransferActMod {
+                txid: ActiveValue::Set(Some(txid.clone())),
+                status: ActiveValue::Set(TransferStatus::Initiated),
+                min_confirmations: ActiveValue::Set(1),
+                created_at: ActiveValue::Set(1),
+                expiration: ActiveValue::Set(Some(100)),
+                ..Default::default()
+            })
+            .unwrap();
+        let id = request().operation_id;
+        assert_eq!(
+            wallet
+                .wallet_rgb_signing_preflight(&id, &psbt.to_string(), 1_799_999_999)
+                .unwrap()
+                .0,
+            txid
+        );
+        assert!(matches!(
+            wallet.wallet_rgb_signing_preflight(&id, "changed-review-bytes", 1_799_999_999),
+            Err(Error::ExternalSendConflict { .. })
+        ));
+        for flag in ["restored", "signing_attempted", "broadcast_attempted"] {
+            let mut value = serde_json::to_value(&original).unwrap();
+            value["external_send"]["wallet_transfer"][flag] = serde_json::json!(true);
+            wallet
+                .transfer_artifacts
+                .insert(txid.clone(), serde_json::from_value(value).unwrap());
+            let before = serde_json::to_value(&wallet.transfer_artifacts).unwrap();
+            assert!(matches!(
+                wallet.wallet_rgb_signing_preflight(&id, &psbt.to_string(), 1_799_999_999),
+                Err(Error::ExternalSendConflict { .. })
+            ));
+            assert_eq!(
+                serde_json::to_value(&wallet.transfer_artifacts).unwrap(),
+                before
+            );
+        }
+        wallet
+            .transfer_artifacts
+            .insert(txid.clone(), original.clone());
+        wallet
+            .transfer_artifacts
+            .get_mut(&txid)
+            .unwrap()
+            .signed_psbt = Some("retained-original".into());
+        assert!(matches!(
+            wallet.wallet_rgb_signing_preflight(&id, &psbt.to_string(), 1_799_999_999),
+            Err(Error::ExternalSendConflict { .. })
+        ));
+        wallet.transfer_artifacts.insert(txid.clone(), original);
+        let mut expired = request();
+        expired.expires_at = 1;
+        wallet
+            .transfer_artifacts
+            .get_mut(&txid)
+            .unwrap()
+            .external_send
+            .as_mut()
+            .unwrap()
+            .wallet_transfer
+            .as_mut()
+            .unwrap()
+            .request_json = serde_json::to_string(&expired).unwrap();
+        let before = serde_json::to_value(&wallet.transfer_artifacts).unwrap();
+        assert!(matches!(
+            wallet.wallet_rgb_signing_preflight(&id, &psbt.to_string(), 1_799_999_999),
+            Err(Error::ExternalSendConflict { .. })
+        ));
+        assert_eq!(
+            serde_json::to_value(&wallet.transfer_artifacts).unwrap(),
+            before
+        );
+        let attempted = wallet.transfer_artifacts.get_mut(&txid).unwrap();
+        attempted.signed_psbt = Some(psbt.to_string());
+        attempted
+            .external_send
+            .as_mut()
+            .unwrap()
+            .wallet_transfer
+            .as_mut()
+            .unwrap()
+            .signing_attempted = true;
+        let data = wallet.wallet_rgb_send_data(id).unwrap();
+        assert_eq!(data["signed_psbt"], psbt.to_string());
+        assert_eq!(data["signing_complete"], false);
+        assert!(data["signed_transaction_hex"].is_null());
     }
     #[test]
     fn duplicate_operation_ids_in_corrupt_storage_fail_closed_instead_of_guessing() {
