@@ -41,6 +41,143 @@ pub struct WalletSnapshot {
     pub reuse_address_index: HashMap<KeychainKind, u32>,
 }
 
+/// Older engines ignore unknown transfer metadata. A required wrapper makes
+/// them refuse managed ordinary-send state instead of losing its attempt flags.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedSnapshot {
+    version: u8,
+    managed_wallet_state: WalletSnapshot,
+}
+
+fn managed_transfers(snapshot: &WalletSnapshot) -> bool {
+    snapshot.transfer_artifacts.values().any(|a| {
+        a.external_send
+            .as_ref()
+            .is_some_and(|e| e.wallet_transfer.is_some())
+    })
+}
+
+fn encode_snapshot(snapshot: &WalletSnapshot) -> Result<String, String> {
+    if managed_transfers(snapshot) {
+        #[derive(Serialize)]
+        struct Envelope<'a> {
+            version: u8,
+            managed_wallet_state: &'a WalletSnapshot,
+        }
+        serde_json::to_string(&Envelope {
+            version: 1,
+            managed_wallet_state: snapshot,
+        })
+    } else {
+        serde_json::to_string(snapshot)
+    }
+    .map_err(|_| "Wallet snapshot serialization failed".to_string())
+}
+
+fn decode_snapshot(json: &str) -> Result<WalletSnapshot, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|_| "Wallet snapshot decoding failed".to_string())?;
+    if value.get("managed_wallet_state").is_some() || value.get("version").is_some() {
+        let envelope: ManagedSnapshot = serde_json::from_value(value)
+            .map_err(|_| "Unsupported managed wallet snapshot".to_string())?;
+        if envelope.version != 1 {
+            return Err("Unsupported managed wallet snapshot version".into());
+        }
+        Ok(envelope.managed_wallet_state)
+    } else {
+        let snapshot: WalletSnapshot = serde_json::from_value(value)
+            .map_err(|_| "Wallet snapshot decoding failed".to_string())?;
+        if managed_transfers(&snapshot) {
+            return Err("Managed wallet state requires its versioned snapshot".into());
+        }
+        Ok(snapshot)
+    }
+}
+
+/// A durable flush acknowledgement must never mean that a signing-attempt
+/// snapshot was silently skipped. Managed originals are append-only even when
+/// another tab has a newer sequence. Callers must reload/reconcile on failure.
+fn snapshot_write_required(
+    existing: &WalletSnapshot,
+    candidate: &WalletSnapshot,
+) -> Result<bool, String> {
+    let refused = || "Managed wallet snapshot is stale or loses original obligations".to_string();
+    if existing.sequence >= candidate.sequence {
+        return if managed_transfers(existing) || managed_transfers(candidate) {
+            Err(refused())
+        } else {
+            Ok(false)
+        };
+    }
+    for (txid, old_artifact) in &existing.transfer_artifacts {
+        let Some(old) = old_artifact
+            .external_send
+            .as_ref()
+            .filter(|e| e.wallet_transfer.is_some())
+        else {
+            continue;
+        };
+        let new_artifact = candidate.transfer_artifacts.get(txid).ok_or_else(refused)?;
+        let new = new_artifact.external_send.as_ref().ok_or_else(refused)?;
+        let old_binding = old.wallet_transfer.as_ref().unwrap();
+        let new_binding = new.wallet_transfer.as_ref().ok_or_else(refused)?;
+        if old_binding.operation_id != new_binding.operation_id
+            || old_binding.request_json != new_binding.request_json
+            || (old_binding.signing_attempted && !new_binding.signing_attempted)
+            || (old_binding.broadcast_attempted && !new_binding.broadcast_attempted)
+            || (old_binding.restored && !new_binding.restored)
+            || old.prepared_psbt != new.prepared_psbt
+            || old.expected_tx_hex != new.expected_tx_hex
+            || old.fascia_json != new.fascia_json
+            || old.recipients_digest != new.recipients_digest
+            || old_artifact.consignment_bytes != new_artifact.consignment_bytes
+            || (old_artifact.signed_psbt.is_some()
+                && old_artifact.signed_psbt != new_artifact.signed_psbt)
+            || (old.conflict_txid.is_some() && old.conflict_txid != new.conflict_txid)
+        {
+            return Err(refused());
+        }
+        use super::online::ExternalSendStatus;
+        match old.status {
+            ExternalSendStatus::Prepared => {}
+            ExternalSendStatus::BroadcastRecorded => {
+                if !matches!(
+                    new.status,
+                    ExternalSendStatus::BroadcastRecorded | ExternalSendStatus::Finalized
+                ) {
+                    return Err(refused());
+                }
+            }
+            ExternalSendStatus::Finalized | ExternalSendStatus::Conflicted => {
+                if new.status != old.status {
+                    return Err(refused());
+                }
+            }
+        }
+    }
+    for (txid, artifact) in &candidate.transfer_artifacts {
+        let Some(binding) = artifact
+            .external_send
+            .as_ref()
+            .and_then(|e| e.wallet_transfer.as_ref())
+        else {
+            continue;
+        };
+        if (artifact.signed_psbt.is_some() && !binding.signing_attempted)
+            || (binding.broadcast_attempted && artifact.signed_psbt.is_none())
+            || existing.transfer_artifacts.get(txid).is_some_and(|a| {
+                a.external_send
+                    .as_ref()
+                    .is_none_or(|e| e.wallet_transfer.is_none())
+            })
+        {
+            return Err(refused());
+        }
+    }
+    Ok(true)
+}
+
 async fn open_db() -> Result<Rexie, String> {
     let rexie = Rexie::builder(DB_NAME)
         .version(DB_VERSION)
@@ -61,7 +198,7 @@ pub async fn save_snapshot(key: &str, snapshot: &WalletSnapshot) -> Result<(), S
         .store(STORE_NAME)
         .map_err(|e| format!("IndexedDB store error: {e:?}"))?;
 
-    let json_str = serde_json::to_string(snapshot).map_err(|e| format!("Serialize error: {e}"))?;
+    let json_str = encode_snapshot(snapshot)?;
     let js_key = JsValue::from_str(key);
     if let Some(existing) = store
         .get(js_key.clone())
@@ -71,9 +208,8 @@ pub async fn save_snapshot(key: &str, snapshot: &WalletSnapshot) -> Result<(), S
         let json = existing
             .as_string()
             .ok_or_else(|| "IndexedDB value is not a string".to_string())?;
-        let existing: WalletSnapshot =
-            serde_json::from_str(&json).map_err(|e| format!("Deserialize error: {e}"))?;
-        if existing.sequence >= snapshot.sequence {
+        let existing = decode_snapshot(&json)?;
+        if !snapshot_write_required(&existing, snapshot)? {
             tx.done()
                 .await
                 .map_err(|e| format!("IndexedDB commit error: {e:?}"))?;
@@ -181,8 +317,7 @@ pub async fn load_snapshot(key: &str) -> Result<Option<WalletSnapshot>, String> 
             let json_str = js_val
                 .as_string()
                 .ok_or_else(|| "IndexedDB value is not a string".to_string())?;
-            let snapshot: WalletSnapshot =
-                serde_json::from_str(&json_str).map_err(|e| format!("Deserialize error: {e}"))?;
+            let snapshot = decode_snapshot(&json_str)?;
             Ok(Some(snapshot))
         }
         None => Ok(None),
@@ -196,6 +331,128 @@ mod tests {
     use rgbstd::contract::IssuerWrapper;
     use rgbstd::persistence::Stock;
     use schemata::NonInflatableAsset;
+
+    #[test]
+    fn managed_snapshot_blocks_old_readers_and_preserves_original_attempts() {
+        let mut snapshot = WalletSnapshot {
+            sequence: u64::MAX,
+            db: InMemoryDb::new(),
+            bdk_changeset: None,
+            transfer_artifacts: HashMap::new(),
+            received_consignments: HashMap::new(),
+            stock_stash_b64: None,
+            stock_state_b64: None,
+            stock_index_b64: None,
+            reuse_address_index: HashMap::new(),
+        };
+        let legacy = encode_snapshot(&snapshot).unwrap();
+        assert!(serde_json::from_str::<WalletSnapshot>(&legacy).is_ok());
+        assert_eq!(decode_snapshot(&legacy).unwrap().sequence, u64::MAX);
+        snapshot.sequence = 7;
+        let artifact = serde_json::from_value(serde_json::json!({
+            "batch_info": null, "asset_infos": {}, "consignment_bytes": {"asset":[1,2,3]},
+            "signed_psbt": "original-signed-bytes", "external_send": {
+                "prepared_psbt": "original-prepared-bytes", "expected_tx_hex":"00",
+                "fascia_json":"{}", "recipients_digest":"original-digest", "status":"Prepared",
+                "conflict_txid":null, "wallet_transfer":{
+                    "operation_id":"01a19805-0462-759b-9050-b9b0feb9da8f",
+                    "request_json":"immutable-request", "signing_attempted":true, "broadcast_attempted":true
+                }
+            }
+        })).unwrap();
+        snapshot
+            .transfer_artifacts
+            .insert("original-txid".into(), artifact);
+        let encoded = encode_snapshot(&snapshot).unwrap();
+        assert!(serde_json::from_str::<WalletSnapshot>(&encoded).is_err());
+        let restored = decode_snapshot(&encoded).unwrap();
+        assert_eq!(restored.sequence, snapshot.sequence);
+        assert_eq!(
+            serde_json::to_value(&restored.transfer_artifacts).unwrap(),
+            serde_json::to_value(&snapshot.transfer_artifacts).unwrap()
+        );
+        let mut unknown: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        unknown["version"] = serde_json::json!(2);
+        assert!(decode_snapshot(&unknown.to_string()).is_err());
+        unknown["version"] = serde_json::json!(1);
+        unknown["db"] = serde_json::to_value(&snapshot.db).unwrap();
+        assert!(decode_snapshot(&unknown.to_string()).is_err());
+        assert!(decode_snapshot(&serde_json::to_string(&snapshot).unwrap()).is_err());
+
+        // A skipped stale write cannot acknowledge a pre-signing flush.
+        let existing = decode_snapshot(&encoded).unwrap();
+        let mut candidate = decode_snapshot(&encoded).unwrap();
+        assert!(snapshot_write_required(&existing, &candidate).is_err());
+        candidate.sequence += 1;
+        assert_eq!(snapshot_write_required(&existing, &candidate), Ok(true));
+        let original = candidate.transfer_artifacts["original-txid"].clone();
+        candidate.transfer_artifacts.clear();
+        assert!(snapshot_write_required(&existing, &candidate).is_err());
+        candidate
+            .transfer_artifacts
+            .insert("original-txid".into(), original.clone());
+        candidate
+            .transfer_artifacts
+            .get_mut("original-txid")
+            .unwrap()
+            .signed_psbt = None;
+        assert!(snapshot_write_required(&existing, &candidate).is_err());
+        candidate
+            .transfer_artifacts
+            .insert("original-txid".into(), original.clone());
+        candidate
+            .transfer_artifacts
+            .get_mut("original-txid")
+            .unwrap()
+            .consignment_bytes
+            .clear();
+        assert!(snapshot_write_required(&existing, &candidate).is_err());
+        candidate
+            .transfer_artifacts
+            .insert("original-txid".into(), original);
+        candidate
+            .transfer_artifacts
+            .get_mut("original-txid")
+            .unwrap()
+            .external_send
+            .as_mut()
+            .unwrap()
+            .wallet_transfer
+            .as_mut()
+            .unwrap()
+            .broadcast_attempted = false;
+        assert!(snapshot_write_required(&existing, &candidate).is_err());
+        let mut restored_existing = decode_snapshot(&encoded).unwrap();
+        restored_existing
+            .transfer_artifacts
+            .get_mut("original-txid")
+            .unwrap()
+            .external_send
+            .as_mut()
+            .unwrap()
+            .wallet_transfer
+            .as_mut()
+            .unwrap()
+            .restored = true;
+        let mut candidate = decode_snapshot(&encoded).unwrap();
+        candidate.sequence += 1;
+        assert!(snapshot_write_required(&restored_existing, &candidate).is_err());
+        candidate
+            .transfer_artifacts
+            .get_mut("original-txid")
+            .unwrap()
+            .external_send
+            .as_mut()
+            .unwrap()
+            .wallet_transfer
+            .as_mut()
+            .unwrap()
+            .restored = true;
+        assert_eq!(
+            snapshot_write_required(&restored_existing, &candidate),
+            Ok(true)
+        );
+    }
 
     #[test]
     fn stock_serialize_round_trip_empty() {
@@ -279,9 +536,8 @@ mod tests {
         };
 
         // JSON round-trip (what IndexedDB does)
-        let json = serde_json::to_string(&snapshot).expect("serialize snapshot to JSON");
-        let restored_snapshot: WalletSnapshot =
-            serde_json::from_str(&json).expect("deserialize snapshot from JSON");
+        let json = encode_snapshot(&snapshot).expect("serialize snapshot to JSON");
+        let restored_snapshot = decode_snapshot(&json).expect("deserialize snapshot from JSON");
         let restored_artifact = restored_snapshot
             .transfer_artifacts
             .get("funding-txid")

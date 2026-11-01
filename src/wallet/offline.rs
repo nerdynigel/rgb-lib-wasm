@@ -3017,7 +3017,14 @@ impl Wallet {
         Ok(super::idb_store::WalletSnapshot {
             sequence: self
                 .idb_sequence
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |sequence| sequence.checked_add(1),
+                )
+                .map_err(|_| Error::Persistence {
+                    details: s!("Wallet snapshot sequence exhausted; preserve current state"),
+                })?
                 + 1,
             db: self.database.as_ref().clone(),
             bdk_changeset: self.bdk_database.get_data().clone(),
@@ -3170,6 +3177,22 @@ mod address_reuse_tests {
     use super::*;
     use crate::keys::generate_keys;
     use crate::utils::{get_descriptors, str_to_xpub};
+
+    #[test]
+    fn snapshot_sequence_exhaustion_refuses_without_wrapping() {
+        let wallet = make_test_wallet(false);
+        *wallet.rgb_stock.borrow_mut() = Some(Stock::in_memory());
+        wallet
+            .idb_sequence
+            .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(wallet.snapshot(), Err(Error::Persistence { .. })));
+        assert_eq!(
+            wallet
+                .idb_sequence
+                .load(std::sync::atomic::Ordering::SeqCst),
+            u64::MAX
+        );
+    }
 
     /// Helper: build a minimal Wallet for native tests.
     ///

@@ -66,6 +66,10 @@ pub(crate) struct WalletTransferBinding {
     pub(crate) request_json: String,
     pub(crate) signing_attempted: bool,
     pub(crate) broadcast_attempted: bool,
+    /// A backup can predate a later signature/broadcast on another device.
+    /// Restored pending operations may only observe/reconcile the original.
+    #[serde(default)]
+    pub(crate) restored: bool,
 }
 
 struct ValidatedRequest {
@@ -153,6 +157,7 @@ fn validate_request(r: &mut WalletRgbSendRequest) -> Result<ValidatedRequest, Er
             request_json,
             signing_attempted: false,
             broadcast_attempted: false,
+            restored: false,
         },
         recipient: Recipient {
             recipient_id: r.recipient_id.clone(),
@@ -671,6 +676,7 @@ mod tests {
             request_json: "exact-bound-request".into(),
             signing_attempted: true,
             broadcast_attempted: true,
+            restored: true,
         };
         let restored: WalletTransferBinding =
             serde_json::from_str(&serde_json::to_string(&original).unwrap()).unwrap();

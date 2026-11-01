@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 use crate::error::InternalError;
 
-pub(crate) const BACKUP_VERSION: u8 = 2;
+pub(crate) const BACKUP_VERSION: u8 = 3;
 /// 24-byte nonce for XChaCha20Poly1305 (single-shot mode).
 const NONCE_LEN: usize = 24;
 
@@ -48,6 +48,60 @@ pub(crate) struct WalletBackupPayload {
         std::collections::HashMap<String, super::online::TransferArtifacts>,
     #[serde(default)]
     pub(crate) received_consignments: std::collections::HashMap<String, Vec<u8>>,
+}
+
+/// The encrypted payload also carries its format. Merely changing an
+/// unauthenticated public version header must not make an old engine silently
+/// discard ordinary-transfer signing/broadcast obligations.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionedWalletBackup {
+    version: u8,
+    wallet_state: WalletBackupPayload,
+}
+
+fn decode_wallet_payload(bytes: &[u8], version: Option<u8>) -> Result<WalletBackupPayload, Error> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| Error::InvalidBackup)?;
+    if value.get("wallet_state").is_some() || value.get("version").is_some() {
+        let envelope: VersionedWalletBackup =
+            serde_json::from_value(value).map_err(|_| Error::InvalidBackup)?;
+        if envelope.version != BACKUP_VERSION || version.is_some_and(|v| v != BACKUP_VERSION) {
+            return Err(Error::InvalidBackup);
+        }
+        Ok(envelope.wallet_state)
+    } else {
+        if version.is_some_and(|v| v != 2) {
+            return Err(Error::InvalidBackup);
+        }
+        let payload: WalletBackupPayload =
+            serde_json::from_value(value).map_err(|_| Error::InvalidBackup)?;
+        if payload.transfer_artifacts.values().any(|a| {
+            a.external_send
+                .as_ref()
+                .is_some_and(|e| e.wallet_transfer.is_some())
+        }) {
+            return Err(Error::InvalidBackup);
+        }
+        Ok(payload)
+    }
+}
+
+fn fence_restored_pending_transfers(
+    artifacts: &mut std::collections::HashMap<String, super::online::TransferArtifacts>,
+) {
+    use super::online::ExternalSendStatus;
+    for artifact in artifacts.values_mut() {
+        if let Some(external) = artifact.external_send.as_mut()
+            && matches!(
+                external.status,
+                ExternalSendStatus::Prepared | ExternalSendStatus::BroadcastRecorded
+            )
+            && let Some(binding) = external.wallet_transfer.as_mut()
+        {
+            binding.restored = true;
+        }
+    }
 }
 
 /// Derive a 32-byte key from password + salt using Scrypt.
@@ -104,7 +158,7 @@ pub(crate) fn decrypt_payload(
     password: &str,
     pub_data: &BackupPubData,
 ) -> Result<Vec<u8>, Error> {
-    if pub_data.version != BACKUP_VERSION {
+    if ![2, BACKUP_VERSION].contains(&pub_data.version) {
         return Err(Error::UnsupportedBackupVersion {
             version: pub_data.version.to_string(),
         });
@@ -154,13 +208,13 @@ use strict_encoding::StrictSerialize;
 
 impl super::Wallet {
     /// Read-only exact-state check for a lost restore acknowledgement. Only
-    /// backup bookkeeping timestamps/counters are excluded; every financial
-    /// record, BDK changeset, Stock byte and pending artifact must match.
+    /// backup bookkeeping timestamps/counters, monotonic public derivations and
+    /// the conservative restored barrier are excluded. Original attempts,
+    /// transaction bytes, Stock and financial records must match.
     pub fn matches_backup_state(&self, bytes: &[u8], password: &str) -> Result<bool, Error> {
         let (public, ciphertext) = decode_backup(bytes)?;
         let plaintext = decrypt_payload(ciphertext, password, &public)?;
-        let mut payload: WalletBackupPayload =
-            serde_json::from_slice(&plaintext).map_err(|_| Error::InvalidBackup)?;
+        let mut payload = decode_wallet_payload(&plaintext, Some(public.version))?;
         self.check_backup_identity(&payload)?;
         // Normal unlock reveals the next public address. It must not make a
         // completed restore look like a different financial history. Permit
@@ -174,10 +228,27 @@ impl super::Wallet {
             }
             expected.indexer = actual.indexer.clone();
         }
+        for (txid, expected) in &mut payload.transfer_artifacts {
+            if let Some(binding) = expected
+                .external_send
+                .as_mut()
+                .and_then(|a| a.wallet_transfer.as_mut())
+                && self.transfer_artifacts.get(txid).is_some_and(|a| {
+                    a.external_send
+                        .as_ref()
+                        .and_then(|a| a.wallet_transfer.as_ref())
+                        .is_some_and(|b| b.restored)
+                })
+            {
+                binding.restored = true;
+            }
+        }
         let mut expected = serde_json::to_value(payload).map_err(InternalError::from)?;
-        let mut actual: serde_json::Value =
-            serde_json::from_slice(&self.serialize_backup_payload()?)
-                .map_err(InternalError::from)?;
+        let mut actual = serde_json::to_value(decode_wallet_payload(
+            &self.serialize_backup_payload()?,
+            Some(BACKUP_VERSION),
+        )?)
+        .map_err(InternalError::from)?;
         for value in [&mut expected, &mut actual] {
             let db = value
                 .get_mut("db")
@@ -211,8 +282,7 @@ impl super::Wallet {
         let payload_json = decrypt_payload(ciphertext, password, &pub_data)?;
 
         // 3. Deserialize payload
-        let payload: WalletBackupPayload =
-            serde_json::from_slice(&payload_json).map_err(|_| Error::InvalidBackup)?;
+        let payload = decode_wallet_payload(&payload_json, Some(pub_data.version))?;
         self.check_backup_identity(&payload)?;
 
         self.install_backup_payload(payload)?;
@@ -222,7 +292,7 @@ impl super::Wallet {
 
     // Decode and validate the entire snapshot in a temporary instance. Invalid
     // Stock/BDK data must never leave the live wallet half-restored.
-    fn install_backup_payload(&mut self, payload: WalletBackupPayload) -> Result<(), Error> {
+    fn install_backup_payload(&mut self, mut payload: WalletBackupPayload) -> Result<(), Error> {
         self.check_backup_identity(&payload)?;
         // Device recovery is permitted only into an empty engine. Never
         // overwrite newer financial state or discard unresolved obligations.
@@ -230,6 +300,9 @@ impl super::Wallet {
         if !current.batch_transfers.is_empty() || !current.txos.is_empty() {
             return Err(Error::InvalidBackup);
         }
+        // A file may predate a later signature on another device. Restoring
+        // cannot grant a fresh attempt for any pending original operation.
+        fence_restored_pending_transfers(&mut payload.transfer_artifacts);
         let snapshot = super::idb_store::WalletSnapshot {
             sequence: 0,
             db: payload.db,
@@ -344,8 +417,7 @@ impl super::Wallet {
         })?;
 
         let payload_json = client.download_backup().await?;
-        let payload: WalletBackupPayload =
-            serde_json::from_slice(&payload_json).map_err(|_| Error::InvalidBackup)?;
+        let payload = decode_wallet_payload(&payload_json, None)?;
         self.check_backup_identity(&payload)?;
 
         self.install_backup_payload(payload)?;
@@ -403,7 +475,11 @@ impl super::Wallet {
             received_consignments: self.received_consignments.clone(),
         };
 
-        serde_json::to_vec(&payload).map_err(|e| InternalError::from(e).into())
+        serde_json::to_vec(&VersionedWalletBackup {
+            version: BACKUP_VERSION,
+            wallet_state: payload,
+        })
+        .map_err(|e| InternalError::from(e).into())
     }
 
     fn backup_identity(&self) -> (String, String, String) {
@@ -463,6 +539,7 @@ mod tests {
     fn backup_payload_preserves_pending_external_and_received_bytes() {
         use super::super::online::{ExternalSendArtifact, ExternalSendStatus, TransferArtifacts};
         let artifacts = TransferArtifacts {
+            signed_psbt: Some("exact-original-signed-psbt".into()),
             consignment_bytes: std::collections::HashMap::from([("asset".into(), vec![1, 2, 3])]),
             external_send: Some(ExternalSendArtifact {
                 conflict_txid: None,
@@ -504,8 +581,32 @@ mod tests {
                 vec![4, 5, 6],
             )]),
         };
-        let encoded = serde_json::to_vec(&payload).unwrap();
-        let restored: WalletBackupPayload = serde_json::from_slice(&encoded).unwrap();
+        let encoded = serde_json::to_vec(&serde_json::json!({
+            "version": BACKUP_VERSION,
+            "wallet_state": &payload
+        }))
+        .unwrap();
+        let restored = decode_wallet_payload(&encoded, Some(BACKUP_VERSION)).unwrap();
+        // An old decoder must refuse this encrypted plaintext even if someone
+        // relabels the unencrypted header as v2.
+        assert!(serde_json::from_slice::<WalletBackupPayload>(&encoded).is_err());
+        assert!(decode_wallet_payload(&encoded, Some(2)).is_err());
+        let (ciphertext, mut public) = encrypt_payload(&encoded, "backup-codec-test").unwrap();
+        public.version = 2;
+        let downgraded = decrypt_payload(&ciphertext, "backup-codec-test", &public).unwrap();
+        assert!(serde_json::from_slice::<WalletBackupPayload>(&downgraded).is_err());
+        assert!(decode_wallet_payload(&downgraded, Some(public.version)).is_err());
+
+        let raw = serde_json::to_vec(&payload).unwrap();
+        assert!(decode_wallet_payload(&raw, Some(2)).is_err());
+        let mut legacy = serde_json::to_value(&payload).unwrap();
+        legacy["transfer_artifacts"] = serde_json::json!({});
+        let legacy = serde_json::to_vec(&legacy).unwrap();
+        let old = decode_wallet_payload(&legacy, Some(2)).unwrap();
+        assert_eq!(old.wallet_identity, payload.wallet_identity);
+        assert_eq!(old.received_consignments, payload.received_consignments);
+        assert!(decode_wallet_payload(&legacy, Some(BACKUP_VERSION)).is_err());
+        assert!(decode_wallet_payload(&legacy, None).is_ok());
         assert_eq!(restored.wallet_identity, payload.wallet_identity);
         let pending = &restored.transfer_artifacts["transaction"];
         assert_eq!(
@@ -513,6 +614,10 @@ mod tests {
             ExternalSendStatus::BroadcastRecorded
         );
         assert_eq!(pending.consignment_bytes["asset"], vec![1, 2, 3]);
+        assert_eq!(
+            pending.signed_psbt.as_deref(),
+            Some("exact-original-signed-psbt")
+        );
         let binding = pending
             .external_send
             .as_ref()
@@ -522,6 +627,21 @@ mod tests {
             .unwrap();
         assert_eq!(binding.request_json, "exact-pending-wallet-request");
         assert!(binding.signing_attempted && binding.broadcast_attempted);
+        let mut fenced = restored.transfer_artifacts.clone();
+        fence_restored_pending_transfers(&mut fenced);
+        let binding = fenced["transaction"]
+            .external_send
+            .as_ref()
+            .unwrap()
+            .wallet_transfer
+            .as_ref()
+            .unwrap();
+        assert!(binding.restored && binding.signing_attempted && binding.broadcast_attempted);
+        assert_eq!(fenced["transaction"].signed_psbt, pending.signed_psbt);
+        assert_eq!(
+            fenced["transaction"].consignment_bytes,
+            pending.consignment_bytes
+        );
         assert_eq!(restored.received_consignments["recipient"], vec![4, 5, 6]);
     }
 
