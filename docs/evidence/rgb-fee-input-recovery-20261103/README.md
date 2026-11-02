@@ -23,6 +23,8 @@ fee-input proof. Caller-owned other holds remain mandatory. RGB asset seals
 cannot be recovery inputs. Only one input and one wallet-owned VANILLA output,
 full value less an exact1..1000sat fee, no arbitrary destination/amount/change,
 no nonbinding sighash, regtest genesis, and a separate120second approval qualify.
+Version2, non-future block locktime and disabled relative timelocks are required;
+mutated versions, future locktimes and relative sequence values are refused.
 BDK performs construction/signing. A native snapshot commit precedes signing and
 submission so a stale other-tab instance cannot authorize using its old mark.
 The host must retain the NEW original/attempt and inputs before these methods.

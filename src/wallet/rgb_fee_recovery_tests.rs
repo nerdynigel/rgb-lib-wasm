@@ -246,6 +246,9 @@ fn altered_destination_amount_input_value_and_nonbinding_sighashes_are_not_signe
         "value",
         "none_sighash",
         "anyonecanpay",
+        "version",
+        "future_locktime",
+        "relative_sequence",
     ] {
         let mut changed = original.clone();
         match mode {
@@ -268,6 +271,12 @@ fn altered_destination_amount_input_value_and_nonbinding_sighashes_are_not_signe
                 changed.inputs[0].sighash_type =
                     Some(bitcoin::psbt::PsbtSighashType::from_u32(0x81))
             }
+            "version" => changed.unsigned_tx.version = bitcoin::transaction::Version::ONE,
+            "future_locktime" => {
+                changed.unsigned_tx.lock_time =
+                    bitcoin::absolute::LockTime::from_height(201).unwrap()
+            }
+            "relative_sequence" => changed.unsigned_tx.input[0].sequence = bitcoin::Sequence(1),
             _ => unreachable!(),
         }
         assert!(

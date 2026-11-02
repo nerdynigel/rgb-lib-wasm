@@ -162,7 +162,15 @@ impl Wallet {
             return Err(refused());
         }
         let psbt = Psbt::from_str(encoded).map_err(|_| refused())?;
-        if psbt.inputs.len() != 1
+        if psbt.unsigned_tx.version != bitcoin::transaction::Version::TWO
+            || !psbt.unsigned_tx.lock_time.is_block_height()
+            || psbt.unsigned_tx.lock_time.to_consensus_u32()
+                > self.bdk_wallet.latest_checkpoint().height()
+            || !matches!(
+                psbt.unsigned_tx.input.first().map(|i| i.sequence.0),
+                Some(0xffff_fffd..=0xffff_ffff)
+            )
+            || psbt.inputs.len() != 1
             || psbt.unsigned_tx.input.len() != 1
             || psbt.unsigned_tx.output.len() != 1
             || psbt.unsigned_tx.input[0].previous_output != point
