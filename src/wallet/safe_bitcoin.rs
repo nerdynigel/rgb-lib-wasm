@@ -675,7 +675,9 @@ pub(super) mod tests {
                 } else {
                     OutPoint {
                         txid: Txid::from_byte_array([71; 32]),
-                        vout: value as u32,
+                        // Equal-value coins are independent, never accidental
+                        // conflicting spends of the same invented parent.
+                        vout: u32::try_from(wallet.bdk_wallet.transactions().count()).unwrap(),
                     }
                 },
                 ..Default::default()
@@ -1000,6 +1002,134 @@ pub(super) mod tests {
         assert_eq!(psbt.unsigned_tx.output[3].script_pubkey, bitcoin_change);
         assert_eq!(change.unwrap().vout, 3);
         assert!(psbt.unsigned_tx.output[3].value.to_sat() > 90000);
+    }
+
+    #[test]
+    fn rgb_builder_handles_split_carriers_and_assignment_free_fee_input() {
+        let mut wallet = wallet();
+        let first = coin(&mut wallet, KeychainKind::External, 1000, true, false);
+        let second = coin(&mut wallet, KeychainKind::External, 1000, true, false);
+        let fee = coin(&mut wallet, KeychainKind::Internal, 93769, true, false);
+        let contract = ContractBuilder::with(
+            Identity::default(),
+            NonInflatableAsset::schema(),
+            NonInflatableAsset::types(),
+            NonInflatableAsset::scripts(),
+            wallet.chain_net(),
+        )
+        .add_global_state(
+            "spec",
+            AssetSpec {
+                ticker: Ticker::try_from("FAKE".to_owned()).unwrap(),
+                name: Name::try_from("Clearly fake split unit asset".to_owned()).unwrap(),
+                details: None,
+                precision: Precision::try_from(0u8).unwrap(),
+            },
+        )
+        .unwrap()
+        .add_global_state(
+            "terms",
+            ContractTerms {
+                text: RicardianContract::default(),
+                media: None,
+            },
+        )
+        .unwrap()
+        .add_global_state("issuedSupply", Amount::from(4u64))
+        .unwrap()
+        .add_fungible_state("assetOwner", wallet.get_builder_seal(first), 1u64)
+        .unwrap()
+        .add_fungible_state("assetOwner", wallet.get_builder_seal(second), 3u64)
+        .unwrap()
+        .issue_contract()
+        .unwrap();
+        let id = contract.contract_id();
+        wallet
+            .rgb_runtime()
+            .unwrap()
+            .import_contract(contract, &DumbResolver)
+            .unwrap();
+        let recipient = wallet
+            ._get_new_address(KeychainKind::External)
+            .unwrap()
+            .script_pubkey();
+        let asset_change = wallet
+            ._get_new_address(KeychainKind::External)
+            .unwrap()
+            .script_pubkey();
+        let bitcoin_change = wallet
+            ._get_new_address(KeychainKind::Internal)
+            .unwrap()
+            .script_pubkey();
+        let rate = wallet._check_fee_rate(3).unwrap();
+        let outputs = vec![(recipient.clone(), 1000), (asset_change.clone(), 1000)];
+        let insufficient = wallet.prepare_psbt_with_change(
+            HashSet::from([first, second]),
+            &outputs,
+            rate,
+            None,
+            bitcoin_change.clone(),
+        );
+        assert!(
+            matches!(insufficient, Err(Error::InsufficientBitcoins { .. })),
+            "{insufficient:?}"
+        );
+        let (mut psbt, change) = wallet
+            .prepare_psbt_with_change(
+                HashSet::from([first, second, fee]),
+                &outputs,
+                rate,
+                None,
+                bitcoin_change.clone(),
+            )
+            .unwrap();
+        assert_eq!(psbt.unsigned_tx.input.len(), 3);
+        assert_eq!(psbt.unsigned_tx.output.len(), 4);
+        assert!(psbt.unsigned_tx.output[0].script_pubkey.is_op_return());
+        assert_eq!(psbt.unsigned_tx.output[1].script_pubkey, recipient);
+        assert_eq!(psbt.unsigned_tx.output[2].script_pubkey, asset_change);
+        assert_eq!(psbt.unsigned_tx.output[3].script_pubkey, bitcoin_change);
+        assert_eq!(change.unwrap().vout, 3);
+        let stock = super::super::super::idb_store::serialize_stock(
+            wallet.rgb_stock.borrow().as_ref().unwrap(),
+        )
+        .unwrap();
+        let (fascia, beneficiaries) = wallet
+            .color_psbt(
+                &mut psbt,
+                super::super::rust_only::ColoringInfo {
+                    asset_info_map: HashMap::from([(
+                        id,
+                        super::super::rust_only::AssetColoringInfo {
+                            output_map: HashMap::from([(0, 2), (1, 2)]),
+                            static_blinding: Some(1),
+                        },
+                    )]),
+                    static_blinding: None,
+                    nonce: None,
+                },
+            )
+            .unwrap();
+        let transfers = wallet
+            .create_transfers_from_fascia(&fascia, &beneficiaries)
+            .unwrap();
+        assert_eq!(transfers.len(), 1);
+        let mut bytes = Vec::new();
+        transfers[0].save(&mut bytes).unwrap();
+        let result = super::super::rust_only::validate_consignment_offchain(
+            &bytes,
+            &psbt.unsigned_tx.compute_txid().to_string(),
+            BitcoinNetwork::Regtest,
+        )
+        .unwrap();
+        assert!(result.valid, "{result:?}");
+        assert_eq!(
+            super::super::super::idb_store::serialize_stock(
+                wallet.rgb_stock.borrow().as_ref().unwrap()
+            )
+            .unwrap(),
+            stock
+        );
     }
 
     #[test]
