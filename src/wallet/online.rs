@@ -19,6 +19,9 @@ mod wallet_transfer;
 pub use wallet_transfer::WalletRgbSendRequest;
 use wallet_transfer::WalletTransferBinding;
 
+#[path = "rgb_input_observation.rs"]
+mod rgb_input_observation;
+
 const SCHEMAS_SUPPORTING_INFLATION: [database::enums::AssetSchema; 1] = [AssetSchema::Ifa];
 
 const TRANSFER_DATA_FILE: &str = "transfer_data.txt";

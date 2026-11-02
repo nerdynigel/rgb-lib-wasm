@@ -300,7 +300,10 @@ impl Wallet {
 
     /// All managed native originals reserve their own RGB and fee inputs. The
     /// caller's separate journal exclusions supplement this native protection.
-    fn managed_rgb_input_holds(&self, except: Option<&str>) -> Result<HashSet<OutPoint>, Error> {
+    pub(super) fn managed_rgb_input_holds(
+        &self,
+        except: Option<&str>,
+    ) -> Result<HashSet<OutPoint>, Error> {
         if self.transfer_artifacts.len() > 4096 {
             return Err(invalid());
         }

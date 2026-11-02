@@ -1,0 +1,9 @@
+{
+  "parent": "934d1e694281b57c08a64c19d28e2dfbf370aefb",
+  "files": {
+    "src/wallet/online.rs": "b944fb7a2a137718704049cb4af8a41d826db2d6222bf354c5dba197d2fd8e95",
+    "src/wallet/wallet_transfer.rs": "fbb135778a060559e683b3d28746c4c3f83b881a09a5445bed30df19cdf7e851",
+    "src/wallet/rgb_input_observation.rs": "3e5f0d04043db6c09f2e7e2c71311e57b02ea47d3af7deaa24e0dcd7e24fa2c9"
+  },
+  "financial_dispatch": false
+}
