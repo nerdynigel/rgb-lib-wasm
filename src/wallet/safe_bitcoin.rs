@@ -634,13 +634,13 @@ impl Wallet {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     //! Real BDK/Stock fixtures on an invented local graph, never chain funding or
     //! financial settlement. No remote RPC, consignment delivery or broadcasting.
     use super::*;
     use bdk_wallet::chain::{BlockId, ConfirmationBlockTime};
 
-    fn wallet() -> Wallet {
+    pub(in crate::wallet::online) fn wallet() -> Wallet {
         let keys = generate_keys(BitcoinNetwork::Regtest);
         Wallet::new(WalletData {
             data_dir: "/tmp/rgb_safe_bitcoin_unit".into(),
@@ -658,7 +658,7 @@ mod tests {
         .unwrap()
     }
 
-    fn coin(
+    pub(in crate::wallet::online) fn coin(
         wallet: &mut Wallet,
         keychain: KeychainKind,
         value: u64,
@@ -726,7 +726,11 @@ mod tests {
         OutPoint { txid, vout: 0 }
     }
 
-    fn assign_stock(wallet: &Wallet, point: OutPoint, inflation: bool) {
+    pub(in crate::wallet::online) fn assign_stock(
+        wallet: &Wallet,
+        point: OutPoint,
+        inflation: bool,
+    ) {
         let spec = AssetSpec {
             ticker: Ticker::try_from("FAKE".to_owned()).unwrap(),
             name: Name::try_from("Clearly fake unit asset".to_owned()).unwrap(),
@@ -793,7 +797,11 @@ mod tests {
         }
     }
 
-    fn retain_external(wallet: &mut Wallet, psbt: &Psbt, ordinary: bool) -> (String, i32) {
+    pub(in crate::wallet::online) fn retain_external(
+        wallet: &mut Wallet,
+        psbt: &Psbt,
+        ordinary: bool,
+    ) -> (String, i32) {
         let txid = psbt.unsigned_tx.compute_txid().to_string();
         // Reservation graph fixture only, not a valid RGB transfer/consignment.
         let binding = ordinary.then(|| super::super::wallet_transfer::WalletTransferBinding {

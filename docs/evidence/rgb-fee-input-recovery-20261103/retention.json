@@ -1,0 +1,34 @@
+{
+  "scope": "NATIVE_SAFETY_COMPONENTS_NOT_FINANCIAL_ACCEPTANCE",
+  "private_directory": "/home/nigel/.local/state/btcx-asm-release-20261101/safe-bitcoin-funded-20261103",
+  "files": [
+    {
+      "file": "fee-recovery-first-check.log",
+      "sha256": "37072a4851aedd1126a2f0d349caa37cb0e2c29a89e6e455d9a728b5bc1a5184"
+    },
+    {
+      "file": "fee-recovery-third-check.log",
+      "sha256": "c39e8a4602e864e626ad6cf83564a2183208f0f36a678eaa5377e418ea73880f"
+    },
+    {
+      "file": "fee-recovery-first-tests.log",
+      "sha256": "cfdb49a9b3b3f69ddc340f46ac6627d9dfa2abfd0207e0ea0f645fffc450d640"
+    },
+    {
+      "file": "fee-recovery-full-tests.log",
+      "sha256": "0819b6518c750294932ed663e4336cc0af602ffa3f08101e5760ab754423134c"
+    },
+    {
+      "file": "fee-recovery-clippy.log",
+      "sha256": "0ba1b1079f16745aa9d046ea1d988a00f9c3412490e138bd386e7ce13754aaa2"
+    },
+    {
+      "file": "fee-recovery-library-clippy.log",
+      "sha256": "6a6aa5cdbaf95a734baa53fb12a046b6fd18e186037bf409e50c354270627fed"
+    },
+    {
+      "file": "fee-recovery-format-final.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ]
+}

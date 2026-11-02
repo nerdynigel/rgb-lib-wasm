@@ -10,6 +10,10 @@ use bitcoin::hashes::{Hash as _, sha256};
 mod safe_bitcoin;
 pub use safe_bitcoin::{BitcoinSpendInput, BitcoinSpendRequest, BitcoinSpendView};
 
+#[path = "rgb_fee_recovery.rs"]
+mod rgb_fee_recovery;
+pub use rgb_fee_recovery::{RgbFeeRecoveryPrepared, RgbFeeRecoveryRequest};
+
 #[path = "wallet_transfer.rs"]
 mod wallet_transfer;
 pub use wallet_transfer::WalletRgbSendRequest;
