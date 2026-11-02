@@ -1499,7 +1499,47 @@ impl Wallet {
         Ok(())
     }
 
-    /// Look up the batch transfer belonging to a transaction id, if any.
+    /// Select the unique outgoing batch for an external/managed send.
+    /// A self-transfer has a separate incoming batch with the same Bitcoin txid;
+    /// insertion order or confirmation status must never select that receipt as
+    /// the sender's operation. Incomplete/mixed/duplicate sender graphs fail
+    /// closed. This lookup never changes a batch or reconstructs RGB Stock.
+    fn outgoing_batch_from_data(
+        db_data: &DbData,
+        txid: &str,
+    ) -> Result<Option<DbBatchTransfer>, Error> {
+        let mut outgoing = None;
+        for batch in db_data
+            .batch_transfers
+            .iter()
+            .filter(|b| b.txid.as_deref() == Some(txid))
+        {
+            let asset_ids: HashSet<i32> = db_data
+                .asset_transfers
+                .iter()
+                .filter(|a| a.batch_transfer_idx == batch.idx)
+                .map(|a| a.idx)
+                .collect();
+            let transfers: Vec<_> = db_data
+                .transfers
+                .iter()
+                .filter(|t| asset_ids.contains(&t.asset_transfer_idx))
+                .collect();
+            if transfers.is_empty() {
+                return Err(Error::ExternalSendConflict { txid: txid.into() });
+            }
+            if transfers.iter().all(|t| t.incoming) {
+                continue;
+            }
+            if transfers.iter().any(|t| t.incoming) || outgoing.is_some() {
+                return Err(Error::ExternalSendConflict { txid: txid.into() });
+            }
+            outgoing = Some(batch.clone());
+        }
+        Ok(outgoing)
+    }
+
+    /// Look up the outgoing batch belonging to a transaction id, if any.
     ///
     /// Distinguishes "no operation" (`None`) from an existing operation so
     /// callers can implement idempotent replay vs. conflicting reuse by
@@ -1509,10 +1549,7 @@ impl Wallet {
         txid: &str,
     ) -> Result<Option<DbBatchTransfer>, Error> {
         let db_data = self.database.get_db_data(false)?;
-        Ok(db_data
-            .batch_transfers
-            .into_iter()
-            .find(|b| b.txid.as_deref() == Some(txid)))
+        Self::outgoing_batch_from_data(&db_data, txid)
     }
 
     /// Canonical, witness-stripped serialisation of a transaction. The txid only
