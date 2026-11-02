@@ -58,6 +58,9 @@ impl Wallet {
             return Err(Error::InvalidRecipientMap);
         }
         let held = self.managed_rgb_input_holds(None)?;
+        let candidates = self
+            .wallet_rgb_candidate_inputs(unspents.clone(), &asset_id, &mut HashSet::new())
+            .map(|rows| rows.into_iter().map(|r| r.utxo.idx).collect::<HashSet<_>>());
         let runtime = self.rgb_runtime()?;
         let mut stock_units = HashMap::<OutPoint, u64>::new();
         let mut other_state = HashSet::new();
@@ -91,10 +94,14 @@ impl Wallet {
             let mut settled = 0u64;
             let mut pending = 0u64;
             let mut non_fungible = false;
+            let mut failed_history = 0usize;
             if let Some(db) = db {
                 for allocation in &db.rgb_allocations {
                     if allocation.asset_id.as_deref() != Some(&asset_id) {
                         continue;
+                    }
+                    if allocation.status.failed() {
+                        failed_history += 1;
                     }
                     match allocation.assignment {
                         Assignment::Fungible(n) => {
@@ -123,6 +130,8 @@ impl Wallet {
                 "stock_other_assignment": other_state.contains(&point),
                 "database_settled_rgb_units": settled.to_string(),
                 "database_pending_rgb_units": pending.to_string(),
+                "database_failed_history_entries": failed_history,
+                "eligible_for_native_asset_selection": candidates.as_ref().ok().map(|set| db.is_some_and(|r| set.contains(&r.utxo.idx))),
                 "database_other_assignment": non_fungible,
                 "database_exists": db.map(|u| u.utxo.exists),
                 "database_pending_blinded": db.map(|u| u.pending_blinded),
@@ -138,6 +147,7 @@ impl Wallet {
             "tip_height": self.bdk_wallet.latest_checkpoint().height(),
             "online_configured": self.online_data.is_some(),
             "spending_authority": false,
+            "native_asset_selection_known": candidates.is_ok(),
             "rows": rows
         }))
     }

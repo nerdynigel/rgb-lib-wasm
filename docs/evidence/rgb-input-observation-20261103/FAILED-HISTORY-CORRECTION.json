@@ -1,0 +1,46 @@
+{
+  "scope": "NATIVE_ORDINARY_RGB_SELECTION_CORRECTION_NOT_CUSTOMER_SETTLEMENT",
+  "native_tests_passed": 172,
+  "new_tests": 6,
+  "regression_failed_before_fix": true,
+  "regression_passed_after_fix": true,
+  "clippy": "PASS_WARNINGS_DENIED",
+  "history_deleted": false,
+  "stock_modified": false,
+  "signing_primitive_changed": false,
+  "dependency_upgrades": false,
+  "shared_native_original_fence": "bitcoin_native_holds now also fences RGB asset selection, including managed/atomic/legacy unknown originals; size bounds are checked in the reusable fence.",
+  "failed_history": "Only a local allocation selection copy drops terminal Failed rows. Database/history/originals are preserved. Active/unknown originals remain excluded or cause refusal.",
+  "readonly_diagnostic": "Reports failed historical allocation count and native asset-selection qualification without granting spending authority. Host holds and full native construction/signing checks still apply.",
+  "old_R_0b4": "Not retried or released. New SDK source build and actual read-only count required before installed-issue claim.",
+  "logs": [
+    {
+      "log": "failed-history-regression-before-fix.log.gz",
+      "uncompressed_sha256": "88d7dcb5ab0f571786a2486de20163567d841e5ee2f17d70e4d86e1d19b1a718"
+    },
+    {
+      "log": "failed-history-regression-before-fix-v2.log.gz",
+      "uncompressed_sha256": "87a3b5e1047b2f519ccc905b0d253ca1b635526966e45df4d9c260541d78f675"
+    },
+    {
+      "log": "failed-history-regression-after-fix.log.gz",
+      "uncompressed_sha256": "59a41fb925aa2809385a62ee6f7a1344048f857102fd3d4916412380f5dc312e"
+    },
+    {
+      "log": "failed-history-native-all.log.gz",
+      "uncompressed_sha256": "4db4e6a4af715f865069343f8e27fbe563d095dba95bf573deb98a85a80e1e98"
+    },
+    {
+      "log": "failed-history-native-clippy.log.gz",
+      "uncompressed_sha256": "591824200170742f5909da617571100c6f20edd2fa87b86ba30932e2a1895e7d"
+    },
+    {
+      "log": "failed-history-native-all-final.log.gz",
+      "uncompressed_sha256": "32727e67619b408804ba5614fc18de5dcbc0c8d3f4acaa433eef3f2c68dd24d4"
+    },
+    {
+      "log": "failed-history-native-clippy-final.log.gz",
+      "uncompressed_sha256": "d7dae192715495fa89ccbe279af3efb9792c1dae1768228e369035e68a1df673"
+    }
+  ]
+}

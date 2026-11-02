@@ -178,12 +178,18 @@ impl Wallet {
     /// Preserve native originals' fee and asset inputs, including external atomic
     /// proposals. Legacy preparations whose fee inputs are not retained are not
     /// safe to classify; fail closed rather than infer their selection.
-    fn bitcoin_native_holds(
+    pub(super) fn bitcoin_native_holds(
         &self,
         db: &DbData,
         own_rgb: Option<&str>,
     ) -> Result<HashSet<OutPoint>, Error> {
-        if self.transfer_artifacts.len() > MAX_INPUTS {
+        if self.transfer_artifacts.len() > MAX_INPUTS
+            || db.txos.len() > MAX_ROWS
+            || db.colorings.len() > MAX_ROWS
+            || db.transfers.len() > MAX_ROWS
+            || db.asset_transfers.len() > MAX_ROWS
+            || db.batch_transfers.len() > MAX_ROWS
+        {
             return Err(refused());
         }
         let mut asset_batches = HashMap::new();

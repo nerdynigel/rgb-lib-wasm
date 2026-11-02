@@ -855,22 +855,8 @@ impl Wallet {
         if unspents.len() > 4096 {
             return Err(invalid());
         }
-        unspents.retain(|u| {
-            !valid
-                .excluded
-                .iter()
-                .any(|p| p.to_string() == u.utxo.outpoint().to_string())
-                && u.utxo.exists
-                && !u.utxo.spent
-                && !u.utxo.pending_witness
-                && u.pending_blinded == 0
-                && !u.rgb_allocations.is_empty()
-                && u.rgb_allocations.iter().all(|a| {
-                    a.asset_id.as_deref() == Some(&request.asset_id)
-                        && a.status.settled()
-                        && matches!(a.assignment, Assignment::Fungible(_))
-                })
-        });
+        unspents =
+            self.wallet_rgb_candidate_inputs(unspents, &request.asset_id, &mut valid.excluded)?;
         // Check complete candidate totals before the legacy selector's additions.
         let mut total_rgb = 0u64;
         let mut total_btc = 0u64;
@@ -1037,6 +1023,44 @@ impl Wallet {
         .await
     }
 
+    /// Read-only input qualification shared by ordinary RGB preparation and
+    /// diagnostics. This does not construct a transaction or grant authority.
+    pub(super) fn wallet_rgb_candidate_inputs(
+        &self,
+        mut unspents: Vec<LocalUnspent>,
+        asset_id: &str,
+        excluded: &mut HashSet<OutPoint>,
+    ) -> Result<Vec<LocalUnspent>, Error> {
+        // Use the same native original fence as ordinary Bitcoin. In particular,
+        // a Failed DB row alone cannot release an ambiguous managed, atomic or
+        // legacy outgoing original. Its exact inputs remain excluded, or the
+        // missing/malformed original makes qualification fail closed.
+        excluded.extend(self.bitcoin_native_holds(&self.database.get_db_data(false)?, None)?);
+        // Failed colorings are retained audit history, not current allocations.
+        // Public list_unspents already omits them. Requiring *all* historical
+        // rows to be Settled incorrectly hid valid Stock after a proven conflict
+        // or unsigned cancellation. Do not alter the database or any original.
+        for unspent in &mut unspents {
+            unspent.rgb_allocations.retain(|a| !a.status.failed());
+        }
+        unspents.retain(|u| {
+            !excluded
+                .iter()
+                .any(|p| p.to_string() == u.utxo.outpoint().to_string())
+                && u.utxo.exists
+                && !u.utxo.spent
+                && !u.utxo.pending_witness
+                && u.pending_blinded == 0
+                && !u.rgb_allocations.is_empty()
+                && u.rgb_allocations.iter().all(|a| {
+                    a.asset_id.as_deref() == Some(asset_id)
+                        && a.status.settled()
+                        && matches!(a.assignment, Assignment::Fungible(_))
+                })
+        });
+        Ok(unspents)
+    }
+
     /// Read the original prepared transfer by its wallet-local operation id.
     /// No new selection, signing, delivery, broadcast or Stock consumption.
     pub fn wallet_rgb_send_data(&self, operation_id: String) -> Result<serde_json::Value, Error> {
@@ -1106,6 +1130,325 @@ impl Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Real BDK/DB graph fixture; terminal metadata below is invented evidence,
+    /// not a new Bitcoin conflict or financial acceptance claim.
+    fn failed_history_fixture() -> (Wallet, String, OutPoint, i32) {
+        use super::super::safe_bitcoin::tests::{coin, retain_external, wallet};
+        let mut wallet = wallet();
+        let point = coin(&mut wallet, KeychainKind::External, 96233, true, false);
+        let address = wallet
+            ._get_new_address(KeychainKind::Internal)
+            .unwrap()
+            .script_pubkey();
+        let change = wallet
+            ._get_new_address(KeychainKind::Internal)
+            .unwrap()
+            .script_pubkey();
+        let (psbt, _) = wallet
+            .prepare_psbt_with_change(
+                HashSet::from([point]),
+                &vec![(address, 1000)],
+                wallet._check_fee_rate(3).unwrap(),
+                None,
+                change,
+            )
+            .unwrap();
+        let (txid, batch_idx) = retain_external(&mut wallet, &psbt, true);
+        let mut batch: DbBatchTransferActMod = wallet.database.iter_batch_transfers().unwrap()[0]
+            .clone()
+            .into();
+        batch.status = ActiveValue::Set(TransferStatus::Failed);
+        wallet.database.update_batch_transfer(&mut batch).unwrap();
+        let external = wallet
+            .transfer_artifacts
+            .get_mut(&txid)
+            .unwrap()
+            .external_send
+            .as_mut()
+            .unwrap();
+        external.status = ExternalSendStatus::Conflicted;
+        external.conflict_txid = Some(Txid::from_byte_array([88; 32]).to_string());
+        let asset_id = request().asset_id;
+        // Retain the helper's original history; add the exact asset Input row.
+        let failed_asset = wallet
+            .database
+            .set_asset_transfer(DbAssetTransferActMod {
+                batch_transfer_idx: ActiveValue::Set(batch_idx),
+                asset_id: ActiveValue::Set(Some(asset_id.clone())),
+                user_driven: ActiveValue::Set(true),
+                ..Default::default()
+            })
+            .unwrap();
+        let txo = wallet
+            .database
+            .get_txo(&Outpoint {
+                txid: point.txid.to_string(),
+                vout: point.vout,
+            })
+            .unwrap()
+            .unwrap()
+            .idx;
+        wallet
+            .database
+            .set_coloring(DbColoringActMod {
+                txo_idx: ActiveValue::Set(txo),
+                asset_transfer_idx: ActiveValue::Set(failed_asset),
+                r#type: ActiveValue::Set(ColoringType::Input),
+                assignment: ActiveValue::Set(Assignment::Fungible(3)),
+                ..Default::default()
+            })
+            .unwrap();
+        let settled = wallet
+            .database
+            .set_batch_transfer(DbBatchTransferActMod {
+                status: ActiveValue::Set(TransferStatus::Settled),
+                min_confirmations: ActiveValue::Set(1),
+                ..Default::default()
+            })
+            .unwrap();
+        let asset = wallet
+            .database
+            .set_asset_transfer(DbAssetTransferActMod {
+                batch_transfer_idx: ActiveValue::Set(settled),
+                asset_id: ActiveValue::Set(Some(asset_id)),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .database
+            .set_transfer(DbTransferActMod {
+                asset_transfer_idx: ActiveValue::Set(asset),
+                incoming: ActiveValue::Set(true),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .database
+            .set_coloring(DbColoringActMod {
+                txo_idx: ActiveValue::Set(txo),
+                asset_transfer_idx: ActiveValue::Set(asset),
+                r#type: ActiveValue::Set(ColoringType::Issue),
+                assignment: ActiveValue::Set(Assignment::Fungible(3)),
+                ..Default::default()
+            })
+            .unwrap();
+        (wallet, txid, point, settled)
+    }
+
+    fn candidate_rows(wallet: &Wallet) -> Vec<LocalUnspent> {
+        wallet
+            .database
+            .get_rgb_allocations(
+                wallet.database.get_unspent_txos(vec![]).unwrap(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn settled_rgb_survives_proven_terminal_failed_input_history_without_history_deletion() {
+        let (wallet, txid, _, _) = failed_history_fixture();
+        let before = serde_json::to_vec(wallet.database.as_ref()).unwrap();
+        let candidates = wallet
+            .wallet_rgb_candidate_inputs(
+                candidate_rows(&wallet),
+                &request().asset_id,
+                &mut HashSet::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "failed historical Input coloring must not hide current settled RGB"
+        );
+        assert_eq!(candidates[0].rgb_allocations.len(), 1);
+        assert_eq!(
+            candidates[0].rgb_allocations[0].assignment,
+            Assignment::Fungible(3)
+        );
+        assert_eq!(
+            serde_json::to_vec(wallet.database.as_ref()).unwrap(),
+            before
+        );
+        assert_eq!(
+            wallet.transfer_artifacts[&txid]
+                .external_send
+                .as_ref()
+                .unwrap()
+                .status,
+            ExternalSendStatus::Conflicted
+        );
+    }
+
+    #[test]
+    fn failed_database_status_never_releases_prepared_or_unknown_native_originals() {
+        for variant in [
+            "prepared",
+            "missing",
+            "bad_conflict",
+            "bad_original",
+            "signed_cancel",
+            "restored_cancel",
+        ] {
+            let (mut wallet, txid, _, _) = failed_history_fixture();
+            let artifacts = wallet.transfer_artifacts.get_mut(&txid).unwrap();
+            let external = artifacts.external_send.as_mut().unwrap();
+            match variant {
+                "prepared" => external.status = ExternalSendStatus::Prepared,
+                "bad_conflict" => external.conflict_txid = None,
+                "bad_original" => external.expected_tx_hex = "changed".into(),
+                "signed_cancel" | "restored_cancel" => {
+                    external.status = ExternalSendStatus::Cancelled;
+                    let binding = external.wallet_transfer.as_mut().unwrap();
+                    binding.signing_attempted = variant == "signed_cancel";
+                    binding.restored = variant == "restored_cancel";
+                }
+                "missing" => artifacts.external_send = None,
+                _ => unreachable!(),
+            }
+            let result = wallet.wallet_rgb_candidate_inputs(
+                candidate_rows(&wallet),
+                &request().asset_id,
+                &mut HashSet::new(),
+            );
+            if variant == "prepared" {
+                assert!(
+                    result.unwrap().is_empty(),
+                    "exact prepared inputs remain held even with Failed DB status"
+                );
+            } else {
+                assert!(result.is_err(), "{variant} must fail closed");
+            }
+        }
+    }
+
+    #[test]
+    fn known_unsigned_cancelled_history_does_not_hide_settled_rgb_or_change_records() {
+        let (mut wallet, txid, _, _) = failed_history_fixture();
+        wallet
+            .transfer_artifacts
+            .get_mut(&txid)
+            .unwrap()
+            .external_send
+            .as_mut()
+            .unwrap()
+            .status = ExternalSendStatus::Cancelled;
+        let before = serde_json::to_vec(wallet.database.as_ref()).unwrap();
+        assert_eq!(
+            wallet
+                .wallet_rgb_candidate_inputs(
+                    candidate_rows(&wallet),
+                    &request().asset_id,
+                    &mut HashSet::new()
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            serde_json::to_vec(wallet.database.as_ref()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn failed_history_filter_preserves_caller_holds_pending_promises_and_foreign_assets() {
+        for variant in [
+            "caller_hold",
+            "pending_witness",
+            "pending_receive",
+            "foreign_asset",
+            "no_settled_allocation",
+        ] {
+            let (wallet, _, point, settled) = failed_history_fixture();
+            let mut excluded = HashSet::new();
+            if variant == "caller_hold" {
+                excluded.insert(point);
+            }
+            let mut rows = candidate_rows(&wallet);
+            match variant {
+                "pending_witness" => rows[0].utxo.pending_witness = true,
+                "pending_receive" => rows[0].pending_blinded = 1,
+                "foreign_asset" => rows[0].rgb_allocations.push(LocalRgbAllocation {
+                    asset_id: Some("another contract".into()),
+                    assignment: Assignment::Fungible(1),
+                    status: TransferStatus::Settled,
+                    incoming: true,
+                    txo_spent: false,
+                }),
+                "no_settled_allocation" => {
+                    let mut batch: DbBatchTransferActMod = wallet
+                        .database
+                        .iter_batch_transfers()
+                        .unwrap()
+                        .into_iter()
+                        .find(|b| b.idx == settled)
+                        .unwrap()
+                        .into();
+                    batch.status = ActiveValue::Set(TransferStatus::Failed);
+                    wallet.database.update_batch_transfer(&mut batch).unwrap();
+                    rows = candidate_rows(&wallet);
+                }
+                _ => {}
+            }
+            assert!(
+                wallet
+                    .wallet_rgb_candidate_inputs(rows, &request().asset_id, &mut excluded)
+                    .unwrap()
+                    .is_empty(),
+                "{variant}"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_rgb_allocation_is_not_failed_history_and_still_refuses_selection() {
+        let (wallet, _, _, _) = failed_history_fixture();
+        let mut rows = candidate_rows(&wallet);
+        rows[0].rgb_allocations.push(LocalRgbAllocation {
+            asset_id: Some(request().asset_id),
+            assignment: Assignment::Fungible(1),
+            status: TransferStatus::WaitingCounterparty,
+            incoming: true,
+            txo_spent: false,
+        });
+        assert!(
+            wallet
+                .wallet_rgb_candidate_inputs(rows, &request().asset_id, &mut HashSet::new())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_history_never_releases_atomic_or_retained_legacy_signed_inputs() {
+        for legacy in [false, true] {
+            let (mut wallet, txid, _, _) = failed_history_fixture();
+            let art = wallet.transfer_artifacts.get_mut(&txid).unwrap();
+            if legacy {
+                art.signed_psbt = Some(art.external_send.as_ref().unwrap().prepared_psbt.clone());
+                art.external_send = None;
+            } else {
+                let external = art.external_send.as_mut().unwrap();
+                external.wallet_transfer = None;
+                external.status = ExternalSendStatus::Prepared;
+            }
+            assert!(
+                wallet
+                    .wallet_rgb_candidate_inputs(
+                        candidate_rows(&wallet),
+                        &request().asset_id,
+                        &mut HashSet::new()
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
     fn empty_wallet() -> Wallet {
         let keys = generate_keys(BitcoinNetwork::Regtest);
         Wallet::new(WalletData {

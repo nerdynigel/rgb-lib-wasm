@@ -31,3 +31,24 @@ outpoints. Initial compile/fixture failures retained. Test-only addition, no
 production dependency/signing/state change. This rules out simple split-input
 construction in a fresh graph; it does not reproduce/fix the held0b4preparation
 or prove actual customer settlement. See SPLIT-CARRIER-TESTS.json/logs.
+
+
+Failed-history correction: ordinary RGB selection previously required all
+historical allocations to be Settled, incorrectly rejecting an input after a
+proven conflict/unsigned cancellation retained Failed Input rows. Reuse the
+existing bounded Bitcoin native-original fence before dropping Failed history
+from only the local selection copy. Managed, atomic and retained legacy signed
+inputs remain excluded; missing/malformed originals, invalid conflict metadata,
+signed/restored cancellations refuse. Caller holds, pending witness/blinded
+promises, pending RGB, foreign assets and absent settled allocations refuse.
+No persisted history/original/Stock/signing/snapshot/asset identity change.
+
+Regression on real BDK/DB invented graph fails before fix and passes after.
+172native cases/Clippy--Dwarnings/owned rustfmt/diff PASS;6new tests include
+negative variants and exact DB history retention. Initial private test-helper
+access compile failure retained/corrected. Read-only getter additionally reports
+failed-history entry count and qualification under the same native fence; this
+is not authority and does not apply host holds. Source build and actual R
+read-only check still required.0b4unconfirmed intent remains held; no replay,
+new signing, broadcast or safe cancellation is inferred from unavailable data.
+See FAILED-HISTORY-CORRECTION.json and complete raw logs.
