@@ -1192,7 +1192,7 @@ mod tests {
         wallet
             .transfer_artifacts
             .insert(txid.clone(), artifact(psbt));
-        wallet
+        let batch = wallet
             .database
             .set_batch_transfer(DbBatchTransferActMod {
                 txid: ActiveValue::Set(Some(txid)),
@@ -1202,7 +1202,133 @@ mod tests {
                 expiration: ActiveValue::Set(Some(100)),
                 ..Default::default()
             })
-            .unwrap()
+            .unwrap();
+        transfer_graph(wallet, batch, false);
+        batch
+    }
+    fn transfer_graph(wallet: &Wallet, batch: i32, incoming: bool) {
+        let asset = wallet
+            .database
+            .set_asset_transfer(DbAssetTransferActMod {
+                user_driven: ActiveValue::Set(true),
+                batch_transfer_idx: ActiveValue::Set(batch),
+                asset_id: ActiveValue::Set(Some(request().asset_id)),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet
+            .database
+            .set_transfer(DbTransferActMod {
+                asset_transfer_idx: ActiveValue::Set(asset),
+                requested_assignment: ActiveValue::Set(Some(Assignment::Fungible(3))),
+                incoming: ActiveValue::Set(incoming),
+                recipient_type: ActiveValue::Set(None),
+                recipient_id: ActiveValue::Set(Some(request().recipient_id)),
+                ack: ActiveValue::Set(None),
+                invoice_string: ActiveValue::Set(None),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    fn additional_batch(wallet: &Wallet, txid: &str, incoming: bool) -> i32 {
+        let batch = wallet
+            .database
+            .set_batch_transfer(DbBatchTransferActMod {
+                txid: ActiveValue::Set(Some(txid.into())),
+                status: ActiveValue::Set(TransferStatus::Settled),
+                min_confirmations: ActiveValue::Set(1),
+                created_at: ActiveValue::Set(1),
+                expiration: ActiveValue::Set(None),
+                ..Default::default()
+            })
+            .unwrap();
+        transfer_graph(wallet, batch, incoming);
+        batch
+    }
+    #[test]
+    fn self_transfer_reads_outgoing_batch_instead_of_earlier_incoming_receipt() {
+        let mut wallet = empty_wallet();
+        let psbt = staged_psbt();
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        let incoming = additional_batch(&wallet, &txid, true);
+        let outgoing = retain(&mut wallet, &psbt, TransferStatus::Initiated);
+        let before = wallet.database.get_db_data(false).unwrap();
+        let data = wallet.wallet_rgb_send_data(request().operation_id).unwrap();
+        assert_ne!(incoming, outgoing);
+        assert_eq!(data["batch_transfer_idx"], outgoing);
+        assert_eq!(data["batch_status"], "Initiated");
+        assert_eq!(data["psbt"], psbt.to_string());
+        let after = wallet.database.get_db_data(false).unwrap();
+        assert_eq!(before.batch_transfers, after.batch_transfers);
+        assert_eq!(before.asset_transfers, after.asset_transfers);
+        assert_eq!(before.transfers, after.transfers);
+        let mut reordered = after;
+        reordered.batch_transfers.reverse();
+        reordered.asset_transfers.reverse();
+        reordered.transfers.reverse();
+        assert_eq!(
+            Wallet::outgoing_batch_from_data(&reordered, &txid)
+                .unwrap()
+                .unwrap()
+                .idx,
+            outgoing
+        );
+    }
+    #[test]
+    fn outgoing_lookup_does_not_borrow_an_incoming_only_receipt() {
+        let wallet = empty_wallet();
+        let txid = "a".repeat(64);
+        additional_batch(&wallet, &txid, true);
+        assert!(wallet.batch_transfer_by_txid(&txid).unwrap().is_none());
+        assert!(
+            wallet
+                .batch_transfer_by_txid(&"b".repeat(64))
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[test]
+    fn outgoing_lookup_refuses_duplicate_sender_and_mixed_direction_graphs() {
+        let wallet = empty_wallet();
+        let txid = "a".repeat(64);
+        let first = additional_batch(&wallet, &txid, false);
+        assert_eq!(
+            wallet.batch_transfer_by_txid(&txid).unwrap().unwrap().idx,
+            first
+        );
+        transfer_graph(&wallet, first, true);
+        assert!(matches!(
+            wallet.batch_transfer_by_txid(&txid),
+            Err(Error::ExternalSendConflict { .. })
+        ));
+        let wallet = empty_wallet();
+        additional_batch(&wallet, &txid, false);
+        additional_batch(&wallet, &txid, false);
+        assert!(matches!(
+            wallet.batch_transfer_by_txid(&txid),
+            Err(Error::ExternalSendConflict { .. })
+        ));
+    }
+    #[test]
+    fn outgoing_lookup_refuses_an_incomplete_same_transaction_graph() {
+        let wallet = empty_wallet();
+        let txid = "a".repeat(64);
+        additional_batch(&wallet, &txid, false);
+        wallet
+            .database
+            .set_batch_transfer(DbBatchTransferActMod {
+                txid: ActiveValue::Set(Some(txid.clone())),
+                status: ActiveValue::Set(TransferStatus::Settled),
+                min_confirmations: ActiveValue::Set(1),
+                created_at: ActiveValue::Set(1),
+                expiration: ActiveValue::Set(None),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(matches!(
+            wallet.batch_transfer_by_txid(&txid),
+            Err(Error::ExternalSendConflict { .. })
+        ));
     }
     fn request() -> WalletRgbSendRequest {
         let script = ScriptBuf::from_hex(
@@ -1391,6 +1517,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
+        transfer_graph(&wallet, batch, false);
         let before = serde_json::to_value(&wallet.transfer_artifacts).unwrap();
         let result = wallet.sign_psbt(psbt.to_string(), None);
         assert!(matches!(result, Err(Error::InvalidPsbt { .. })));
@@ -1494,7 +1621,7 @@ mod tests {
         wallet
             .transfer_artifacts
             .insert(txid.clone(), original.clone());
-        wallet
+        let batch = wallet
             .database
             .set_batch_transfer(DbBatchTransferActMod {
                 txid: ActiveValue::Set(Some(txid.clone())),
@@ -1505,6 +1632,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
+        transfer_graph(&wallet, batch, false);
         let id = request().operation_id;
         assert_eq!(
             wallet
