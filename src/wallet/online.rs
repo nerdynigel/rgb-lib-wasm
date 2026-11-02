@@ -6,6 +6,10 @@ use super::*;
 use crate::api::proxy::WasmProxyClient;
 use bitcoin::hashes::{Hash as _, sha256};
 
+#[path = "safe_bitcoin.rs"]
+mod safe_bitcoin;
+pub use safe_bitcoin::{BitcoinSpendInput, BitcoinSpendRequest, BitcoinSpendView};
+
 #[path = "wallet_transfer.rs"]
 mod wallet_transfer;
 pub use wallet_transfer::WalletRgbSendRequest;
@@ -830,6 +834,25 @@ impl Wallet {
         lock_time: Option<u32>,
     ) -> Result<(Psbt, Option<BtcChange>), Error> {
         let change_addr = self.get_new_address()?.script_pubkey();
+        self.prepare_psbt_with_change(
+            input_outpoints,
+            witness_recipients,
+            fee_rate,
+            lock_time,
+            change_addr,
+        )
+    }
+
+    /// Same established BDK/RGB construction, with an explicitly owned change
+    /// descriptor chosen by the managed ordinary-transfer caller.
+    fn prepare_psbt_with_change(
+        &mut self,
+        input_outpoints: HashSet<BdkOutPoint>,
+        witness_recipients: &Vec<(ScriptBuf, u64)>,
+        fee_rate: FeeRate,
+        lock_time: Option<u32>,
+        change_addr: ScriptBuf,
+    ) -> Result<(Psbt, Option<BtcChange>), Error> {
         let mut builder = self.bdk_wallet.build_tx();
         builder
             .add_data(&[0; 32])

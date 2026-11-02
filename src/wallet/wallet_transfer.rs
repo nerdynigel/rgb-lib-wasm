@@ -461,7 +461,7 @@ impl Wallet {
         Ok((txid.clone(), psbt, request.expires_at))
     }
 
-    async fn require_wallet_rgb_regtest(&self, online: &Online) -> Result<(), Error> {
+    pub(super) async fn require_wallet_rgb_regtest(&self, online: &Online) -> Result<(), Error> {
         if self.bitcoin_network() != BitcoinNetwork::Regtest {
             return Err(Error::InvalidRecipientNetwork);
         }
@@ -767,7 +767,7 @@ impl Wallet {
         self.wallet_rgb_send_data(operation_id)
     }
 
-    fn wallet_transfer_by_operation(
+    pub(super) fn wallet_transfer_by_operation(
         &self,
         id: &str,
     ) -> Result<Option<(&String, &TransferArtifacts)>, Error> {
@@ -900,18 +900,17 @@ impl Wallet {
             return Err(invalid());
         }
         self._restore_missing_bdk_inputs(&inputs).await?;
-        let db_txos = self.database.iter_txos()?;
-        if db_txos.len() > 32_768 {
-            return Err(invalid());
-        }
-        let db_outpoints = db_txos
-            .iter()
-            .map(|u| OutPoint::from_str(&u.outpoint().to_string()).map_err(|_| invalid()))
+        let safe_fee_points = self
+            .bitcoin_spend_view()?
+            .inputs
+            .into_iter()
+            .map(|u| OutPoint::from_str(&u.outpoint).map_err(|_| invalid()))
             .collect::<Result<HashSet<_>, _>>()?;
         let mut fee_inputs: Vec<_> = self
-            .internal_unspents()
+            .bdk_wallet
+            .list_unspent()
             .filter(|u| {
-                !valid.excluded.contains(&u.outpoint) && !db_outpoints.contains(&u.outpoint)
+                !valid.excluded.contains(&u.outpoint) && safe_fee_points.contains(&u.outpoint)
             })
             .take(4097)
             .collect();
@@ -920,21 +919,39 @@ impl Wallet {
         }
         fee_inputs.sort_by_key(|u| (u.txout.value.to_sat(), u.outpoint));
         let mut fees = fee_inputs.into_iter();
-        let outputs = vec![(valid.script, request.witness_sats)];
-        let (mut psbt, change) = loop {
-            match self._prepare_psbt(inputs.clone(), &outputs, rate, None) {
-                Ok((psbt, change))
-                    if spend.assignments_collected.fungible == request.amount
-                        || change.is_some() =>
-                {
-                    break (psbt, change);
-                }
-                Ok(_) | Err(Error::InsufficientBitcoins { .. }) => {
+        let remainder = spend
+            .assignments_collected
+            .fungible
+            .checked_sub(request.amount)
+            .ok_or_else(invalid)?;
+        let mut outputs = vec![(valid.script, request.witness_sats)];
+        if remainder > 0 {
+            // Keep only an explicit carrier with RGB change. Ordinary Bitcoin
+            // change must not become trapped inside that asset assignment.
+            outputs.push((
+                self.get_new_address()?.script_pubkey(),
+                request.witness_sats,
+            ));
+        }
+        let bitcoin_change = self
+            ._get_new_address(KeychainKind::Internal)?
+            .script_pubkey();
+        let mut psbt = loop {
+            match self.prepare_psbt_with_change(
+                inputs.clone(),
+                &outputs,
+                rate,
+                None,
+                bitcoin_change.clone(),
+            ) {
+                Ok((psbt, _)) => break psbt,
+                Err(Error::InsufficientBitcoins { .. }) => {
                     let next = fees.next().ok_or(Error::InsufficientBitcoins {
                         needed: request.witness_sats,
                         available: total_btc,
                     })?;
-                    // Never silently spend an unconfirmed vanilla input.
+                    // Native qualification also checks Stock and pending RGB
+                    // promises; preserve the requested confirmation depth.
                     if self
                         .indexer()
                         .get_tx_confirmations(&next.outpoint.txid.to_string())
@@ -985,24 +1002,13 @@ impl Wallet {
         );
         let mut output_map =
             HashMap::from([(1u32.checked_sub(shift).ok_or_else(invalid)?, request.amount)]);
-        let remainder = spend
-            .assignments_collected
-            .fungible
-            .checked_sub(request.amount)
-            .ok_or_else(invalid)?;
         if remainder > 0 {
-            let change = change.ok_or_else(invalid)?;
-            if !self.bdk_wallet.is_mine(
-                psbt.unsigned_tx.output[change.vout as usize]
-                    .script_pubkey
-                    .clone(),
-            ) {
+            if psbt.unsigned_tx.output.get(2).is_none_or(|o| {
+                o.script_pubkey != outputs[1].0 || o.value.to_sat() != request.witness_sats
+            }) {
                 return Err(invalid());
             }
-            output_map.insert(
-                change.vout.checked_sub(shift).ok_or_else(invalid)?,
-                remainder,
-            );
+            output_map.insert(2u32.checked_sub(shift).ok_or_else(invalid)?, remainder);
         }
         let (fascia, _) = self.color_psbt(
             &mut psbt,
