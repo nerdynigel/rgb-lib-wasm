@@ -1133,6 +1133,18 @@ impl InMemoryDb {
         let colorings = colorings.unwrap_or_else(|| self.iter_colorings().unwrap_or_default());
         let txos = txos.unwrap_or_else(|| self.iter_txos().unwrap_or_default());
 
+        // A witness request is provisional until its validated Receive coloring
+        // exists. Count the same asset/receive outpoint once, never both the
+        // request and its coloring. This changes no reservation or spendability.
+        let colored_receives: std::collections::HashSet<(i32, String, u32)> = colorings
+            .iter()
+            .filter(|c| c.r#type == ColoringType::Receive)
+            .filter_map(|c| {
+                txos.iter()
+                    .find(|t| t.idx == c.txo_idx && !t.spent)
+                    .map(|t| (c.asset_transfer_idx, t.txid.clone(), t.vout))
+            })
+            .collect();
         let txos_allocations = self.get_rgb_allocations(
             txos,
             Some(colorings),
@@ -1175,6 +1187,14 @@ impl InMemoryDb {
                         Ok((at, bt)) => {
                             if bt.status.waiting_confirmations() {
                                 if at.asset_id.as_deref() != Some(asset_id.as_str()) {
+                                    return None;
+                                }
+                                if let (
+                                    Some(txid),
+                                    Some(RecipientTypeFull::Witness { vout: Some(vout) }),
+                                ) = (&bt.txid, &t.recipient_type)
+                                    && colored_receives.contains(&(at.idx, txid.clone(), *vout))
+                                {
                                     return None;
                                 }
                                 Some(Ok(t
@@ -2149,6 +2169,76 @@ mod tests {
         assert_eq!(balance.settled, 1000);
         assert_eq!(balance.future, 1000);
         assert_eq!(balance.spendable, 1000);
+    }
+
+    #[test]
+    fn test_witness_pending_receive_is_projected_once_with_or_without_coloring() {
+        let db = make_db();
+        let settled = db
+            .set_batch_transfer(make_batch_transfer_mod(TransferStatus::Settled))
+            .unwrap();
+        let asset = db
+            .set_asset_transfer(make_asset_transfer_mod(settled, Some("a1")))
+            .unwrap();
+        db.set_transfer(make_transfer_mod(asset, true)).unwrap();
+        let owned = db.set_txo(make_txo_mod("owned", 0, "1000")).unwrap();
+        db.set_coloring(make_coloring_mod(owned, asset, ColoringType::Issue, 2))
+            .unwrap();
+        let mut pending = make_batch_transfer_mod(TransferStatus::WaitingConfirmations);
+        pending.txid = ActiveValue::Set(Some("incoming".into()));
+        let batch = db.set_batch_transfer(pending).unwrap();
+        let asset = db
+            .set_asset_transfer(make_asset_transfer_mod(batch, Some("a1")))
+            .unwrap();
+        let mut transfer = make_transfer_mod(asset, true);
+        transfer.recipient_type =
+            ActiveValue::Set(Some(RecipientTypeFull::Witness { vout: Some(1) }));
+        transfer.requested_assignment = ActiveValue::Set(Some(Assignment::Fungible(2)));
+        db.set_transfer(transfer).unwrap();
+        let balance = db
+            .get_asset_balance("a1".into(), None, None, None, None, None)
+            .unwrap();
+        assert_eq!(
+            (balance.settled, balance.future, balance.spendable),
+            (2, 4, 2)
+        );
+        let receiving = db.set_txo(make_txo_mod("incoming", 1, "1000")).unwrap();
+        db.set_coloring(make_coloring_mod(
+            receiving,
+            asset,
+            ColoringType::Receive,
+            2,
+        ))
+        .unwrap();
+        let before = serde_json::to_value(&db).unwrap();
+        let balance = db
+            .get_asset_balance("a1".into(), None, None, None, None, None)
+            .unwrap();
+        assert_eq!(
+            (balance.settled, balance.future, balance.spendable),
+            (2, 4, 2)
+        );
+        assert_eq!(serde_json::to_value(&db).unwrap(), before);
+        // An independently failed incoming transfer contributes no projected or
+        // spendable units. Its request, coloring and history remain intact.
+        let mut failed: DbBatchTransferActMod = db
+            .iter_batch_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|b| b.idx == batch)
+            .unwrap()
+            .into();
+        failed.status = ActiveValue::Set(TransferStatus::Failed);
+        db.update_batch_transfer(&mut failed).unwrap();
+        let balance = db
+            .get_asset_balance("a1".into(), None, None, None, None, None)
+            .unwrap();
+        assert_eq!(
+            (balance.settled, balance.future, balance.spendable),
+            (2, 2, 2)
+        );
+        assert_eq!(db.iter_colorings().unwrap().len(), 2);
+        assert_eq!(db.iter_transfers().unwrap().len(), 2);
     }
 
     #[test]

@@ -1,0 +1,12 @@
+    Blocking waiting for file lock on build directory
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-safe-bitcoin-20261103)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 26.11s
+     Running unittests src/lib.rs (/home/nigel/.cache/btcx-asm-release-20261101/native-target/debug/deps/rgb_lib_wasm-f6780f344ba8f335)
+
+running 3 tests
+test wallet::idb_store::tests::incoming_conflict_snapshot_v2_is_append_only_and_blocks_downgrade ... ok
+test wallet::online::incoming_conflict::tests::absent_original_uses_raw_404_without_requesting_status_or_changing_state ... ok
+test wallet::online::incoming_conflict::tests::malformed_retained_receipt_cannot_replace_wallet_state ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 185 filtered out; finished in 0.57s
+

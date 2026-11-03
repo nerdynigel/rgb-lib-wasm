@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 use crate::error::InternalError;
 
-pub(crate) const BACKUP_VERSION: u8 = 3;
+pub(crate) const BACKUP_VERSION: u8 = 4;
 /// 24-byte nonce for XChaCha20Poly1305 (single-shot mode).
 const NONCE_LEN: usize = 24;
 
@@ -48,6 +48,9 @@ pub(crate) struct WalletBackupPayload {
         std::collections::HashMap<String, super::online::TransferArtifacts>,
     #[serde(default)]
     pub(crate) received_consignments: std::collections::HashMap<String, Vec<u8>>,
+    #[serde(default)]
+    pub(crate) incoming_conflicts:
+        std::collections::HashMap<String, super::online::IncomingRgbConflict>,
 }
 
 /// The encrypted payload also carries its format. Merely changing an
@@ -66,7 +69,10 @@ fn decode_wallet_payload(bytes: &[u8], version: Option<u8>) -> Result<WalletBack
     if value.get("wallet_state").is_some() || value.get("version").is_some() {
         let envelope: VersionedWalletBackup =
             serde_json::from_value(value).map_err(|_| Error::InvalidBackup)?;
-        if envelope.version != BACKUP_VERSION || version.is_some_and(|v| v != BACKUP_VERSION) {
+        if ![3, BACKUP_VERSION].contains(&envelope.version)
+            || version.is_some_and(|v| v != envelope.version)
+            || (envelope.version == 3 && !envelope.wallet_state.incoming_conflicts.is_empty())
+        {
             return Err(Error::InvalidBackup);
         }
         Ok(envelope.wallet_state)
@@ -76,11 +82,13 @@ fn decode_wallet_payload(bytes: &[u8], version: Option<u8>) -> Result<WalletBack
         }
         let payload: WalletBackupPayload =
             serde_json::from_value(value).map_err(|_| Error::InvalidBackup)?;
-        if payload.transfer_artifacts.values().any(|a| {
-            a.external_send
-                .as_ref()
-                .is_some_and(|e| e.wallet_transfer.is_some())
-        }) {
+        if !payload.incoming_conflicts.is_empty()
+            || payload.transfer_artifacts.values().any(|a| {
+                a.external_send
+                    .as_ref()
+                    .is_some_and(|e| e.wallet_transfer.is_some())
+            })
+        {
             return Err(Error::InvalidBackup);
         }
         Ok(payload)
@@ -158,7 +166,7 @@ pub(crate) fn decrypt_payload(
     password: &str,
     pub_data: &BackupPubData,
 ) -> Result<Vec<u8>, Error> {
-    if ![2, BACKUP_VERSION].contains(&pub_data.version) {
+    if ![2, 3, BACKUP_VERSION].contains(&pub_data.version) {
         return Err(Error::UnsupportedBackupVersion {
             version: pub_data.version.to_string(),
         });
@@ -309,6 +317,7 @@ impl super::Wallet {
             bdk_changeset: payload.bdk_changeset,
             transfer_artifacts: payload.transfer_artifacts,
             received_consignments: payload.received_consignments,
+            incoming_conflicts: payload.incoming_conflicts,
             stock_stash_b64: Some(payload.stock_stash_b64),
             stock_state_b64: Some(payload.stock_state_b64),
             stock_index_b64: Some(payload.stock_index_b64),
@@ -473,6 +482,7 @@ impl super::Wallet {
             reuse_address_index: self.reuse_address_index.clone(),
             transfer_artifacts: self.transfer_artifacts.clone(),
             received_consignments: self.received_consignments.clone(),
+            incoming_conflicts: self.incoming_conflicts.clone(),
         };
 
         serde_json::to_vec(&VersionedWalletBackup {
@@ -576,6 +586,7 @@ mod tests {
                 "transaction".into(),
                 artifacts,
             )]),
+            incoming_conflicts: std::collections::HashMap::new(),
             received_consignments: std::collections::HashMap::from([(
                 "recipient".into(),
                 vec![4, 5, 6],
@@ -643,6 +654,43 @@ mod tests {
             pending.consignment_bytes
         );
         assert_eq!(restored.received_consignments["recipient"], vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn conflict_backup_v4_retains_receipt_and_refuses_header_or_payload_downgrade() {
+        let payload: WalletBackupPayload = serde_json::from_value(serde_json::json!({
+            "db": crate::database::memory_db::InMemoryDb::new(), "bdk_changeset":null,
+            "stock_stash_b64":"", "stock_state_b64":"", "stock_index_b64":""
+        }))
+        .unwrap();
+        // Historical native v3 remains readable, with no fabricated receipt.
+        let mut envelope = serde_json::json!({"version":3,"wallet_state":payload});
+        assert!(
+            decode_wallet_payload(&serde_json::to_vec(&envelope).unwrap(), Some(3))
+                .unwrap()
+                .incoming_conflicts
+                .is_empty()
+        );
+        let receipt = super::super::online::incoming_conflict::tests::receipt();
+        envelope["version"] = serde_json::json!(4);
+        envelope["wallet_state"]["incoming_conflicts"] =
+            serde_json::json!({"test-recipient": &receipt});
+        envelope["wallet_state"]["received_consignments"] =
+            serde_json::json!({"test-recipient":[1,2,3]});
+        let encoded = serde_json::to_vec(&envelope).unwrap();
+        let restored = decode_wallet_payload(&encoded, Some(4)).unwrap();
+        assert_eq!(restored.incoming_conflicts["test-recipient"], receipt);
+        assert_eq!(restored.received_consignments["test-recipient"], [1, 2, 3]);
+        assert!(decode_wallet_payload(&encoded, Some(3)).is_err());
+        envelope["version"] = serde_json::json!(3);
+        assert!(decode_wallet_payload(&serde_json::to_vec(&envelope).unwrap(), Some(3)).is_err());
+        assert!(
+            decode_wallet_payload(
+                &serde_json::to_vec(&envelope["wallet_state"]).unwrap(),
+                Some(2)
+            )
+            .is_err()
+        );
     }
 
     #[test]

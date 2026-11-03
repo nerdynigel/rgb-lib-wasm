@@ -27,6 +27,9 @@ pub struct WalletSnapshot {
     /// Received consignment bytes keyed by recipient_id.
     #[serde(default)]
     pub received_consignments: HashMap<String, Vec<u8>>,
+    /// Append-only independently confirmed incoming conflicts.
+    #[serde(default)]
+    pub incoming_conflicts: HashMap<String, super::online::IncomingRgbConflict>,
     /// Strict-encoded RGB Stock stash (base64).
     #[serde(default)]
     pub stock_stash_b64: Option<String>,
@@ -59,14 +62,18 @@ fn managed_transfers(snapshot: &WalletSnapshot) -> bool {
 }
 
 fn encode_snapshot(snapshot: &WalletSnapshot) -> Result<String, String> {
-    if managed_transfers(snapshot) {
+    if managed_transfers(snapshot) || !snapshot.incoming_conflicts.is_empty() {
         #[derive(Serialize)]
         struct Envelope<'a> {
             version: u8,
             managed_wallet_state: &'a WalletSnapshot,
         }
         serde_json::to_string(&Envelope {
-            version: 1,
+            version: if snapshot.incoming_conflicts.is_empty() {
+                1
+            } else {
+                2
+            },
             managed_wallet_state: snapshot,
         })
     } else {
@@ -81,14 +88,17 @@ fn decode_snapshot(json: &str) -> Result<WalletSnapshot, String> {
     if value.get("managed_wallet_state").is_some() || value.get("version").is_some() {
         let envelope: ManagedSnapshot = serde_json::from_value(value)
             .map_err(|_| "Unsupported managed wallet snapshot".to_string())?;
-        if envelope.version != 1 {
+        if ![1, 2].contains(&envelope.version)
+            || (envelope.version == 1
+                && !envelope.managed_wallet_state.incoming_conflicts.is_empty())
+        {
             return Err("Unsupported managed wallet snapshot version".into());
         }
         Ok(envelope.managed_wallet_state)
     } else {
         let snapshot: WalletSnapshot = serde_json::from_value(value)
             .map_err(|_| "Wallet snapshot decoding failed".to_string())?;
-        if managed_transfers(&snapshot) {
+        if managed_transfers(&snapshot) || !snapshot.incoming_conflicts.is_empty() {
             return Err("Managed wallet state requires its versioned snapshot".into());
         }
         Ok(snapshot)
@@ -104,11 +114,33 @@ fn snapshot_write_required(
 ) -> Result<bool, String> {
     let refused = || "Managed wallet snapshot is stale or loses original obligations".to_string();
     if existing.sequence >= candidate.sequence {
-        return if managed_transfers(existing) || managed_transfers(candidate) {
+        return if managed_transfers(existing)
+            || managed_transfers(candidate)
+            || !existing.incoming_conflicts.is_empty()
+            || !candidate.incoming_conflicts.is_empty()
+        {
             Err(refused())
         } else {
             Ok(false)
         };
+    }
+    for (recipient, receipt) in &existing.incoming_conflicts {
+        if candidate.incoming_conflicts.get(recipient) != Some(receipt)
+            || candidate.received_consignments.get(recipient)
+                != existing.received_consignments.get(recipient)
+            || !candidate
+                .db
+                .iter_batch_transfers()
+                .map_err(|_| refused())?
+                .iter()
+                .any(|b| {
+                    b.idx == receipt.batch_transfer_idx
+                        && b.status.failed()
+                        && b.txid.as_ref() == Some(&receipt.original_txid)
+                })
+        {
+            return Err(refused());
+        }
     }
     for (txid, old_artifact) in &existing.transfer_artifacts {
         let Some(old) = old_artifact
@@ -335,6 +367,60 @@ mod tests {
     use schemata::NonInflatableAsset;
 
     #[test]
+    fn incoming_conflict_snapshot_v2_is_append_only_and_blocks_downgrade() {
+        use crate::database::memory_db::{ActiveValue, DbBatchTransferActMod};
+        let db = InMemoryDb::new();
+        let receipt = super::super::online::incoming_conflict::tests::receipt();
+        db.set_batch_transfer(DbBatchTransferActMod {
+            txid: ActiveValue::Set(Some(receipt.original_txid.clone())),
+            status: ActiveValue::Set(crate::TransferStatus::Failed),
+            ..Default::default()
+        })
+        .unwrap();
+        let snapshot: WalletSnapshot = serde_json::from_value(serde_json::json!({
+            "sequence":7,"db":db,"bdk_changeset":null,"transfer_artifacts":{},
+            "received_consignments":{"test-recipient":[1,2,3]},
+            "incoming_conflicts":{"test-recipient":receipt}
+        }))
+        .unwrap();
+        let encoded = encode_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).unwrap()["version"],
+            2
+        );
+        assert!(serde_json::from_str::<WalletSnapshot>(&encoded).is_err());
+        let mut candidate = decode_snapshot(&encoded).unwrap();
+        candidate.sequence += 1;
+        assert!(snapshot_write_required(&snapshot, &candidate).unwrap());
+        candidate.incoming_conflicts.clear();
+        assert!(snapshot_write_required(&snapshot, &candidate).is_err());
+        candidate.incoming_conflicts = snapshot.incoming_conflicts.clone();
+        candidate
+            .incoming_conflicts
+            .get_mut("test-recipient")
+            .unwrap()
+            .conflicting_txid = "44".repeat(32);
+        assert!(snapshot_write_required(&snapshot, &candidate).is_err());
+        candidate.incoming_conflicts = snapshot.incoming_conflicts.clone();
+        candidate.received_consignments.clear();
+        assert!(snapshot_write_required(&snapshot, &candidate).is_err());
+        candidate.received_consignments = snapshot.received_consignments.clone();
+        let mut batch: DbBatchTransferActMod = candidate
+            .db
+            .iter_batch_transfers()
+            .unwrap()
+            .remove(0)
+            .into();
+        batch.status = ActiveValue::Set(crate::TransferStatus::WaitingConfirmations);
+        candidate.db.update_batch_transfer(&mut batch).unwrap();
+        assert!(snapshot_write_required(&snapshot, &candidate).is_err());
+        let mut downgraded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        downgraded["version"] = serde_json::json!(1);
+        assert!(decode_snapshot(&downgraded.to_string()).is_err());
+        assert!(decode_snapshot(&serde_json::to_string(&snapshot).unwrap()).is_err());
+    }
+
+    #[test]
     fn managed_snapshot_blocks_old_readers_and_preserves_original_attempts() {
         let mut snapshot = WalletSnapshot {
             sequence: u64::MAX,
@@ -342,6 +428,7 @@ mod tests {
             bdk_changeset: None,
             transfer_artifacts: HashMap::new(),
             received_consignments: HashMap::new(),
+            incoming_conflicts: HashMap::new(),
             stock_stash_b64: None,
             stock_state_b64: None,
             stock_index_b64: None,
@@ -374,7 +461,7 @@ mod tests {
             serde_json::to_value(&snapshot.transfer_artifacts).unwrap()
         );
         let mut unknown: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-        unknown["version"] = serde_json::json!(2);
+        unknown["version"] = serde_json::json!(99);
         assert!(decode_snapshot(&unknown.to_string()).is_err());
         unknown["version"] = serde_json::json!(1);
         unknown["db"] = serde_json::to_value(&snapshot.db).unwrap();
@@ -531,6 +618,7 @@ mod tests {
             bdk_changeset: None,
             transfer_artifacts: HashMap::from([("funding-txid".to_owned(), transfer_artifact)]),
             received_consignments: HashMap::new(),
+            incoming_conflicts: HashMap::new(),
             stock_stash_b64: Some(s),
             stock_state_b64: Some(st),
             stock_index_b64: Some(i),

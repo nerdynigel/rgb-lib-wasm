@@ -22,6 +22,10 @@ pub use wallet_transfer::{WalletRgbRecoveryBinding, WalletRgbSendRequest};
 #[path = "rgb_input_observation.rs"]
 mod rgb_input_observation;
 
+#[path = "incoming_conflict.rs"]
+pub(super) mod incoming_conflict;
+pub use incoming_conflict::IncomingRgbConflict;
+
 const SCHEMAS_SUPPORTING_INFLATION: [database::enums::AssetSchema; 1] = [AssetSchema::Ifa];
 
 const TRANSFER_DATA_FILE: &str = "transfer_data.txt";
@@ -372,21 +376,34 @@ impl Indexer {
     pub(crate) async fn get_tx_confirmations(&self, txid: &str) -> Result<Option<u64>, Error> {
         Ok(match self {
             Indexer::EsploraAsync(client) => {
-                let txid = Txid::from_str(txid).unwrap();
-                let tx_status = client
+                let txid = Txid::from_str(txid).map_err(|_| Error::InvalidTxid)?;
+                // A missing transaction returns None. Its status endpoint may
+                // return 404, so requesting status first makes missing originals
+                // impossible to reconcile through this documented API.
+                let Some(transaction) = client.get_tx(&txid).await.map_err(IndexerError::from)?
+                else {
+                    return Ok(None);
+                };
+                if transaction.compute_txid() != txid {
+                    return Err(Error::InvalidConsignment);
+                }
+                let status = client
                     .get_tx_status(&txid)
                     .await
                     .map_err(IndexerError::from)?;
-                if let Some(tx_height) = tx_status.block_height {
+                if status.confirmed {
+                    let tx_height = status
+                        .block_height
+                        .filter(|h| *h > 0)
+                        .ok_or(Error::InvalidConsignment)?;
                     let height = client.get_height().await.map_err(IndexerError::from)?;
-                    Some((height - tx_height + 1) as u64)
-                } else if client
-                    .get_tx(&txid)
-                    .await
-                    .map_err(IndexerError::from)?
-                    .is_none()
-                {
-                    None
+                    Some(
+                        u64::from(
+                            height
+                                .checked_sub(tx_height)
+                                .ok_or(Error::InvalidConsignment)?,
+                        ) + 1,
+                    )
                 } else {
                     Some(0)
                 }
@@ -3565,6 +3582,11 @@ impl Wallet {
                 return Ok(None);
             }
         } else {
+            if incoming {
+                return self
+                    .reconcile_incoming_witness_conflict(batch_transfer, db_data)
+                    .await;
+            }
             return Ok(None);
         }
 
