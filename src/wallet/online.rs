@@ -16,8 +16,8 @@ pub use rgb_fee_recovery::{RgbFeeRecoveryPrepared, RgbFeeRecoveryRequest};
 
 #[path = "wallet_transfer.rs"]
 mod wallet_transfer;
-pub use wallet_transfer::WalletRgbSendRequest;
 use wallet_transfer::WalletTransferBinding;
+pub use wallet_transfer::{WalletRgbRecoveryBinding, WalletRgbSendRequest};
 
 #[path = "rgb_input_observation.rs"]
 mod rgb_input_observation;
@@ -1687,7 +1687,12 @@ impl Wallet {
             .iter()
             .map(|i| i.previous_output)
             .collect();
-        let data = self.database.get_db_data(false)?;
+        let mut data = self.database.get_db_data(false)?;
+        if let Some(binding) = &wallet_transfer {
+            let request: WalletRgbSendRequest = serde_json::from_str(&binding.request_json)
+                .map_err(|_| Error::InvalidRecipientMap)?;
+            data = self.wallet_rgb_recovery_db_view(data, &request)?;
+        }
         let utxos = self.database.get_unspent_txos(data.txos.clone())?;
         let available = self.database.get_rgb_allocations(
             utxos,

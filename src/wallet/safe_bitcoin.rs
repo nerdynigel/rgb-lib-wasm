@@ -183,6 +183,18 @@ impl Wallet {
         db: &DbData,
         own_rgb: Option<&str>,
     ) -> Result<HashSet<OutPoint>, Error> {
+        self.bitcoin_native_holds_for_recovery(db, own_rgb, None)
+    }
+
+    /// Only an independently checked, original-bound RGB recovery may name a
+    /// second preparation. Never subtract outpoints from a union of holds: a
+    /// third operation retaining the same coin must still prevent spending.
+    pub(super) fn bitcoin_native_holds_for_recovery(
+        &self,
+        db: &DbData,
+        own_rgb: Option<&str>,
+        recovery_source: Option<&str>,
+    ) -> Result<HashSet<OutPoint>, Error> {
         if self.transfer_artifacts.len() > MAX_INPUTS
             || db.txos.len() > MAX_ROWS
             || db.colorings.len() > MAX_ROWS
@@ -265,7 +277,7 @@ impl Wallet {
             {
                 return Err(refused());
             }
-            if own_rgb == Some(txid.as_str()) {
+            if own_rgb == Some(txid.as_str()) || recovery_source == Some(txid.as_str()) {
                 if external.wallet_transfer.is_none()
                     || external.status != ExternalSendStatus::Prepared
                     || batch.status != TransferStatus::Initiated

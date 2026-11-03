@@ -1,0 +1,16 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 ($WORKTREE)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.60s
+     Running unittests src/lib.rs (target/debug/deps/rgb_lib_wasm-f6780f344ba8f335)
+
+running 8 tests
+test wallet::online::wallet_transfer::asset_recovery::tests::raw_original_and_recovery_purpose_survive_native_artifact_serialization ... ok
+test wallet::online::wallet_transfer::asset_recovery::tests::explicit_marker_is_canonical_and_legacy_ordinary_bytes_are_unchanged ... ok
+test wallet::online::wallet_transfer::asset_recovery::tests::one_original_cannot_authorize_competing_recoveries_and_ordinary_entry_refuses_marker ... ok
+test wallet::online::wallet_transfer::asset_recovery::tests::third_native_holds_and_caller_exclusions_remain_effective ... ok
+test wallet::online::wallet_transfer::asset_recovery::tests::dispatched_two_rgb_inputs_qualify_without_any_plain_bitcoin_fee_input_and_keep_all_state ... ok
+test wallet::online::wallet_transfer::asset_recovery::tests::own_new_transaction_binds_fee_all_original_rgb_and_every_destination ... ok
+test wallet::online::wallet_transfer::asset_recovery::tests::all_rgb_must_return_to_an_exact_wallet_owned_receive_record ... ok
+test wallet::online::wallet_transfer::asset_recovery::tests::changed_original_identity_signature_network_state_or_asset_never_qualifies ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 172 filtered out; finished in 8.38s
+

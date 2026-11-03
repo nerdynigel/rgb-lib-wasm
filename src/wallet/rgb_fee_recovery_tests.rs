@@ -33,6 +33,7 @@ fn fixture() -> (Wallet, RgbFeeRecoveryRequest, OutPoint, String) {
         min_confirmations: 1,
         excluded_inputs: vec![],
         expires_at: 1,
+        recovery_of: None,
     };
     let mut signed = original;
     w._sign_psbt(&mut signed, None).unwrap();
