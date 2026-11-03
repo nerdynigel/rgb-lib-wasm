@@ -2033,6 +2033,14 @@ impl Wallet {
                 return Err(Error::CannotDeleteBatchTransfer);
             }
             #[cfg(feature = "esplora")]
+            if self.transfer_artifacts.values().any(|a| {
+                a.external_receive
+                    .as_ref()
+                    .is_some_and(|r| r.batch_transfer_idx == batch_transfer.idx)
+            }) {
+                return Err(Error::CannotDeleteBatchTransfer);
+            }
+            #[cfg(feature = "esplora")]
             if batch_transfer.txid.as_ref().is_some_and(|txid| {
                 self.transfer_artifacts
                     .get(txid)
@@ -2067,6 +2075,14 @@ impl Wallet {
                 .filter(|t| t.failed())
                 .collect();
             for batch_transfer in batch_transfers.iter_mut() {
+                #[cfg(feature = "esplora")]
+                if self.transfer_artifacts.values().any(|a| {
+                    a.external_receive
+                        .as_ref()
+                        .is_some_and(|r| r.batch_transfer_idx == batch_transfer.idx)
+                }) {
+                    continue;
+                }
                 #[cfg(feature = "esplora")]
                 if batch_transfer.txid.as_ref().is_some_and(|txid| {
                     self.transfer_artifacts

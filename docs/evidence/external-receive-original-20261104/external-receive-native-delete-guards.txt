@@ -1,0 +1,11 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-safe-bitcoin-20261103)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.20s
+     Running unittests src/lib.rs (target/debug/deps/rgb_lib_wasm-f6780f344ba8f335)
+
+running 3 tests
+test wallet::online::external_receive::tests::matching_metadata_or_digest_never_substitutes_for_standard_rgb_proof ... ok
+test wallet::online::external_receive::tests::failed_receive_history_is_preserved_in_single_and_bulk_delete ... ok
+test wallet::online::external_receive::tests::offline_and_non_regtest_retention_never_mutates_or_suspends ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.45s
+

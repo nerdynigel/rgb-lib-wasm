@@ -301,6 +301,46 @@ mod tests {
     }
 
     #[test]
+    fn failed_receive_history_is_preserved_in_single_and_bulk_delete() {
+        // Refusal-journal fixture, not an accepted standard RGB proof.
+        let mut wallet = super::super::safe_bitcoin::tests::wallet();
+        let idx = wallet
+            .database
+            .set_batch_transfer(DbBatchTransferActMod {
+                status: ActiveValue::Set(TransferStatus::Failed),
+                ..Default::default()
+            })
+            .unwrap();
+        wallet.transfer_artifacts.insert(
+            "original".into(),
+            TransferArtifacts {
+                external_receive: Some(ExternalReceiveOriginal {
+                    txid: "original".into(),
+                    contract_id: "contract".into(),
+                    recipient_id: "recipient".into(),
+                    amount: "1".into(),
+                    vout: 2,
+                    batch_transfer_idx: idx,
+                    consignment_sha256: "digest".into(),
+                    restored: false,
+                }),
+                ..Default::default()
+            },
+        );
+        let before = serde_json::to_value(wallet.database.as_ref()).unwrap();
+        assert!(matches!(
+            wallet.delete_transfers(Some(idx), false),
+            Err(Error::CannotDeleteBatchTransfer)
+        ));
+        assert!(!wallet.delete_transfers(None, false).unwrap());
+        assert_eq!(
+            serde_json::to_value(wallet.database.as_ref()).unwrap(),
+            before
+        );
+        assert!(wallet.transfer_artifacts.contains_key("original"));
+    }
+
+    #[test]
     fn matching_metadata_or_digest_never_substitutes_for_standard_rgb_proof() {
         let bytes = b"unfunded-invalid-proof".to_vec();
         let txid = "11".repeat(32);
