@@ -1,0 +1,16 @@
+{
+  "scope": "LIVE_PAIRED_PENDING_RGB_PROJECTED_BALANCE_FIX_NOT_FINANCIAL_ACCEPTANCE",
+  "observed_future": "18446744073709551614",
+  "expected_conservative_future": "0",
+  "settled_and_spendable_and_DB_unchanged": true,
+  "all_balance_additions_checked": true,
+  "tests": 183,
+  "log_sha256": {
+    "native-pending-balance-RED-corrected-test.log": "70a2aeb17acc11d3b35977a35e2c6f35d0fb039a7a3eec9212af1d7f144b9e73",
+    "native-183-accounting-final.log": "ae6df28a704d5b3ce28af909d54720e5390e2722d342821363089b53e8ceae57",
+    "native-accounting-clippy.log": "46987f4610d588486d099d53a9468c8e173fca1c92b65640cac6756cfced0bd5",
+    "native-accounting-wasm.log": "2550b154c98c740a9a3b7d564aeefc69ce45841d3c135d06690f512048076adc"
+  },
+  "private_unsigned_complete_backup_sha256": "4adccf969c70fedccd8dd266612516bca6f1687309aacdec33c151aaf589568d",
+  "new_financial_operations": 0
+}

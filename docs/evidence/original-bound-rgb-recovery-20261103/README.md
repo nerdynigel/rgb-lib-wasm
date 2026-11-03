@@ -40,3 +40,18 @@ No dependency versions changed. No live signature, delivery, financial broadcast
 mining, reset, original replay or hold release occurred in this source checkpoint.
 Main remains untouched. Full BTCX delivery status stays in the integration branch
 PROGRESS.md / PR252; this is the Native candidate component only.
+
+## Live original/recovery pending accounting correction
+
+Real Lab preparation fbe9ef23 returns2RGB to an owned receive with256sat
+miner fee,1000sat carrier and744sat owned change. No signer/broadcast ran.
+Retaining both outgoing proposals exposed existing signed-to-unsigned projection
+wrapping: settled2 minus two pending2 proposals became u64::MAX-1.
+Fix the native projected future lower bound to zero while preserving every DB
+row/reservation and independent settled/spendable calculations. It grants no
+spending authority and classifies no transaction. Check every balance addition
+and reject positive/sum overflow as inconsistency.183native tests PASS, including
+red-before/green-after exact2pending regression with byte-exact DB readback,
+unsigned-cancelled alternative still-held proof and two overflow cases. WASM
+compile/strict library lint/format PASS. Complete private pending file retained;
+old original and new unsigned proposal remain held. Actual recovery still OPEN.

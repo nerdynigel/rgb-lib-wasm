@@ -1,0 +1,24 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-safe-bitcoin-20261103)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.81s
+     Running unittests src/lib.rs (target/debug/deps/rgb_lib_wasm-f6780f344ba8f335)
+
+running 1 test
+test database::memory_db::tests::test_conflicting_pending_proposals_never_wrap_future_or_release_holds ... FAILED
+
+failures:
+
+---- database::memory_db::tests::test_conflicting_pending_proposals_never_wrap_future_or_release_holds stdout ----
+
+thread 'database::memory_db::tests::test_conflicting_pending_proposals_never_wrap_future_or_release_holds' (800144) panicked at src/database/memory_db.rs:2150:9:
+assertion `left == right` failed
+  left: 18446744073709551614
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    database::memory_db::tests::test_conflicting_pending_proposals_never_wrap_future_or_release_holds
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 181 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
