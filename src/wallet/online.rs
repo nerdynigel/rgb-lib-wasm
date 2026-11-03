@@ -22,6 +22,10 @@ pub use wallet_transfer::{WalletRgbRecoveryBinding, WalletRgbSendRequest};
 #[path = "rgb_input_observation.rs"]
 mod rgb_input_observation;
 
+#[path = "asset_spend.rs"]
+mod asset_spend;
+pub use asset_spend::{AssetSpendInput, AssetSpendView};
+
 #[path = "incoming_conflict.rs"]
 pub(super) mod incoming_conflict;
 pub use incoming_conflict::IncomingRgbConflict;
