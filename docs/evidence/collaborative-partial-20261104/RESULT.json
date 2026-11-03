@@ -1,8 +1,8 @@
 {
   "scope": "NATIVE_COLLABORATIVE_PARTIAL_CORE_AND_FORMAT_CHECKPOINT_NOT_ASYNC_BROWSER_OR_ATOMIC_ACCEPTANCE",
   "base_revision": "3191bf62e4f7f7ae8c197def84b5a597cd915d5a",
-  "native_cases": 210,
-  "new_cases": 11,
+  "native_cases": 211,
+  "new_cases": 12,
   "checks": [
     {
       "name": "native-tests",
@@ -80,7 +80,8 @@
   "retained_failures": [
     "First full202cases:200PASS/2new fixture failures from missing foreign non-witness UTXOs. Full original transactions added to fixtures; BDK trust-witness setting unchanged.",
     "First format-test compile failed on two private test imports, corrected to the actual module path.",
-    "Broader cargo clippy --lib --tests -Dwarnings finds unchanged historical Arc<InMemoryDb> test declarations and native-unused imports in WASM-only integration test files. Raw failure retained; established strict --lib lint passes. No test/lint suppressions added."
+    "Broader cargo clippy --lib --tests -Dwarnings finds unchanged historical Arc<InMemoryDb> test declarations and native-unused imports in WASM-only integration test files. Raw failure retained; established strict --lib lint passes. No test/lint suppressions added.",
+    "Integration inspection found the encrypted-envelope version guard omitted legacy v4 after the backup5 bump. Corrected before any SDK pin/deployment; new actual encrypted v3/v4 encode/decode/decrypt regressions pass. Initial core SHA a64014c remains historical, not a promoted runtime."
   ],
   "source_sha256": {
     "src/wallet/collaborative_partial.rs": "c6bdac610b87bc933e38815c2dcc858e25552ad5917f9ff1e051f33a373caca9",
@@ -89,7 +90,7 @@
     "src/wallet/offline.rs": "85e4f0012537d6da45a9ceb11e0f2eb8c4fd5711e6b6d76cc96af4867e747e12",
     "src/wallet/wallet_transfer.rs": "33fad9e2d1eda6ea7ed3cd517102fbd4deada2ea98c3bfe258682e741424ee7b",
     "src/wallet/safe_bitcoin.rs": "17eb0ca07d3adb5c3ccca58b5ba2265f19d088c87e2bf022d0d72e18a320215d",
-    "src/wallet/backup.rs": "98a92771be141dc463f58ca2466a2fb76b746a88109122ec9ca1b71f865c2a56",
+    "src/wallet/backup.rs": "a4cf65eeb35849b072373e2ac02af9e1994c7fd95439c8aa02fe1f39d527a372",
     "src/wallet/idb_store.rs": "60b299c2d8a9cf33bdbf3e8b7d46fdd772f327cbdb8c74bee9cb368181014b39",
     "Cargo.toml": "92334cb58fe1b8531899c9b84554471c2a3174634bd78e130ba19b535edef028",
     "Cargo.lock": "6287c1b3bebd571efc5a78f325f52ca0274c87d77ed35d10f40d72408125014c"
@@ -98,15 +99,16 @@
     "CHECKS.json": "ef71e94a1d8d6e3cf9a315965d24d672f8f73d2bb1df27a7377f9fffddce75cc",
     "native-clippy-broader-tests-existing-errors.txt": "b59520073baa686eed0ad3f32e6405244b2abf0fe967bb00e1ba677ce7e351b8",
     "native-clippy-exit.txt": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
-    "native-clippy.txt": "8106bedc06c86c3d2d2b8d80c03a2645999470a08cdf7ff0dcb1a7b0a4514d8b",
+    "native-clippy.txt": "a7bdd1d5fadc8acc8920d090726547a06b60cefb0a3c684ba7c8b5498d366092",
     "native-focused.txt": "1495311e7f60c6ec19bee07071c63c515d9df5cfcf5308ecde466afbf7684f33",
     "native-format-exit.txt": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
     "native-format.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "native-legacy-envelope-regression.txt": "3ec2e5d0ef6a9c1882c38d8486e8741c4e69c57f4703f52373e57a2d9ea648d1",
     "native-tests-exit.txt": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
     "native-tests-first-import-error.txt": "f3193b193e4f0df2334e042c6fee7fbe4eccf2cc1cc41e8d537e1c48af1e4956",
     "native-tests-first.txt": "a0153afa2f19002d5a2a30633c4bed85998594562f025147b90e7746a4c4b63b",
-    "native-tests.txt": "13dc9fcaa70ff5f9237c55d07aedea0bd79f0124c51a4a1bb9b58a068d0c0343",
+    "native-tests.txt": "04730aed46b72ef021ac26697f7bdedfc60d89c96945dc30eb6eb77013761a14",
     "native-wasm-exit.txt": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
-    "native-wasm.txt": "625728057e80e11b634d63b6b42293a360e9d51edc030e40d341aa040f35a69f"
+    "native-wasm.txt": "475ca7f4ad8c2f174ea5d64ee743875a11c9470acc4e98b8d99991ebd7aa461e"
   }
 }

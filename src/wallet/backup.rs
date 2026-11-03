@@ -179,7 +179,7 @@ pub(crate) fn decrypt_payload(
     password: &str,
     pub_data: &BackupPubData,
 ) -> Result<Vec<u8>, Error> {
-    if ![2, 3, BACKUP_VERSION].contains(&pub_data.version) {
+    if ![2, 3, 4, BACKUP_VERSION].contains(&pub_data.version) {
         return Err(Error::UnsupportedBackupVersion {
             version: pub_data.version.to_string(),
         });
@@ -539,6 +539,31 @@ impl super::Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_v3_and_v4_encrypted_envelopes_remain_decryptable() {
+        for version in [3, 4] {
+            let payload: WalletBackupPayload = serde_json::from_value(serde_json::json!({
+                "wallet_identity":["regtest","public-vanilla","public-colored"],
+                "db":crate::database::memory_db::InMemoryDb::new(),"bdk_changeset":null,
+                "stock_stash_b64":"stash","stock_state_b64":"state","stock_index_b64":"index",
+                "transfer_artifacts":{},"received_consignments":{},"incoming_conflicts":{}
+            }))
+            .unwrap();
+            let plaintext =
+                serde_json::to_vec(&serde_json::json!({"version":version,"wallet_state":payload}))
+                    .unwrap();
+            let (ciphertext, mut public) =
+                encrypt_payload(&plaintext, "unfunded-migration-fixture").unwrap();
+            public.version = version;
+            let envelope = encode_backup(&ciphertext, &public).unwrap();
+            let (metadata, encrypted) = decode_backup(&envelope).unwrap();
+            let recovered =
+                decrypt_payload(encrypted, "unfunded-migration-fixture", &metadata).unwrap();
+            assert_eq!(recovered, plaintext);
+            assert!(decode_wallet_payload(&recovered, Some(version)).is_ok());
+        }
+    }
 
     #[test]
     fn collaborative_backup_v5_preserves_original_and_marks_all_imported_attempts_restored() {

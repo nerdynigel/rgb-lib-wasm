@@ -1,0 +1,9 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-safe-bitcoin-20261103)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.52s
+     Running unittests src/lib.rs (target/debug/deps/rgb_lib_wasm-f6780f344ba8f335)
+
+running 1 test
+test wallet::backup::tests::legacy_v3_and_v4_encrypted_envelopes_remain_decryptable ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 210 filtered out; finished in 42.51s
+
