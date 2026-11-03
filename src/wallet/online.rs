@@ -26,6 +26,11 @@ mod rgb_input_observation;
 mod asset_spend;
 pub use asset_spend::{AssetSpendInput, AssetSpendView};
 
+#[path = "collaborative_partial.rs"]
+pub(super) mod collaborative_partial;
+pub use collaborative_partial::CollaborativePartialRequest;
+use collaborative_partial::PartialSigningRecord;
+
 #[path = "incoming_conflict.rs"]
 pub(super) mod incoming_conflict;
 pub use incoming_conflict::IncomingRgbConflict;
@@ -211,6 +216,9 @@ pub(crate) struct TransferArtifacts {
     /// the prepared operation survives a reload/reopen before finalisation.
     #[serde(default)]
     pub(crate) external_send: Option<ExternalSendArtifact>,
+    /// One native signing attempt and exact original partial, never a balance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) partial_signing: Option<PartialSigningRecord>,
 }
 
 /// Durable lifecycle state of an externally constructed RGB send.
@@ -255,6 +263,9 @@ pub(crate) struct ExternalSendArtifact {
     /// has no such binding and cannot enter the ordinary-send lifecycle.
     #[serde(default)]
     pub(crate) wallet_transfer: Option<WalletTransferBinding>,
+    /// Any restored pending external original must not mint a new partial.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) restored_for_partial: bool,
 }
 
 /// Stable result of preparing an externally constructed RGB send.
@@ -2063,6 +2074,7 @@ impl Wallet {
                     status: ExternalSendStatus::Prepared,
                     conflict_txid: None,
                     wallet_transfer,
+                    restored_for_partial: false,
                 }),
                 ..Default::default()
             },

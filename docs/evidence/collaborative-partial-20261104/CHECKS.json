@@ -1,0 +1,54 @@
+[
+  {
+    "name": "native-tests",
+    "argv": [
+      "cargo",
+      "test",
+      "--locked",
+      "--lib",
+      "--features",
+      "esplora"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "native-clippy",
+    "argv": [
+      "cargo",
+      "clippy",
+      "--locked",
+      "--lib",
+      "--features",
+      "esplora",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "native-format",
+    "argv": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0
+  },
+  {
+    "name": "native-wasm",
+    "argv": [
+      "cargo",
+      "check",
+      "--locked",
+      "--lib",
+      "--target",
+      "wasm32-unknown-unknown",
+      "--features",
+      "esplora"
+    ],
+    "exit_code": 0
+  }
+]

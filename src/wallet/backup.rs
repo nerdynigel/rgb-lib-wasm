@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 use crate::error::InternalError;
 
-pub(crate) const BACKUP_VERSION: u8 = 4;
+pub(crate) const BACKUP_VERSION: u8 = 5;
 /// 24-byte nonce for XChaCha20Poly1305 (single-shot mode).
 const NONCE_LEN: usize = 24;
 
@@ -69,7 +69,14 @@ fn decode_wallet_payload(bytes: &[u8], version: Option<u8>) -> Result<WalletBack
     if value.get("wallet_state").is_some() || value.get("version").is_some() {
         let envelope: VersionedWalletBackup =
             serde_json::from_value(value).map_err(|_| Error::InvalidBackup)?;
-        if ![3, BACKUP_VERSION].contains(&envelope.version)
+        if ![3, 4, BACKUP_VERSION].contains(&envelope.version)
+            || (envelope.version < 5
+                && envelope.wallet_state.transfer_artifacts.values().any(|a| {
+                    a.partial_signing.is_some()
+                        || a.external_send
+                            .as_ref()
+                            .is_some_and(|e| e.restored_for_partial)
+                }))
             || version.is_some_and(|v| v != envelope.version)
             || (envelope.version == 3 && !envelope.wallet_state.incoming_conflicts.is_empty())
         {
@@ -86,7 +93,8 @@ fn decode_wallet_payload(bytes: &[u8], version: Option<u8>) -> Result<WalletBack
             || payload.transfer_artifacts.values().any(|a| {
                 a.external_send
                     .as_ref()
-                    .is_some_and(|e| e.wallet_transfer.is_some())
+                    .is_some_and(|e| e.wallet_transfer.is_some() || e.restored_for_partial)
+                    || a.partial_signing.is_some()
             })
         {
             return Err(Error::InvalidBackup);
@@ -100,14 +108,19 @@ fn fence_restored_pending_transfers(
 ) {
     use super::online::ExternalSendStatus;
     for artifact in artifacts.values_mut() {
+        if let Some(partial) = artifact.partial_signing.as_mut() {
+            partial.restored = true;
+        }
         if let Some(external) = artifact.external_send.as_mut()
             && matches!(
                 external.status,
                 ExternalSendStatus::Prepared | ExternalSendStatus::BroadcastRecorded
             )
-            && let Some(binding) = external.wallet_transfer.as_mut()
         {
-            binding.restored = true;
+            external.restored_for_partial = true;
+            if let Some(binding) = external.wallet_transfer.as_mut() {
+                binding.restored = true;
+            }
         }
     }
 }
@@ -237,6 +250,21 @@ impl super::Wallet {
             expected.indexer = actual.indexer.clone();
         }
         for (txid, expected) in &mut payload.transfer_artifacts {
+            if let Some(live) = self.transfer_artifacts.get(txid) {
+                if live.partial_signing.as_ref().is_some_and(|p| p.restored)
+                    && let Some(p) = expected.partial_signing.as_mut()
+                {
+                    p.restored = true;
+                }
+                if live
+                    .external_send
+                    .as_ref()
+                    .is_some_and(|e| e.restored_for_partial)
+                    && let Some(e) = expected.external_send.as_mut()
+                {
+                    e.restored_for_partial = true;
+                }
+            }
             if let Some(binding) = expected
                 .external_send
                 .as_mut()
@@ -513,6 +541,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn collaborative_backup_v5_preserves_original_and_marks_all_imported_attempts_restored() {
+        use super::super::online::{
+            TransferArtifacts,
+            collaborative_partial::{PartialSigningRecord, tests::vector},
+        };
+        let (_, request) = vector();
+        let id = request
+            .psbt
+            .parse::<crate::bitcoin::psbt::Psbt>()
+            .unwrap()
+            .unsigned_tx
+            .compute_txid()
+            .to_string();
+        let artifact = TransferArtifacts {
+            partial_signing: Some(PartialSigningRecord {
+                request: request.clone(),
+                attempted: true,
+                restored: false,
+            }),
+            signed_psbt: Some("exact-original-partial".into()),
+            ..Default::default()
+        };
+        let payload = WalletBackupPayload {
+            wallet_identity: Some((
+                "regtest".into(),
+                "public-vanilla".into(),
+                "public-colored".into(),
+            )),
+            db: crate::database::memory_db::InMemoryDb::new(),
+            bdk_changeset: None,
+            stock_stash_b64: "stash".into(),
+            stock_state_b64: "state".into(),
+            stock_index_b64: "index".into(),
+            reuse_address_index: Default::default(),
+            transfer_artifacts: std::collections::HashMap::from([(id.clone(), artifact)]),
+            received_consignments: Default::default(),
+            incoming_conflicts: Default::default(),
+        };
+        let encoded =
+            serde_json::to_vec(&serde_json::json!({"version":5,"wallet_state":payload})).unwrap();
+        let mut restored = decode_wallet_payload(&encoded, Some(5)).unwrap();
+        assert_eq!(
+            restored.transfer_artifacts[&id]
+                .partial_signing
+                .as_ref()
+                .unwrap()
+                .request,
+            request
+        );
+        for version in [3, 4] {
+            let mut bad: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            bad["version"] = serde_json::json!(version);
+            assert!(
+                decode_wallet_payload(&serde_json::to_vec(&bad).unwrap(), Some(version)).is_err()
+            );
+        }
+        fence_restored_pending_transfers(&mut restored.transfer_artifacts);
+        assert!(
+            restored.transfer_artifacts[&id]
+                .partial_signing
+                .as_ref()
+                .unwrap()
+                .restored
+        );
+        assert_eq!(
+            restored.transfer_artifacts[&id].signed_psbt.as_deref(),
+            Some("exact-original-partial")
+        );
+    }
+
+    #[test]
     fn restore_comparison_only_allows_monotonic_public_derivation_growth() {
         use bdk_wallet::chain::{DescriptorId, indexer::keychain_txout::ChangeSet};
         let id: DescriptorId = "11".repeat(32).parse().unwrap();
@@ -567,6 +666,7 @@ mod tests {
                     }))
                     .unwrap(),
                 ),
+                restored_for_partial: false,
             }),
             ..Default::default()
         };

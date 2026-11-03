@@ -195,13 +195,24 @@ impl Wallet {
         let mut request: WalletRgbSendRequest =
             serde_json::from_str(&binding.request_json).map_err(|_| invalid())?;
         validate_request(&mut request)?;
+        self.external_rgb_original_input_units(txid, &request.asset_id, request.amount)
+    }
+
+    pub(super) fn external_rgb_original_input_units(
+        &self,
+        txid: &str,
+        asset_id: &str,
+        amount: u64,
+    ) -> Result<BTreeMap<String, u64>, Error> {
+        if amount == 0 {
+            return Err(invalid());
+        }
+        let artifacts = self.transfer_artifacts.get(txid).ok_or_else(invalid)?;
+        let external = artifacts.external_send.as_ref().ok_or_else(invalid)?;
         if artifacts.asset_infos.len() != 1 {
             return Err(invalid());
         }
-        let info = artifacts
-            .asset_infos
-            .get(&request.asset_id)
-            .ok_or_else(invalid)?;
+        let info = artifacts.asset_infos.get(asset_id).ok_or_else(invalid)?;
         let psbt = Psbt::from_str(&external.prepared_psbt)?;
         let points = psbt
             .unsigned_tx
@@ -212,14 +223,14 @@ impl Wallet {
         if points.is_empty()
             || points.len() > 128
             || points.len() != psbt.unsigned_tx.input.len()
-            || info.asset_info.contract_id.to_string() != request.asset_id
+            || info.asset_info.contract_id.to_string() != asset_id
             || info.main_transition != TypeOfTransition::Transfer
             || info.asset_spend.txo_map.is_empty()
             || info.asset_spend.txo_map.len() > 128
             || info.asset_spend.txo_map.len() != info.assignments_spent.len()
             || info.original_assignments_needed
                 != (AssignmentsCollection {
-                    fungible: request.amount,
+                    fungible: amount,
                     ..Default::default()
                 })
         {
@@ -255,7 +266,7 @@ impl Wallet {
                 fungible: total,
                 ..Default::default()
             })
-            || total < request.amount
+            || total < amount
         {
             return Err(invalid());
         }
@@ -272,7 +283,7 @@ impl Wallet {
         self.assert_wallet_rgb_stock_input_units(asset, psbt, &expected)
     }
 
-    fn assert_wallet_rgb_stock_input_units(
+    pub(super) fn assert_wallet_rgb_stock_input_units(
         &self,
         asset: &str,
         psbt: &Psbt,
@@ -331,12 +342,28 @@ impl Wallet {
         }
         let mut points = HashSet::new();
         for (txid, artifacts) in &self.transfer_artifacts {
+            if let Some(partial) = &artifacts.partial_signing {
+                points.extend(super::collaborative_partial::retained_partial_inputs(
+                    txid, partial,
+                )?);
+            }
             if except == Some(txid.as_str()) {
                 continue;
             }
             let Some(external) = artifacts.external_send.as_ref() else {
                 continue;
             };
+            if external.restored_for_partial {
+                let original = Psbt::from_str(&external.prepared_psbt).map_err(|_| invalid())?;
+                if original.unsigned_tx.compute_txid().to_string() != *txid
+                    || original.inputs.is_empty()
+                    || original.inputs.len() > 128
+                {
+                    return Err(invalid());
+                }
+                points.extend(original.unsigned_tx.input.iter().map(|i| i.previous_output));
+                continue;
+            }
             let Some(binding) = external.wallet_transfer.as_ref() else {
                 continue;
             };
@@ -392,7 +419,11 @@ impl Wallet {
             .transfer_artifacts
             .get(&txid)
             .and_then(|a| a.external_send.as_ref())
-            .is_some_and(|e| e.wallet_transfer.is_some())
+            .is_some_and(|e| e.wallet_transfer.is_some() || e.restored_for_partial)
+            || self
+                .transfer_artifacts
+                .get(&txid)
+                .is_some_and(|a| a.partial_signing.is_some())
         {
             return Err(Error::ExternalSendConflict { txid });
         }
@@ -1595,6 +1626,7 @@ mod tests {
                 status: ExternalSendStatus::Prepared,
                 conflict_txid: None,
                 wallet_transfer: Some(validate_request(&mut req).unwrap().binding),
+                restored_for_partial: false,
             }),
             ..Default::default()
         }

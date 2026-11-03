@@ -55,9 +55,13 @@ struct ManagedSnapshot {
 
 fn managed_transfers(snapshot: &WalletSnapshot) -> bool {
     snapshot.transfer_artifacts.values().any(|a| {
-        a.external_send
-            .as_ref()
-            .is_some_and(|e| e.wallet_transfer.is_some())
+        a.partial_signing.is_some()
+            || a.external_send
+                .as_ref()
+                .is_some_and(|e| e.restored_for_partial)
+            || a.external_send
+                .as_ref()
+                .is_some_and(|e| e.wallet_transfer.is_some())
     })
 }
 
@@ -69,7 +73,14 @@ fn encode_snapshot(snapshot: &WalletSnapshot) -> Result<String, String> {
             managed_wallet_state: &'a WalletSnapshot,
         }
         serde_json::to_string(&Envelope {
-            version: if snapshot.incoming_conflicts.is_empty() {
+            version: if snapshot.transfer_artifacts.values().any(|a| {
+                a.partial_signing.is_some()
+                    || a.external_send
+                        .as_ref()
+                        .is_some_and(|e| e.restored_for_partial)
+            }) {
+                3
+            } else if snapshot.incoming_conflicts.is_empty() {
                 1
             } else {
                 2
@@ -88,7 +99,13 @@ fn decode_snapshot(json: &str) -> Result<WalletSnapshot, String> {
     if value.get("managed_wallet_state").is_some() || value.get("version").is_some() {
         let envelope: ManagedSnapshot = serde_json::from_value(value)
             .map_err(|_| "Unsupported managed wallet snapshot".to_string())?;
-        if ![1, 2].contains(&envelope.version)
+        if ![1, 2, 3].contains(&envelope.version)
+            || (envelope.version < 3
+                && envelope
+                    .managed_wallet_state
+                    .transfer_artifacts
+                    .values()
+                    .any(|a| a.partial_signing.is_some()))
             || (envelope.version == 1
                 && !envelope.managed_wallet_state.incoming_conflicts.is_empty())
         {
@@ -143,6 +160,57 @@ fn snapshot_write_required(
         }
     }
     for (txid, old_artifact) in &existing.transfer_artifacts {
+        if old_artifact
+            .external_send
+            .as_ref()
+            .is_some_and(|e| e.restored_for_partial)
+            && candidate
+                .transfer_artifacts
+                .get(txid)
+                .and_then(|a| a.external_send.as_ref())
+                .is_none_or(|e| !e.restored_for_partial)
+        {
+            return Err(refused());
+        }
+        if let Some(old_partial) = &old_artifact.partial_signing {
+            super::online::collaborative_partial::retained_partial_inputs(txid, old_partial)
+                .map_err(|_| refused())?;
+            let next = candidate.transfer_artifacts.get(txid).ok_or_else(refused)?;
+            let new_partial = next.partial_signing.as_ref().ok_or_else(refused)?;
+            if serde_json::to_value(&old_artifact.asset_infos).map_err(|_| refused())?
+                != serde_json::to_value(&next.asset_infos).map_err(|_| refused())?
+                || old_partial.request != new_partial.request
+                || !new_partial.attempted
+                || (old_partial.restored && !new_partial.restored)
+                || (old_artifact.signed_psbt.is_some()
+                    && old_artifact.signed_psbt != next.signed_psbt)
+                || old_artifact.consignment_bytes != next.consignment_bytes
+            {
+                return Err(refused());
+            }
+            if let Some(old_external) = &old_artifact.external_send {
+                let new_external = next.external_send.as_ref().ok_or_else(refused)?;
+                use super::online::ExternalSendStatus;
+                if new_external.status == ExternalSendStatus::Cancelled
+                    || (old_external.status != ExternalSendStatus::Prepared
+                        && new_external.status != old_external.status
+                        && !(old_external.status == ExternalSendStatus::BroadcastRecorded
+                            && new_external.status == ExternalSendStatus::Finalized))
+                    || (old_external.conflict_txid.is_some()
+                        && old_external.conflict_txid != new_external.conflict_txid)
+                {
+                    return Err(refused());
+                }
+                if old_external.prepared_psbt != new_external.prepared_psbt
+                    || old_external.expected_tx_hex != new_external.expected_tx_hex
+                    || old_external.fascia_json != new_external.fascia_json
+                    || old_external.recipients_digest != new_external.recipients_digest
+                    || (old_external.restored_for_partial && !new_external.restored_for_partial)
+                {
+                    return Err(refused());
+                }
+            }
+        }
         let Some(old) = old_artifact
             .external_send
             .as_ref()
@@ -191,6 +259,20 @@ fn snapshot_write_required(
         }
     }
     for (txid, artifact) in &candidate.transfer_artifacts {
+        if let Some(partial) = &artifact.partial_signing {
+            super::online::collaborative_partial::retained_partial_inputs(txid, partial)
+                .map_err(|_| refused())?;
+            if existing.transfer_artifacts.get(txid).is_some_and(|old| {
+                old.partial_signing.is_none()
+                    && (old.signed_psbt.is_some()
+                        || old
+                            .external_send
+                            .as_ref()
+                            .is_none_or(|e| e.wallet_transfer.is_some()))
+            }) {
+                return Err(refused());
+            }
+        }
         let Some(binding) = artifact
             .external_send
             .as_ref()
@@ -365,6 +447,68 @@ mod tests {
     use rgbstd::contract::IssuerWrapper;
     use rgbstd::persistence::Stock;
     use schemata::NonInflatableAsset;
+
+    #[test]
+    fn collaborative_snapshot_v3_retains_attempts_and_refuses_stale_or_downgraded_records() {
+        use super::super::online::{
+            TransferArtifacts,
+            collaborative_partial::{PartialSigningRecord, tests::vector},
+        };
+        let (_, request) = vector();
+        let id = request
+            .psbt
+            .parse::<crate::bitcoin::psbt::Psbt>()
+            .unwrap()
+            .unsigned_tx
+            .compute_txid()
+            .to_string();
+        let artifact = TransferArtifacts {
+            partial_signing: Some(PartialSigningRecord {
+                request,
+                attempted: true,
+                restored: true,
+            }),
+            ..Default::default()
+        };
+        let snapshot: WalletSnapshot = serde_json::from_value(serde_json::json!({"sequence":7,"db":InMemoryDb::new(),"bdk_changeset":null,"transfer_artifacts":{id.clone():artifact}})).unwrap();
+        let encoded = encode_snapshot(&snapshot).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["version"], 3);
+        assert!(serde_json::from_str::<WalletSnapshot>(&encoded).is_err());
+        for version in [1, 2] {
+            let mut bad = value.clone();
+            bad["version"] = serde_json::json!(version);
+            assert!(decode_snapshot(&bad.to_string()).is_err());
+        }
+        assert!(decode_snapshot(&serde_json::to_string(&snapshot).unwrap()).is_err());
+        let existing = decode_snapshot(&encoded).unwrap();
+        let mut next = decode_snapshot(&encoded).unwrap();
+        assert!(snapshot_write_required(&existing, &next).is_err());
+        next.sequence += 1;
+        assert_eq!(snapshot_write_required(&existing, &next), Ok(true));
+        let original = next.transfer_artifacts[&id].clone();
+        next.transfer_artifacts.clear();
+        assert!(snapshot_write_required(&existing, &next).is_err());
+        next.transfer_artifacts.insert(id.clone(), original.clone());
+        next.transfer_artifacts
+            .get_mut(&id)
+            .unwrap()
+            .partial_signing
+            .as_mut()
+            .unwrap()
+            .restored = false;
+        assert!(snapshot_write_required(&existing, &next).is_err());
+        next.transfer_artifacts.insert(id.clone(), original.clone());
+        next.transfer_artifacts
+            .get_mut(&id)
+            .unwrap()
+            .partial_signing
+            .as_mut()
+            .unwrap()
+            .request
+            .expires_at = "1".into();
+        assert!(snapshot_write_required(&existing, &next).is_err());
+    }
 
     #[test]
     fn incoming_conflict_snapshot_v2_is_append_only_and_blocks_downgrade() {

@@ -129,7 +129,7 @@ fn integer(value: &str) -> Result<u64, Error> {
     Ok(parsed)
 }
 
-fn unix_seconds() -> Result<u64, Error> {
+pub(super) fn unix_seconds() -> Result<u64, Error> {
     #[cfg(target_arch = "wasm32")]
     let timestamp = now().unix_timestamp();
     #[cfg(not(target_arch = "wasm32"))]
@@ -194,6 +194,24 @@ impl Wallet {
         db: &DbData,
         own_rgb: Option<&str>,
         recovery_source: Option<&str>,
+    ) -> Result<HashSet<OutPoint>, Error> {
+        self.bitcoin_native_holds_impl(db, own_rgb, recovery_source, None)
+    }
+
+    pub(super) fn bitcoin_partial_input_holds(
+        &self,
+        db: &DbData,
+        txid: &str,
+    ) -> Result<HashSet<OutPoint>, Error> {
+        self.bitcoin_native_holds_impl(db, None, None, Some(txid))
+    }
+
+    fn bitcoin_native_holds_impl(
+        &self,
+        db: &DbData,
+        own_rgb: Option<&str>,
+        recovery_source: Option<&str>,
+        own_partial: Option<&str>,
     ) -> Result<HashSet<OutPoint>, Error> {
         if self.transfer_artifacts.len() > MAX_INPUTS
             || db.txos.len() > MAX_ROWS
@@ -261,6 +279,12 @@ impl Wallet {
             }
         }
         for (txid, artifacts) in &self.transfer_artifacts {
+            if let Some(partial) = &artifacts.partial_signing {
+                let points = super::collaborative_partial::retained_partial_inputs(txid, partial)?;
+                if own_partial != Some(txid.as_str()) {
+                    holds.extend(points);
+                }
+            }
             let Some(external) = &artifacts.external_send else {
                 continue;
             };
@@ -276,6 +300,15 @@ impl Wallet {
                 || original.unsigned_tx.input.len() > MAX_PSBT_INPUTS
             {
                 return Err(refused());
+            }
+            if own_partial == Some(txid.as_str()) {
+                if external.wallet_transfer.is_some()
+                    || external.status != ExternalSendStatus::Prepared
+                    || batch.status != TransferStatus::Initiated
+                {
+                    return Err(refused());
+                }
+                continue;
             }
             if own_rgb == Some(txid.as_str()) || recovery_source == Some(txid.as_str()) {
                 if external.wallet_transfer.is_none()
@@ -380,6 +413,18 @@ impl Wallet {
     }
 
     fn bitcoin_spend_view_impl(&self, own_rgb: Option<&str>) -> Result<BitcoinSpendView, Error> {
+        self.bitcoin_spend_view_with_partial(own_rgb, None)
+    }
+
+    pub(super) fn bitcoin_partial_input_view(&self, txid: &str) -> Result<BitcoinSpendView, Error> {
+        self.bitcoin_spend_view_with_partial(None, Some(txid))
+    }
+
+    fn bitcoin_spend_view_with_partial(
+        &self,
+        own_rgb: Option<&str>,
+        own_partial: Option<&str>,
+    ) -> Result<BitcoinSpendView, Error> {
         if self.bitcoin_network() != BitcoinNetwork::Regtest {
             return Err(Error::InvalidRecipientNetwork);
         }
@@ -403,7 +448,7 @@ impl Wallet {
             return Err(refused());
         }
         let pending_scripts = pending.into_iter().map(|p| p.script).collect();
-        let held = self.bitcoin_native_holds(&db, own_rgb)?;
+        let held = self.bitcoin_native_holds_impl(&db, own_rgb, None, own_partial)?;
         let database_inputs = BitcoinDbInputs::new(&db, pending_scripts)?;
         let outputs = self
             .bdk_wallet
@@ -842,6 +887,7 @@ pub(super) mod tests {
                     status: ExternalSendStatus::Prepared,
                     conflict_txid: None,
                     wallet_transfer: binding,
+                    restored_for_partial: false,
                 }),
                 ..Default::default()
             },
