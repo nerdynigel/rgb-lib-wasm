@@ -1,0 +1,37 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-safe-bitcoin-20261103)
+error[E0034]: multiple applicable items in scope
+   --> src/wallet/external_receive.rs:184:47
+    |
+184 |             consignment_sha256: sha256::Hash::hash(bytes).to_string(),
+    |                                               ^^^^ multiple `hash` found
+    |
+    = note: candidate #1 is defined in an impl of the trait `bdk_wallet::bitcoin::bitcoin_hashes::Hash` for the type `bdk_wallet::bitcoin::bitcoin_hashes::sha256::Hash`
+    = note: candidate #2 is defined in an impl of the trait `std::hash::Hash` for the type `bdk_wallet::bitcoin::bitcoin_hashes::sha256::Hash`
+help: use fully-qualified syntax to disambiguate
+    |
+184 -             consignment_sha256: sha256::Hash::hash(bytes).to_string(),
+184 +             consignment_sha256: <bdk_wallet::bitcoin::bitcoin_hashes::sha256::Hash as bdk_wallet::bitcoin::bitcoin_hashes::Hash>::hash(bytes).to_string(),
+    |
+184 -             consignment_sha256: sha256::Hash::hash(bytes).to_string(),
+184 +             consignment_sha256: std::hash::Hash::hash(bytes).to_string(),
+    |
+
+error[E0034]: multiple applicable items in scope
+  --> src/wallet/external_receive.rs:43:26
+   |
+43 |         || sha256::Hash::hash(bytes).to_string() != original.consignment_sha256
+   |                          ^^^^ multiple `hash` found
+   |
+   = note: candidate #1 is defined in an impl of the trait `bdk_wallet::bitcoin::bitcoin_hashes::Hash` for the type `bdk_wallet::bitcoin::bitcoin_hashes::sha256::Hash`
+   = note: candidate #2 is defined in an impl of the trait `std::hash::Hash` for the type `bdk_wallet::bitcoin::bitcoin_hashes::sha256::Hash`
+help: use fully-qualified syntax to disambiguate
+   |
+43 -         || sha256::Hash::hash(bytes).to_string() != original.consignment_sha256
+43 +         || <bdk_wallet::bitcoin::bitcoin_hashes::sha256::Hash as bdk_wallet::bitcoin::bitcoin_hashes::Hash>::hash(bytes).to_string() != original.consignment_sha256
+   |
+43 -         || sha256::Hash::hash(bytes).to_string() != original.consignment_sha256
+43 +         || std::hash::Hash::hash(bytes).to_string() != original.consignment_sha256
+   |
+
+For more information about this error, try `rustc --explain E0034`.
+error: could not compile `rgb-lib-wasm` (lib test) due to 2 previous errors

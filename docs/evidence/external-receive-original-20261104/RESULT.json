@@ -1,0 +1,36 @@
+{
+  "scope": "SOURCE_CANDIDATE_NO_FINANCIAL_ACCEPTANCE",
+  "predecessor_native": "5aa053897cb3084ac9fa8529b838c868121ec5e7",
+  "native_tests": {
+    "cases": 215,
+    "passed": 215
+  },
+  "strict_library_clippy": "PASS",
+  "formatter": "PASS",
+  "wasm32_library_check": "PASS",
+  "native_backup_version": 6,
+  "managed_snapshot_version_for_incoming_originals": 4,
+  "source_sha256": {
+    "src/wallet/external_receive.rs": "ac9db9cef02912dc624d26fe09dead2b624ec0355e20233c2b39b01ab1e3f5cd",
+    "src/wallet/online.rs": "04535553f4c73efe368a044d0cbb9cef7f0c26a8bccccab7ffdd7e7fe132ddb8",
+    "src/wallet/rust_only.rs": "4e237c6886fe8c9722ed677570c1181eee3fe288c6f3f0eb050204589279bb7a",
+    "src/wallet/offline.rs": "a1f086d6714542eb0cb7b4826e47adb5379966cdd3d939e1e25eb08de7063f08",
+    "src/wallet/backup.rs": "9861c7892782445e957e9b5472256791090ec3e174423267635dcb5c5e277fc0",
+    "src/wallet/idb_store.rs": "64dca4b4fe6c8890cec753d3e0f6748cd16e57dfd7b2b9c5e85dbe30206fb9a7",
+    "src/wallet/collaborative_partial.rs": "5791b48010ad752505c13dcee8e18c76510421598fb4df7309147e52c849a90f"
+  },
+  "evidence_sha256": {
+    "external-receive-first-native-tests.txt": "d5bd74d8c3cc853f2fa8e23fdfed4349751d440dfc17e325f0413ecd15d38ca0",
+    "external-receive-native-tests-2.txt": "f4780c841b21106833ed61d36a49804284a1e2c8d3f30d458722461874b0f38e",
+    "external-receive-native-tests-3.txt": "649acc175bdfb3ce81903f435339ca524658cfa1b568482ee3365a302c3c10a8",
+    "external-receive-native-tests-final.txt": "8dcf2d4097000ddd77f32aae82f079927ea030f3c026a84427fd20d440dbf99a",
+    "external-receive-native-clippy-final.txt": "a7bdd1d5fadc8acc8920d090726547a06b60cefb0a3c684ba7c8b5498d366092",
+    "external-receive-native-format-final.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "external-receive-native-wasm.txt": "0e4381a7f1e12f5f13c45d8c89b103820ecd9fa43268b1ae4eba836a9d0cabc2"
+  },
+  "actual_positive_async_native_persistence_test": false,
+  "funded_two_wallet_complete_input_acceptance": false,
+  "lab_contact_or_mutation": false,
+  "main_merge": false,
+  "first_failure": "Rust hash trait ambiguity; corrected with explicit Bitcoin Hash trait. Original compiler output retained."
+}

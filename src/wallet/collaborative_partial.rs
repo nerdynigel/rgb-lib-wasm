@@ -245,9 +245,41 @@ impl Wallet {
                 return Err(refused());
             }
         } else if artifact.is_some_and(|a| {
-            a.partial_signing.is_some() || a.signed_psbt.is_some() || a.external_send.is_none()
+            a.partial_signing.is_some()
+                || a.signed_psbt.is_some()
+                || (a.external_send.is_none() && a.external_receive.is_none())
         }) {
             return Err(refused());
+        }
+        if let Some(receive) = artifact.and_then(|a| a.external_receive.as_ref()) {
+            let artifact = artifact.unwrap();
+            external_receive::validate_original(
+                &txid,
+                artifact,
+                &self.database.get_db_data(false)?,
+            )?;
+            let db = self.database.get_db_data(false)?;
+            let batch = db
+                .batch_transfers
+                .iter()
+                .find(|b| b.idx == receive.batch_transfer_idx)
+                .ok_or_else(refused)?;
+            if receive.restored
+                || !batch.waiting_counterparty()
+                || batch
+                    .expiration
+                    .is_none_or(|e| e <= i64::try_from(now_unix).unwrap_or(i64::MAX))
+            {
+                return Err(refused());
+            }
+            self.inspect_external_transfer(
+                artifact
+                    .consignment_bytes
+                    .get(&receive.contract_id)
+                    .ok_or_else(refused)?,
+                txid.clone(),
+                receive.contract_id.clone(),
+            )?;
         }
         let mut assigned = BTreeMap::new();
         if let Some(external) = artifact.and_then(|a| a.external_send.as_ref()) {

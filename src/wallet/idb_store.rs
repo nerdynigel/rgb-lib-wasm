@@ -55,7 +55,8 @@ struct ManagedSnapshot {
 
 fn managed_transfers(snapshot: &WalletSnapshot) -> bool {
     snapshot.transfer_artifacts.values().any(|a| {
-        a.partial_signing.is_some()
+        a.external_receive.is_some()
+            || a.partial_signing.is_some()
             || a.external_send
                 .as_ref()
                 .is_some_and(|e| e.restored_for_partial)
@@ -73,7 +74,13 @@ fn encode_snapshot(snapshot: &WalletSnapshot) -> Result<String, String> {
             managed_wallet_state: &'a WalletSnapshot,
         }
         serde_json::to_string(&Envelope {
-            version: if snapshot.transfer_artifacts.values().any(|a| {
+            version: if snapshot
+                .transfer_artifacts
+                .values()
+                .any(|a| a.external_receive.is_some())
+            {
+                4
+            } else if snapshot.transfer_artifacts.values().any(|a| {
                 a.partial_signing.is_some()
                     || a.external_send
                         .as_ref()
@@ -99,7 +106,13 @@ fn decode_snapshot(json: &str) -> Result<WalletSnapshot, String> {
     if value.get("managed_wallet_state").is_some() || value.get("version").is_some() {
         let envelope: ManagedSnapshot = serde_json::from_value(value)
             .map_err(|_| "Unsupported managed wallet snapshot".to_string())?;
-        if ![1, 2, 3].contains(&envelope.version)
+        if ![1, 2, 3, 4].contains(&envelope.version)
+            || (envelope.version < 4
+                && envelope
+                    .managed_wallet_state
+                    .transfer_artifacts
+                    .values()
+                    .any(|a| a.external_receive.is_some()))
             || (envelope.version < 3
                 && envelope
                     .managed_wallet_state
@@ -160,6 +173,17 @@ fn snapshot_write_required(
         }
     }
     for (txid, old_artifact) in &existing.transfer_artifacts {
+        if let Some(old) = &old_artifact.external_receive {
+            let next = candidate.transfer_artifacts.get(txid).ok_or_else(refused)?;
+            let new = next.external_receive.as_ref().ok_or_else(refused)?;
+            let mut expected = old.clone();
+            if new.restored {
+                expected.restored = true;
+            }
+            if new != &expected || old_artifact.consignment_bytes != next.consignment_bytes {
+                return Err(refused());
+            }
+        }
         if old_artifact
             .external_send
             .as_ref()
@@ -265,10 +289,12 @@ fn snapshot_write_required(
             if existing.transfer_artifacts.get(txid).is_some_and(|old| {
                 old.partial_signing.is_none()
                     && (old.signed_psbt.is_some()
-                        || old
-                            .external_send
-                            .as_ref()
-                            .is_none_or(|e| e.wallet_transfer.is_some()))
+                        || (old.external_receive.is_none()
+                            && old
+                                .external_send
+                                .as_ref()
+                                .is_none_or(|e| e.wallet_transfer.is_some()))
+                        || old.external_receive.as_ref().is_some_and(|r| r.restored))
             }) {
                 return Err(refused());
             }
@@ -508,6 +534,88 @@ mod tests {
             .request
             .expires_at = "1".into();
         assert!(snapshot_write_required(&existing, &next).is_err());
+    }
+
+    #[test]
+    fn incoming_original_snapshot_v4_preserves_exact_bytes_and_rejects_loss_or_downgrade() {
+        // Serialization/CAS fixture only: these bytes are not a valid RGB proof.
+        // Real proof/owned-database validation remains mandatory on installation.
+        let artifact: super::super::online::TransferArtifacts = serde_json::from_value(serde_json::json!({
+            "batch_info":null, "asset_infos":{}, "signed_psbt":null,
+            "consignment_bytes":{"contract":[1,2,3]},
+            "external_receive": {"txid":"original", "contract_id":"contract", "recipient_id":"recipient",
+                "amount":"1", "vout":2, "batch_transfer_idx":1, "consignment_sha256":"digest", "restored":false}
+        })).unwrap();
+        let snapshot = WalletSnapshot {
+            sequence: 7,
+            db: InMemoryDb::new(),
+            bdk_changeset: None,
+            transfer_artifacts: HashMap::from([("original".into(), artifact)]),
+            received_consignments: HashMap::new(),
+            incoming_conflicts: HashMap::new(),
+            stock_stash_b64: None,
+            stock_state_b64: None,
+            stock_index_b64: None,
+            reuse_address_index: HashMap::new(),
+        };
+        let encoded = encode_snapshot(&snapshot).unwrap();
+        let mut envelope: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(envelope["version"], 4);
+        assert!(serde_json::from_str::<WalletSnapshot>(&encoded).is_err());
+        for version in 1..=3 {
+            envelope["version"] = serde_json::json!(version);
+            assert!(decode_snapshot(&envelope.to_string()).is_err());
+        }
+        assert!(decode_snapshot(&serde_json::to_string(&snapshot).unwrap()).is_err());
+        let candidate = || {
+            let mut next = decode_snapshot(&encoded).unwrap();
+            next.sequence += 1;
+            next
+        };
+        let next = candidate();
+        assert_eq!(snapshot_write_required(&snapshot, &next), Ok(true));
+        let mut next = candidate();
+        next.transfer_artifacts.clear();
+        assert!(snapshot_write_required(&snapshot, &next).is_err());
+        let mut next = candidate();
+        next.transfer_artifacts
+            .get_mut("original")
+            .unwrap()
+            .consignment_bytes
+            .get_mut("contract")
+            .unwrap()
+            .push(4);
+        assert!(snapshot_write_required(&snapshot, &next).is_err());
+        for field in [
+            "txid",
+            "contract_id",
+            "recipient_id",
+            "amount",
+            "consignment_sha256",
+        ] {
+            let mut next = candidate();
+            let mut value = serde_json::to_value(&next.transfer_artifacts["original"]).unwrap();
+            value["external_receive"][field] = serde_json::json!("replacement");
+            next.transfer_artifacts
+                .insert("original".into(), serde_json::from_value(value).unwrap());
+            assert!(snapshot_write_required(&snapshot, &next).is_err());
+        }
+        let mut restored = candidate();
+        restored
+            .transfer_artifacts
+            .get_mut("original")
+            .unwrap()
+            .external_receive
+            .as_mut()
+            .unwrap()
+            .restored = true;
+        assert_eq!(snapshot_write_required(&snapshot, &restored), Ok(true));
+        let mut rollback = candidate();
+        rollback.sequence = restored.sequence + 1;
+        assert!(snapshot_write_required(&restored, &rollback).is_err());
+        let mut stale = candidate();
+        stale.sequence = snapshot.sequence;
+        assert!(snapshot_write_required(&snapshot, &stale).is_err());
     }
 
     #[test]

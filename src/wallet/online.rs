@@ -35,6 +35,10 @@ use collaborative_partial::PartialSigningRecord;
 pub(super) mod incoming_conflict;
 pub use incoming_conflict::IncomingRgbConflict;
 
+#[path = "external_receive.rs"]
+pub(super) mod external_receive;
+use external_receive::ExternalReceiveOriginal;
+
 const SCHEMAS_SUPPORTING_INFLATION: [database::enums::AssetSchema; 1] = [AssetSchema::Ifa];
 
 const TRANSFER_DATA_FILE: &str = "transfer_data.txt";
@@ -219,6 +223,9 @@ pub(crate) struct TransferArtifacts {
     /// One native signing attempt and exact original partial, never a balance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) partial_signing: Option<PartialSigningRecord>,
+    /// Validated original incoming proof, durably retained before approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) external_receive: Option<ExternalReceiveOriginal>,
 }
 
 /// Durable lifecycle state of an externally constructed RGB send.
@@ -2977,6 +2984,16 @@ impl Wallet {
             self.logger,
             "Refusing invalid consignment for {recipient_id}"
         );
+        // A retained collaborative original cannot be failed or replaced by a
+        // proxy response. Keep it for explicit reconciliation instead.
+        if self.transfer_artifacts.values().any(|a| {
+            a.external_receive
+                .as_ref()
+                .is_some_and(|r| r.recipient_id == recipient_id)
+        }) {
+            return Err(Error::InvalidConsignment);
+        }
+
         match self
             .wasm_proxy_client
             .post_ack(&proxy_url, recipient_id, false)
@@ -3052,50 +3069,96 @@ impl Wallet {
             .expect("transfer should have a recipient ID");
         debug!(self.logger, "Recipient ID: {recipient_id}");
 
-        // check if a consignment has been posted
-        let tte_data = self
-            .database
-            .get_transfer_transport_endpoints_data(transfer.idx)?;
-        if let Some(updated_transfer) =
-            self._fail_batch_transfer_if_no_endpoints(batch_transfer, &tte_data)?
+        let retained = self.transfer_artifacts.iter().find_map(|(id, a)| {
+            a.external_receive
+                .as_ref()
+                .filter(|r| r.recipient_id == recipient_id)
+                .map(|r| (id.clone(), a.clone(), r.clone()))
+        });
+        let retained_source = retained.is_some();
+        let (consignment, proxy_url, txid, vout) = if let Some((id, artifact, original)) = retained
         {
-            return Ok(Some(updated_transfer));
-        }
-        let mut proxy_res = None;
-        for (transfer_transport_endpoint, transport_endpoint) in tte_data {
-            let result = match self
-                ._get_consignment_async(&transport_endpoint.endpoint, recipient_id.clone())
-                .await
+            external_receive::validate_original(&id, &artifact, db_data)?;
+            if self.bitcoin_network() != BitcoinNetwork::Regtest
+                || original.batch_transfer_idx != batch_transfer.idx
             {
-                Err(Error::NoConsignment) => {
-                    info!(
-                        self.logger,
-                        "Skipping transport endpoint: {:?}", &transport_endpoint
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-                Ok(r) => r,
-            };
-
-            proxy_res = Some((
-                result.consignment,
-                transport_endpoint.endpoint,
-                result.txid,
-                result.vout,
-            ));
-            let mut updated_transfer_transport_endpoint: DbTransferTransportEndpointActMod =
-                transfer_transport_endpoint.into();
-            updated_transfer_transport_endpoint.used = ActiveValue::Set(true);
-            self.database
-                .update_transfer_transport_endpoint(&mut updated_transfer_transport_endpoint)?;
-            break;
-        }
-
-        let (consignment, proxy_url, txid, vout) = if let Some(res) = proxy_res {
-            (res.0, res.1, res.2, res.3)
+                return Err(Error::InvalidConsignment);
+            }
+            // No balance/coloring/ACK is created from an unconfirmed proposal.
+            // Indexer failure, absence and a mempool observation retain it.
+            if self
+                .indexer()
+                .get_tx_confirmations(&id)
+                .await?
+                .is_none_or(|n| n < u64::from(batch_transfer.min_confirmations.max(1)))
+            {
+                return Ok(None);
+            }
+            let bytes = artifact
+                .consignment_bytes
+                .get(&original.contract_id)
+                .ok_or(Error::InvalidConsignment)?;
+            self.validate_external_transfer_ancestry(bytes, id.clone())
+                .await?;
+            let facts =
+                self.inspect_external_transfer(bytes, id.clone(), original.contract_id.clone())?;
+            if facts["allocations"][original.vout.to_string()].as_str()
+                != Some(original.amount.as_str())
+            {
+                return Err(Error::InvalidConsignment);
+            }
+            (
+                general_purpose::STANDARD.encode(bytes),
+                String::new(),
+                id,
+                Some(original.vout),
+            )
         } else {
-            return Ok(None);
+            // check if a consignment has been posted
+            let tte_data = self
+                .database
+                .get_transfer_transport_endpoints_data(transfer.idx)?;
+            if let Some(updated_transfer) =
+                self._fail_batch_transfer_if_no_endpoints(batch_transfer, &tte_data)?
+            {
+                return Ok(Some(updated_transfer));
+            }
+            let mut proxy_res = None;
+            for (transfer_transport_endpoint, transport_endpoint) in tte_data {
+                let result = match self
+                    ._get_consignment_async(&transport_endpoint.endpoint, recipient_id.clone())
+                    .await
+                {
+                    Err(Error::NoConsignment) => {
+                        info!(
+                            self.logger,
+                            "Skipping transport endpoint: {:?}", &transport_endpoint
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                    Ok(r) => r,
+                };
+
+                proxy_res = Some((
+                    result.consignment,
+                    transport_endpoint.endpoint,
+                    result.txid,
+                    result.vout,
+                ));
+                let mut updated_transfer_transport_endpoint: DbTransferTransportEndpointActMod =
+                    transfer_transport_endpoint.into();
+                updated_transfer_transport_endpoint.used = ActiveValue::Set(true);
+                self.database
+                    .update_transfer_transport_endpoint(&mut updated_transfer_transport_endpoint)?;
+                break;
+            }
+
+            if let Some(res) = proxy_res {
+                (res.0, res.1, res.2, res.3)
+            } else {
+                return Ok(None);
+            }
         };
 
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
@@ -3421,22 +3484,24 @@ impl Wallet {
             "Consignment is valid. Received '{:?}' of contract '{}'", received, asset_id
         );
 
-        match self
-            .wasm_proxy_client
-            .post_ack(&proxy_url, recipient_id, true)
-            .await
-        {
-            Ok(r) => {
-                debug!(self.logger, "Consignment ACK response: {:?}", r);
-            }
-            Err(e) if e.to_string().contains("Cannot change ACK") => {
-                warn!(self.logger, "Found an NACK when trying ACK");
-            }
-            Err(e) => {
-                error!(self.logger, "Failed to post ACK: {e}");
-                return Err(e);
-            }
-        };
+        if !retained_source {
+            match self
+                .wasm_proxy_client
+                .post_ack(&proxy_url, recipient_id, true)
+                .await
+            {
+                Ok(r) => {
+                    debug!(self.logger, "Consignment ACK response: {:?}", r);
+                }
+                Err(e) if e.to_string().contains("Cannot change ACK") => {
+                    warn!(self.logger, "Found an NACK when trying ACK");
+                }
+                Err(e) => {
+                    error!(self.logger, "Failed to post ACK: {e}");
+                    return Err(e);
+                }
+            };
+        }
 
         let utxo_idx = match transfer.recipient_type {
             Some(RecipientTypeFull::Blind { ref unblinded_utxo }) => {
@@ -3826,6 +3891,19 @@ impl Wallet {
             Err(e) => Err(e),
             Ok(v) => Ok(v),
         }?;
+        // A retained original is never classified by a timer or missing reply.
+        let retained = self.transfer_artifacts.values().any(|a| {
+            a.external_receive
+                .as_ref()
+                .is_some_and(|r| r.batch_transfer_idx == batch_transfer.idx)
+        });
+        if retained && updated_batch_transfer.is_none() {
+            return if throw_err {
+                Err(Error::CannotFailBatchTransfer)
+            } else {
+                Ok(())
+            };
+        }
         // fail transfer if the status didn't change after a refresh
         if updated_batch_transfer.is_none() {
             self._fail_batch_transfer(batch_transfer)?;

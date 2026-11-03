@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 use crate::error::InternalError;
 
-pub(crate) const BACKUP_VERSION: u8 = 5;
+pub(crate) const BACKUP_VERSION: u8 = 6;
 /// 24-byte nonce for XChaCha20Poly1305 (single-shot mode).
 const NONCE_LEN: usize = 24;
 
@@ -69,7 +69,13 @@ fn decode_wallet_payload(bytes: &[u8], version: Option<u8>) -> Result<WalletBack
     if value.get("wallet_state").is_some() || value.get("version").is_some() {
         let envelope: VersionedWalletBackup =
             serde_json::from_value(value).map_err(|_| Error::InvalidBackup)?;
-        if ![3, 4, BACKUP_VERSION].contains(&envelope.version)
+        if ![3, 4, 5, BACKUP_VERSION].contains(&envelope.version)
+            || (envelope.version < 6
+                && envelope
+                    .wallet_state
+                    .transfer_artifacts
+                    .values()
+                    .any(|a| a.external_receive.is_some()))
             || (envelope.version < 5
                 && envelope.wallet_state.transfer_artifacts.values().any(|a| {
                     a.partial_signing.is_some()
@@ -95,6 +101,7 @@ fn decode_wallet_payload(bytes: &[u8], version: Option<u8>) -> Result<WalletBack
                     .as_ref()
                     .is_some_and(|e| e.wallet_transfer.is_some() || e.restored_for_partial)
                     || a.partial_signing.is_some()
+                    || a.external_receive.is_some()
             })
         {
             return Err(Error::InvalidBackup);
@@ -108,6 +115,9 @@ fn fence_restored_pending_transfers(
 ) {
     use super::online::ExternalSendStatus;
     for artifact in artifacts.values_mut() {
+        if let Some(receive) = artifact.external_receive.as_mut() {
+            receive.restored = true;
+        }
         if let Some(partial) = artifact.partial_signing.as_mut() {
             partial.restored = true;
         }
@@ -179,7 +189,7 @@ pub(crate) fn decrypt_payload(
     password: &str,
     pub_data: &BackupPubData,
 ) -> Result<Vec<u8>, Error> {
-    if ![2, 3, 4, BACKUP_VERSION].contains(&pub_data.version) {
+    if ![2, 3, 4, 5, BACKUP_VERSION].contains(&pub_data.version) {
         return Err(Error::UnsupportedBackupVersion {
             version: pub_data.version.to_string(),
         });
@@ -250,6 +260,15 @@ impl super::Wallet {
             expected.indexer = actual.indexer.clone();
         }
         for (txid, expected) in &mut payload.transfer_artifacts {
+            if self
+                .transfer_artifacts
+                .get(txid)
+                .and_then(|a| a.external_receive.as_ref())
+                .is_some_and(|r| r.restored)
+                && let Some(r) = expected.external_receive.as_mut()
+            {
+                r.restored = true;
+            }
             if let Some(live) = self.transfer_artifacts.get(txid) {
                 if live.partial_signing.as_ref().is_some_and(|p| p.restored)
                     && let Some(p) = expected.partial_signing.as_mut()
@@ -541,8 +560,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_v3_and_v4_encrypted_envelopes_remain_decryptable() {
-        for version in [3, 4] {
+    fn legacy_v3_v4_v5_encrypted_envelopes_remain_decryptable() {
+        for version in [3, 4, 5] {
             let payload: WalletBackupPayload = serde_json::from_value(serde_json::json!({
                 "wallet_identity":["regtest","public-vanilla","public-colored"],
                 "db":crate::database::memory_db::InMemoryDb::new(),"bdk_changeset":null,
@@ -563,6 +582,56 @@ mod tests {
             assert_eq!(recovered, plaintext);
             assert!(decode_wallet_payload(&recovered, Some(version)).is_ok());
         }
+    }
+
+    #[test]
+    fn incoming_original_backup_v6_retains_proof_and_fences_restored_signing() {
+        // Envelope/migration fixture, not an accepted standard RGB proof.
+        let payload: WalletBackupPayload=serde_json::from_value(serde_json::json!({
+            "wallet_identity":["regtest","public-vanilla","public-colored"],
+            "db":crate::database::memory_db::InMemoryDb::new(), "bdk_changeset":null,
+            "stock_stash_b64":"stash", "stock_state_b64":"state", "stock_index_b64":"index",
+            "transfer_artifacts":{"original":{
+                "batch_info":null,"asset_infos":{},"signed_psbt":null,"consignment_bytes":{"contract":[1,2,3]},
+                "external_receive":{"txid":"original","contract_id":"contract","recipient_id":"recipient",
+                    "amount":"1","vout":2,"batch_transfer_idx":1,"consignment_sha256":"digest","restored":false}
+            }}
+        })).unwrap();
+        let encoded =
+            serde_json::to_vec(&serde_json::json!({"version":6,"wallet_state":payload})).unwrap();
+        let mut restored = decode_wallet_payload(&encoded, Some(6)).unwrap();
+        assert_eq!(
+            restored.transfer_artifacts["original"].consignment_bytes["contract"],
+            vec![1, 2, 3]
+        );
+        for version in [3, 4, 5] {
+            let mut envelope: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            envelope["version"] = serde_json::json!(version);
+            assert!(
+                decode_wallet_payload(&serde_json::to_vec(&envelope).unwrap(), Some(version))
+                    .is_err()
+            );
+        }
+        assert!(decode_wallet_payload(&serde_json::to_vec(&payload).unwrap(), Some(2)).is_err());
+        fence_restored_pending_transfers(&mut restored.transfer_artifacts);
+        assert!(
+            restored.transfer_artifacts["original"]
+                .external_receive
+                .as_ref()
+                .unwrap()
+                .restored
+        );
+        assert_eq!(
+            restored.transfer_artifacts["original"].consignment_bytes["contract"],
+            vec![1, 2, 3]
+        );
+        let (ciphertext, mut public) =
+            encrypt_payload(&encoded, "unfunded-incoming-migration-fixture").unwrap();
+        assert_eq!(public.version, 6);
+        public.version = 5;
+        let plaintext =
+            decrypt_payload(&ciphertext, "unfunded-incoming-migration-fixture", &public).unwrap();
+        assert!(decode_wallet_payload(&plaintext, Some(public.version)).is_err());
     }
 
     #[test]

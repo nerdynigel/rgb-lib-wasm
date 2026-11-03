@@ -3128,6 +3128,19 @@ impl Wallet {
             &snapshot.db.get_db_data(false)?,
         )?;
 
+        if self.bitcoin_network() != BitcoinNetwork::Regtest
+            && snapshot
+                .transfer_artifacts
+                .values()
+                .any(|a| a.external_receive.is_some())
+        {
+            return Err(Error::InvalidBackup);
+        }
+        super::online::external_receive::validate_originals(
+            &snapshot.transfer_artifacts,
+            &snapshot.db.get_db_data(false)?,
+        )?;
+
         // Restore the in-memory database
         self.database = Arc::new(snapshot.db);
 
@@ -3185,6 +3198,19 @@ impl Wallet {
                     return Err(Error::Persistence {
                         details: format!("failed to load persisted BDK wallet: {error}"),
                     });
+                }
+            }
+        }
+
+        for artifact in snapshot.transfer_artifacts.values() {
+            if let Some(original) = &artifact.external_receive {
+                let script = script_buf_from_recipient_id(original.recipient_id.clone())?
+                    .ok_or(Error::InvalidBackup)?;
+                if !matches!(
+                    self.bdk_wallet.derivation_of_spk(script),
+                    Some((KeychainKind::External, _))
+                ) {
+                    return Err(Error::InvalidBackup);
                 }
             }
         }
