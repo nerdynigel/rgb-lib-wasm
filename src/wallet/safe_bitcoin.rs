@@ -421,11 +421,26 @@ impl Wallet {
     }
 
     fn bitcoin_spend_view_impl(&self, own_rgb: Option<&str>) -> Result<BitcoinSpendView, Error> {
-        self.bitcoin_spend_view_with_originals(own_rgb, None, None)
+        let peer = own_rgb
+            .map(|txid| self.wallet_rgb_recovery_peer_for_tx(txid))
+            .transpose()?
+            .flatten();
+        self.bitcoin_spend_view_with_originals(own_rgb, None, None, peer.as_deref())
+    }
+
+    /// Only the existing, fully checked original-bound RGB recovery may select
+    /// its source's reserved ordinary fee inputs. This is a read-only view;
+    /// ordinary Bitcoin selection continues with no exemptions.
+    pub(super) fn bitcoin_rgb_recovery_fee_view(
+        &self,
+        request: &WalletRgbSendRequest,
+    ) -> Result<BitcoinSpendView, Error> {
+        let source = self.checked_wallet_rgb_recovery_source(request)?;
+        self.bitcoin_spend_view_impl(source.as_deref())
     }
 
     pub(super) fn bitcoin_partial_input_view(&self, txid: &str) -> Result<BitcoinSpendView, Error> {
-        self.bitcoin_spend_view_with_originals(None, Some(txid), None)
+        self.bitcoin_spend_view_with_originals(None, Some(txid), None, None)
     }
 
     fn bitcoin_spend_view_with_originals(
@@ -433,6 +448,7 @@ impl Wallet {
         own_rgb: Option<&str>,
         own_partial: Option<&str>,
         own_bitcoin: Option<&str>,
+        recovery_source: Option<&str>,
     ) -> Result<BitcoinSpendView, Error> {
         if self.bitcoin_network() != BitcoinNetwork::Regtest {
             return Err(Error::InvalidRecipientNetwork);
@@ -457,7 +473,13 @@ impl Wallet {
             return Err(refused());
         }
         let pending_scripts = pending.into_iter().map(|p| p.script).collect();
-        let held = self.bitcoin_native_holds_impl(&db, own_rgb, None, own_partial, own_bitcoin)?;
+        let held = self.bitcoin_native_holds_impl(
+            &db,
+            own_rgb,
+            recovery_source,
+            own_partial,
+            own_bitcoin,
+        )?;
         let database_inputs = BitcoinDbInputs::new(&db, pending_scripts)?;
         let outputs = self
             .bdk_wallet
@@ -582,7 +604,7 @@ impl Wallet {
         {
             return Err(refused());
         }
-        let view = self.bitcoin_spend_view_with_originals(None, None, own_bitcoin)?;
+        let view = self.bitcoin_spend_view_with_originals(None, None, own_bitcoin, None)?;
         let coins = view
             .inputs
             .into_iter()
@@ -891,7 +913,24 @@ pub(super) mod tests {
         // Reservation graph fixture only, not a valid RGB transfer/consignment.
         let binding = ordinary.then(|| super::super::wallet_transfer::WalletTransferBinding {
             operation_id: "01a19805-0462-759b-9050-b9b0feb9da8f".into(),
-            request_json: "unit graph; no financial authorization".into(),
+            // Typed reservation fixture only; no outgoing RGB consignment or
+            // signing authority. Recovery tests replace it with an exact signed
+            // original and independently populated Native Stock/DB evidence.
+            request_json: serde_json::to_string(&WalletRgbSendRequest {
+                operation_id: "01a19805-0462-759b-9050-b9b0feb9da8f".into(),
+                asset_id: "rgb:Kpai9_2X-uhBiC5K-moZtGkh-hwThNSE-h96Pbck-gfJQRHY".into(),
+                recipient_id: "bcrt:wvout:unfunded-reservation-fixture-only".into(),
+                amount: 1,
+                witness_sats: 1000,
+                blinding: None,
+                transport_endpoints: vec!["rpc://127.0.0.1:3000/json-rpc".into()],
+                fee_rate: 1,
+                min_confirmations: 1,
+                excluded_inputs: vec![],
+                expires_at: 1,
+                recovery_of: None,
+            })
+            .unwrap(),
             signing_attempted: false,
             broadcast_attempted: false,
             restored: false,
