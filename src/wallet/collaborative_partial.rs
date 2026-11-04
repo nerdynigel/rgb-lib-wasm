@@ -138,12 +138,23 @@ pub(in crate::wallet) fn retained_partial_inputs(
 /// signature. Foreign input maps and the exact transaction remain unchanged.
 fn verify_partial(request: &CollaborativePartialRequest, signed: &Psbt) -> Result<(), Error> {
     let (original, owned, _) = parse_request(request)?;
+    verify_owned_keyspends(&original, signed, &owned)
+}
+
+/// Shared established BIP341 verification. Callers independently validate the
+/// original, complete owned set and current Native eligibility before signing.
+pub(super) fn verify_owned_keyspends(
+    original: &Psbt,
+    signed: &Psbt,
+    owned: &HashSet<OutPoint>,
+) -> Result<(), Error> {
     if original.unsigned_tx != signed.unsigned_tx
         || original.inputs.len() != signed.inputs.len()
         || original.version != signed.version
         || original.xpub != signed.xpub
         || original.proprietary != signed.proprietary
         || original.unknown != signed.unknown
+        || original.outputs.len() != signed.outputs.len()
     {
         return Err(refused());
     }
@@ -153,6 +164,30 @@ fn verify_partial(request: &CollaborativePartialRequest, signed: &Psbt) -> Resul
         .map(|i| i.witness_utxo.clone().ok_or_else(refused))
         .collect::<Result<Vec<_>, _>>()?;
     let secp = Secp256k1::verification_only();
+    for (i, actual) in signed.outputs.iter().enumerate() {
+        let before = &original.outputs[i];
+        let mut metadata = actual.clone();
+        if before.tap_internal_key.is_none()
+            && let Some(internal) = metadata.tap_internal_key
+        {
+            let (key, _) = internal.tap_tweak(&secp, None);
+            if ScriptBuf::new_p2tr_tweaked(key) != original.unsigned_tx.output[i].script_pubkey {
+                return Err(refused());
+            }
+            metadata.tap_internal_key = None;
+            if !before.tap_key_origins.contains_key(&internal)
+                && metadata
+                    .tap_key_origins
+                    .get(&internal)
+                    .is_some_and(|(leaves, _)| leaves.is_empty())
+            {
+                metadata.tap_key_origins.remove(&internal);
+            }
+        }
+        if &metadata != before {
+            return Err(refused());
+        }
+    }
     let mut cache = SighashCache::new(&original.unsigned_tx);
     for (i, actual) in signed.inputs.iter().enumerate() {
         if !owned.contains(&original.unsigned_tx.input[i].previous_output) {
@@ -428,7 +463,10 @@ impl Wallet {
         )
     }
 
-    async fn require_collaborative_original_unobserved(&self, txid: &str) -> Result<(), Error> {
+    pub(super) async fn require_collaborative_original_unobserved(
+        &self,
+        txid: &str,
+    ) -> Result<(), Error> {
         if self
             .indexer()
             .get_tx_with_status(&Txid::from_str(txid).map_err(|_| refused())?)

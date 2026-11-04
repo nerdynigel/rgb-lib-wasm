@@ -231,7 +231,8 @@ impl Wallet {
             if old != &original {
                 return Err(refused());
             }
-        } else if artifact.partial_signing.is_some()
+        } else if artifact.bitcoin_recovery.is_some()
+            || artifact.partial_signing.is_some()
             || artifact.signed_psbt.is_some()
             || !artifact.consignment_bytes.is_empty()
             || artifact.external_send.is_some()

@@ -1,0 +1,51 @@
+[
+  {
+    "check": "native-unit",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "--lib"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 103.134
+  },
+  {
+    "check": "native-clippy",
+    "command": [
+      "cargo",
+      "clippy",
+      "--locked",
+      "--lib",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 5.087
+  },
+  {
+    "check": "native-format",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--check"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 0.268
+  },
+  {
+    "check": "native-wasm-check",
+    "command": [
+      "cargo",
+      "check",
+      "--locked",
+      "--lib",
+      "--target",
+      "wasm32-unknown-unknown"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 3.641
+  }
+]

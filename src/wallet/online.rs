@@ -10,6 +10,11 @@ use bitcoin::hashes::{Hash as _, sha256};
 mod safe_bitcoin;
 pub use safe_bitcoin::{BitcoinSpendInput, BitcoinSpendRequest, BitcoinSpendView};
 
+#[path = "bitcoin_recovery.rs"]
+pub(super) mod bitcoin_recovery;
+use bitcoin_recovery::BitcoinRecoveryRecord;
+pub use bitcoin_recovery::BitcoinRecoveryRequest;
+
 #[path = "rgb_fee_recovery.rs"]
 mod rgb_fee_recovery;
 pub use rgb_fee_recovery::{RgbFeeRecoveryPrepared, RgbFeeRecoveryRequest};
@@ -212,6 +217,9 @@ pub(crate) struct InfoAssetTransfer {
 /// In-memory storage for transfer artifacts (replaces filesystem directories).
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub(crate) struct TransferArtifacts {
+    /// One exact Native Bitcoin self-recovery, held before signing/dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) bitcoin_recovery: Option<BitcoinRecoveryRecord>,
     pub(crate) batch_info: Option<InfoBatchTransfer>,
     pub(crate) asset_infos: BTreeMap<String, InfoAssetTransfer>,
     pub(crate) consignment_bytes: HashMap<String, Vec<u8>>,

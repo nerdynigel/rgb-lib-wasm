@@ -342,6 +342,11 @@ impl Wallet {
         }
         let mut points = HashSet::new();
         for (txid, artifacts) in &self.transfer_artifacts {
+            if let Some(record) = &artifacts.bitcoin_recovery {
+                points.extend(super::bitcoin_recovery::retained_bitcoin_recovery_inputs(
+                    txid, record,
+                )?);
+            }
             if let Some(partial) = &artifacts.partial_signing {
                 points.extend(super::collaborative_partial::retained_partial_inputs(
                     txid, partial,
@@ -423,7 +428,7 @@ impl Wallet {
             || self
                 .transfer_artifacts
                 .get(&txid)
-                .is_some_and(|a| a.partial_signing.is_some())
+                .is_some_and(|a| a.partial_signing.is_some() || a.bitcoin_recovery.is_some())
         {
             return Err(Error::ExternalSendConflict { txid });
         }

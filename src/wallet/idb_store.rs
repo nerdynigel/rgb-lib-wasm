@@ -55,7 +55,8 @@ struct ManagedSnapshot {
 
 fn managed_transfers(snapshot: &WalletSnapshot) -> bool {
     snapshot.transfer_artifacts.values().any(|a| {
-        a.external_receive.is_some()
+        a.bitcoin_recovery.is_some()
+            || a.external_receive.is_some()
             || a.partial_signing.is_some()
             || a.external_send
                 .as_ref()
@@ -67,6 +68,10 @@ fn managed_transfers(snapshot: &WalletSnapshot) -> bool {
 }
 
 fn encode_snapshot(snapshot: &WalletSnapshot) -> Result<String, String> {
+    for (txid, artifact) in &snapshot.transfer_artifacts {
+        super::online::bitcoin_recovery::validate_bitcoin_recovery_artifact(txid, artifact)
+            .map_err(|_| "Invalid Bitcoin recovery artifact".to_string())?;
+    }
     if managed_transfers(snapshot) || !snapshot.incoming_conflicts.is_empty() {
         #[derive(Serialize)]
         struct Envelope<'a> {
@@ -75,6 +80,12 @@ fn encode_snapshot(snapshot: &WalletSnapshot) -> Result<String, String> {
         }
         serde_json::to_string(&Envelope {
             version: if snapshot
+                .transfer_artifacts
+                .values()
+                .any(|a| a.bitcoin_recovery.is_some())
+            {
+                5
+            } else if snapshot
                 .transfer_artifacts
                 .values()
                 .any(|a| a.external_receive.is_some())
@@ -106,7 +117,13 @@ fn decode_snapshot(json: &str) -> Result<WalletSnapshot, String> {
     if value.get("managed_wallet_state").is_some() || value.get("version").is_some() {
         let envelope: ManagedSnapshot = serde_json::from_value(value)
             .map_err(|_| "Unsupported managed wallet snapshot".to_string())?;
-        if ![1, 2, 3, 4].contains(&envelope.version)
+        if ![1, 2, 3, 4, 5].contains(&envelope.version)
+            || (envelope.version < 5
+                && envelope
+                    .managed_wallet_state
+                    .transfer_artifacts
+                    .values()
+                    .any(|a| a.bitcoin_recovery.is_some()))
             || (envelope.version < 4
                 && envelope
                     .managed_wallet_state
@@ -123,6 +140,10 @@ fn decode_snapshot(json: &str) -> Result<WalletSnapshot, String> {
                 && !envelope.managed_wallet_state.incoming_conflicts.is_empty())
         {
             return Err("Unsupported managed wallet snapshot version".into());
+        }
+        for (txid, artifact) in &envelope.managed_wallet_state.transfer_artifacts {
+            super::online::bitcoin_recovery::validate_bitcoin_recovery_artifact(txid, artifact)
+                .map_err(|_| "Invalid Bitcoin recovery artifact".to_string())?;
         }
         Ok(envelope.managed_wallet_state)
     } else {
@@ -173,6 +194,21 @@ fn snapshot_write_required(
         }
     }
     for (txid, old_artifact) in &existing.transfer_artifacts {
+        if let Some(old) = &old_artifact.bitcoin_recovery {
+            super::online::bitcoin_recovery::retained_bitcoin_recovery_inputs(txid, old)
+                .map_err(|_| refused())?;
+            let next = candidate.transfer_artifacts.get(txid).ok_or_else(refused)?;
+            let new = next.bitcoin_recovery.as_ref().ok_or_else(refused)?;
+            if old.request != new.request
+                || !new.attempted
+                || (old.restored && !new.restored)
+                || (old.broadcast_attempted && !new.broadcast_attempted)
+                || (old_artifact.signed_psbt.is_some()
+                    && old_artifact.signed_psbt != next.signed_psbt)
+            {
+                return Err(refused());
+            }
+        }
         if let Some(old) = &old_artifact.external_receive {
             let next = candidate.transfer_artifacts.get(txid).ok_or_else(refused)?;
             let new = next.external_receive.as_ref().ok_or_else(refused)?;
@@ -283,6 +319,26 @@ fn snapshot_write_required(
         }
     }
     for (txid, artifact) in &candidate.transfer_artifacts {
+        super::online::bitcoin_recovery::validate_bitcoin_recovery_artifact(txid, artifact)
+            .map_err(|_| refused())?;
+        if let Some(record) = &artifact.bitcoin_recovery {
+            super::online::bitcoin_recovery::retained_bitcoin_recovery_inputs(txid, record)
+                .map_err(|_| refused())?;
+            if artifact.external_send.is_some()
+                || artifact.external_receive.is_some()
+                || artifact.partial_signing.is_some()
+                || artifact.batch_info.is_some()
+                || !artifact.asset_infos.is_empty()
+                || !artifact.consignment_bytes.is_empty()
+                || (record.broadcast_attempted && artifact.signed_psbt.is_none())
+                || existing
+                    .transfer_artifacts
+                    .get(txid)
+                    .is_some_and(|a| a.bitcoin_recovery.is_none())
+            {
+                return Err(refused());
+            }
+        }
         if let Some(partial) = &artifact.partial_signing {
             super::online::collaborative_partial::retained_partial_inputs(txid, partial)
                 .map_err(|_| refused())?;
@@ -473,6 +529,70 @@ mod tests {
     use rgbstd::contract::IssuerWrapper;
     use rgbstd::persistence::Stock;
     use schemata::NonInflatableAsset;
+
+    #[test]
+    fn bitcoin_recovery_snapshot_v5_fences_downgrade_stale_writes_original_and_attempt_loss() {
+        use super::super::online::{
+            TransferArtifacts,
+            bitcoin_recovery::{BitcoinRecoveryRecord, tests::vector},
+        };
+        let (w, request, _) = vector(2);
+        let mut psbt = request.psbt.parse::<crate::bitcoin::psbt::Psbt>().unwrap();
+        w._sign_psbt(&mut psbt, None).unwrap();
+        let id = psbt.unsigned_tx.compute_txid().to_string();
+        let artifact = TransferArtifacts {
+            bitcoin_recovery: Some(BitcoinRecoveryRecord {
+                request,
+                attempted: true,
+                restored: false,
+                broadcast_attempted: false,
+            }),
+            ..Default::default()
+        };
+        let snapshot: WalletSnapshot = serde_json::from_value(serde_json::json!({"sequence":7,"db":InMemoryDb::new(),"bdk_changeset":null,"transfer_artifacts":{id.clone():artifact}})).unwrap();
+        let encoded = encode_snapshot(&snapshot).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(value["version"], 5);
+        assert!(serde_json::from_str::<WalletSnapshot>(&encoded).is_err());
+        for version in [1, 2, 3, 4] {
+            let mut bad = value.clone();
+            bad["version"] = serde_json::json!(version);
+            assert!(decode_snapshot(&bad.to_string()).is_err());
+        }
+        assert!(decode_snapshot(&serde_json::to_string(&snapshot).unwrap()).is_err());
+        let existing = decode_snapshot(&encoded).unwrap();
+        let mut next = decode_snapshot(&encoded).unwrap();
+        assert!(snapshot_write_required(&existing, &next).is_err());
+        next.sequence += 1;
+        assert_eq!(snapshot_write_required(&existing, &next), Ok(true));
+        next.transfer_artifacts.get_mut(&id).unwrap().signed_psbt = Some(psbt.to_string());
+        assert_eq!(snapshot_write_required(&existing, &next), Ok(true));
+        let signed = decode_snapshot(&encode_snapshot(&next).unwrap()).unwrap();
+        next.sequence += 1;
+        next.transfer_artifacts.get_mut(&id).unwrap().signed_psbt = None;
+        assert!(snapshot_write_required(&signed, &next).is_err());
+        next.transfer_artifacts.get_mut(&id).unwrap().signed_psbt = Some(psbt.to_string());
+        next.transfer_artifacts
+            .get_mut(&id)
+            .unwrap()
+            .bitcoin_recovery
+            .as_mut()
+            .unwrap()
+            .broadcast_attempted = true;
+        assert_eq!(snapshot_write_required(&signed, &next), Ok(true));
+        let dispatched = decode_snapshot(&encode_snapshot(&next).unwrap()).unwrap();
+        next.sequence += 1;
+        next.transfer_artifacts
+            .get_mut(&id)
+            .unwrap()
+            .bitcoin_recovery
+            .as_mut()
+            .unwrap()
+            .broadcast_attempted = false;
+        assert!(snapshot_write_required(&dispatched, &next).is_err());
+        next.transfer_artifacts.clear();
+        assert!(snapshot_write_required(&dispatched, &next).is_err());
+    }
 
     #[test]
     fn collaborative_snapshot_v3_retains_attempts_and_refuses_stale_or_downgraded_records() {

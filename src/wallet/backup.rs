@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 use crate::error::InternalError;
 
-pub(crate) const BACKUP_VERSION: u8 = 6;
+pub(crate) const BACKUP_VERSION: u8 = 7;
 /// 24-byte nonce for XChaCha20Poly1305 (single-shot mode).
 const NONCE_LEN: usize = 24;
 
@@ -69,7 +69,13 @@ fn decode_wallet_payload(bytes: &[u8], version: Option<u8>) -> Result<WalletBack
     if value.get("wallet_state").is_some() || value.get("version").is_some() {
         let envelope: VersionedWalletBackup =
             serde_json::from_value(value).map_err(|_| Error::InvalidBackup)?;
-        if ![3, 4, 5, BACKUP_VERSION].contains(&envelope.version)
+        if ![3, 4, 5, 6, BACKUP_VERSION].contains(&envelope.version)
+            || (envelope.version < 7
+                && envelope
+                    .wallet_state
+                    .transfer_artifacts
+                    .values()
+                    .any(|a| a.bitcoin_recovery.is_some()))
             || (envelope.version < 6
                 && envelope
                     .wallet_state
@@ -88,6 +94,10 @@ fn decode_wallet_payload(bytes: &[u8], version: Option<u8>) -> Result<WalletBack
         {
             return Err(Error::InvalidBackup);
         }
+        for (txid, artifact) in &envelope.wallet_state.transfer_artifacts {
+            super::online::bitcoin_recovery::validate_bitcoin_recovery_artifact(txid, artifact)
+                .map_err(|_| Error::InvalidBackup)?;
+        }
         Ok(envelope.wallet_state)
     } else {
         if version.is_some_and(|v| v != 2) {
@@ -100,11 +110,16 @@ fn decode_wallet_payload(bytes: &[u8], version: Option<u8>) -> Result<WalletBack
                 a.external_send
                     .as_ref()
                     .is_some_and(|e| e.wallet_transfer.is_some() || e.restored_for_partial)
+                    || a.bitcoin_recovery.is_some()
                     || a.partial_signing.is_some()
                     || a.external_receive.is_some()
             })
         {
             return Err(Error::InvalidBackup);
+        }
+        for (txid, artifact) in &payload.transfer_artifacts {
+            super::online::bitcoin_recovery::validate_bitcoin_recovery_artifact(txid, artifact)
+                .map_err(|_| Error::InvalidBackup)?;
         }
         Ok(payload)
     }
@@ -115,6 +130,9 @@ fn fence_restored_pending_transfers(
 ) {
     use super::online::ExternalSendStatus;
     for artifact in artifacts.values_mut() {
+        if let Some(record) = artifact.bitcoin_recovery.as_mut() {
+            record.restored = true;
+        }
         if let Some(receive) = artifact.external_receive.as_mut() {
             receive.restored = true;
         }
@@ -189,7 +207,7 @@ pub(crate) fn decrypt_payload(
     password: &str,
     pub_data: &BackupPubData,
 ) -> Result<Vec<u8>, Error> {
-    if ![2, 3, 4, 5, BACKUP_VERSION].contains(&pub_data.version) {
+    if ![2, 3, 4, 5, 6, BACKUP_VERSION].contains(&pub_data.version) {
         return Err(Error::UnsupportedBackupVersion {
             version: pub_data.version.to_string(),
         });
@@ -270,6 +288,11 @@ impl super::Wallet {
                 r.restored = true;
             }
             if let Some(live) = self.transfer_artifacts.get(txid) {
+                if live.bitcoin_recovery.as_ref().is_some_and(|r| r.restored)
+                    && let Some(r) = expected.bitcoin_recovery.as_mut()
+                {
+                    r.restored = true;
+                }
                 if live.partial_signing.as_ref().is_some_and(|p| p.restored)
                     && let Some(p) = expected.partial_signing.as_mut()
                 {
@@ -560,8 +583,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_v3_v4_v5_encrypted_envelopes_remain_decryptable() {
-        for version in [3, 4, 5] {
+    fn legacy_v3_through_v6_encrypted_envelopes_remain_decryptable() {
+        for version in [3, 4, 5, 6] {
             let payload: WalletBackupPayload = serde_json::from_value(serde_json::json!({
                 "wallet_identity":["regtest","public-vanilla","public-colored"],
                 "db":crate::database::memory_db::InMemoryDb::new(),"bdk_changeset":null,
@@ -627,7 +650,7 @@ mod tests {
         );
         let (ciphertext, mut public) =
             encrypt_payload(&encoded, "unfunded-incoming-migration-fixture").unwrap();
-        assert_eq!(public.version, 6);
+        assert_eq!(public.version, BACKUP_VERSION);
         public.version = 5;
         let plaintext =
             decrypt_payload(&ciphertext, "unfunded-incoming-migration-fixture", &public).unwrap();
@@ -703,6 +726,76 @@ mod tests {
             restored.transfer_artifacts[&id].signed_psbt.as_deref(),
             Some("exact-original-partial")
         );
+    }
+
+    #[test]
+    fn bitcoin_recovery_backup_v7_preserves_exact_original_and_fences_restored_attempts() {
+        use super::super::online::{
+            TransferArtifacts,
+            bitcoin_recovery::{BitcoinRecoveryRecord, tests::vector},
+        };
+        let (w, request, _) = vector(2);
+        let mut psbt = request.psbt.parse::<crate::bitcoin::psbt::Psbt>().unwrap();
+        w._sign_psbt(&mut psbt, None).unwrap();
+        let id = psbt.unsigned_tx.compute_txid().to_string();
+        let artifact = TransferArtifacts {
+            bitcoin_recovery: Some(BitcoinRecoveryRecord {
+                request: request.clone(),
+                attempted: true,
+                broadcast_attempted: true,
+                restored: false,
+            }),
+            signed_psbt: Some(psbt.to_string()),
+            ..Default::default()
+        };
+        let payload = WalletBackupPayload {
+            wallet_identity: Some((
+                "regtest".into(),
+                "synthetic-public-vanilla".into(),
+                "synthetic-public-colored".into(),
+            )),
+            db: crate::database::memory_db::InMemoryDb::new(),
+            bdk_changeset: None,
+            stock_stash_b64: "stash".into(),
+            stock_state_b64: "state".into(),
+            stock_index_b64: "index".into(),
+            reuse_address_index: Default::default(),
+            transfer_artifacts: std::collections::HashMap::from([(id.clone(), artifact)]),
+            received_consignments: Default::default(),
+            incoming_conflicts: Default::default(),
+        };
+        let encoded =
+            serde_json::to_vec(&serde_json::json!({"version":7,"wallet_state":payload})).unwrap();
+        let mut restored = decode_wallet_payload(&encoded, Some(7)).unwrap();
+        assert_eq!(
+            restored.transfer_artifacts[&id].signed_psbt.as_deref(),
+            Some(psbt.to_string()).as_deref()
+        );
+        for version in [3, 4, 5, 6] {
+            let mut bad: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            bad["version"] = serde_json::json!(version);
+            assert!(
+                decode_wallet_payload(&serde_json::to_vec(&bad).unwrap(), Some(version)).is_err()
+            );
+        }
+        assert!(decode_wallet_payload(&serde_json::to_vec(&payload).unwrap(), Some(2)).is_err());
+        fence_restored_pending_transfers(&mut restored.transfer_artifacts);
+        let record = restored.transfer_artifacts[&id]
+            .bitcoin_recovery
+            .as_ref()
+            .unwrap();
+        assert!(record.restored && record.attempted && record.broadcast_attempted);
+        assert_eq!(record.request, request);
+        let (ciphertext, mut public) =
+            encrypt_payload(&encoded, "synthetic-unfunded-recovery-test").unwrap();
+        assert_eq!(public.version, 7);
+        let plaintext =
+            decrypt_payload(&ciphertext, "synthetic-unfunded-recovery-test", &public).unwrap();
+        decode_wallet_payload(&plaintext, Some(public.version)).unwrap();
+        public.version = 6;
+        let plaintext =
+            decrypt_payload(&ciphertext, "synthetic-unfunded-recovery-test", &public).unwrap();
+        assert!(decode_wallet_payload(&plaintext, Some(public.version)).is_err());
     }
 
     #[test]
