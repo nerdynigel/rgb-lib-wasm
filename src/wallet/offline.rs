@@ -767,6 +767,9 @@ pub struct Transfer {
     pub updated_at: i64,
     /// Status of the transfer
     pub status: TransferStatus,
+    /// Independently verified confirmed conflict, retained across recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incoming_conflict: Option<super::online::IncomingRgbConflict>,
     /// Requested RGB assignment
     pub requested_assignment: Option<Assignment>,
     /// RGB assignmnents
@@ -803,6 +806,7 @@ impl Transfer {
             created_at: td.created_at,
             updated_at: td.updated_at,
             status: td.status,
+            incoming_conflict: None,
             requested_assignment: x.requested_assignment.clone(),
             assignments: td.assignments,
             kind: td.kind,
@@ -1000,6 +1004,9 @@ pub struct Wallet {
     /// Key: recipient_id
     #[cfg(feature = "esplora")]
     pub(crate) received_consignments: HashMap<String, Vec<u8>>,
+    /// Retained independently confirmed incoming witness conflicts.
+    #[cfg(feature = "esplora")]
+    pub(crate) incoming_conflicts: HashMap<String, super::online::IncomingRgbConflict>,
     pub(crate) idb_save_in_progress: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(crate) idb_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Persistent in-memory RGB stock.
@@ -1154,6 +1161,7 @@ impl Wallet {
             transfer_artifacts: HashMap::new(),
             #[cfg(feature = "esplora")]
             received_consignments: HashMap::new(),
+            incoming_conflicts: HashMap::new(),
             idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rgb_stock: {
@@ -2025,6 +2033,14 @@ impl Wallet {
                 return Err(Error::CannotDeleteBatchTransfer);
             }
             #[cfg(feature = "esplora")]
+            if self.transfer_artifacts.values().any(|a| {
+                a.external_receive
+                    .as_ref()
+                    .is_some_and(|r| r.batch_transfer_idx == batch_transfer.idx)
+            }) {
+                return Err(Error::CannotDeleteBatchTransfer);
+            }
+            #[cfg(feature = "esplora")]
             if batch_transfer.txid.as_ref().is_some_and(|txid| {
                 self.transfer_artifacts
                     .get(txid)
@@ -2059,6 +2075,14 @@ impl Wallet {
                 .filter(|t| t.failed())
                 .collect();
             for batch_transfer in batch_transfers.iter_mut() {
+                #[cfg(feature = "esplora")]
+                if self.transfer_artifacts.values().any(|a| {
+                    a.external_receive
+                        .as_ref()
+                        .is_some_and(|r| r.batch_transfer_idx == batch_transfer.idx)
+                }) {
+                    continue;
+                }
                 #[cfg(feature = "esplora")]
                 if batch_transfer.txid.as_ref().is_some_and(|txid| {
                     self.transfer_artifacts
@@ -2494,7 +2518,7 @@ impl Wallet {
                 let (asset_transfer, batch_transfer) =
                     t.related_transfers(&db_data.asset_transfers, &db_data.batch_transfers)?;
                 let tte_data = self.database.get_transfer_transport_endpoints_data(t.idx)?;
-                Ok(Transfer::from_db_transfer(
+                let mut result = Transfer::from_db_transfer(
                     &t,
                     self.get_transfer_data(
                         &t,
@@ -2509,7 +2533,12 @@ impl Wallet {
                             TransferTransportEndpoint::from_db_transfer_transport_endpoint(tte, ce)
                         })
                         .collect(),
-                ))
+                );
+                result.incoming_conflict = t
+                    .recipient_id
+                    .as_ref()
+                    .and_then(|id| self.incoming_conflicts.get(id).cloned());
+                Ok(result)
             })
             .collect::<Result<Vec<Transfer>, Error>>()?;
 
@@ -3046,6 +3075,7 @@ impl Wallet {
             bdk_changeset: self.bdk_database.get_data().clone(),
             transfer_artifacts: self.transfer_artifacts.clone(),
             received_consignments: self.received_consignments.clone(),
+            incoming_conflicts: self.incoming_conflicts.clone(),
             stock_stash_b64: Some(stock_stash_b64),
             stock_state_b64: Some(stock_state_b64),
             stock_index_b64: Some(stock_index_b64),
@@ -3103,6 +3133,30 @@ impl Wallet {
         &mut self,
         snapshot: super::idb_store::WalletSnapshot,
     ) -> Result<(), Error> {
+        if self.bitcoin_network() != BitcoinNetwork::Regtest
+            && !snapshot.incoming_conflicts.is_empty()
+        {
+            return Err(Error::InvalidBackup);
+        }
+        super::online::incoming_conflict::validate_retained_conflicts(
+            &snapshot.incoming_conflicts,
+            &snapshot.received_consignments,
+            &snapshot.db.get_db_data(false)?,
+        )?;
+
+        if self.bitcoin_network() != BitcoinNetwork::Regtest
+            && snapshot
+                .transfer_artifacts
+                .values()
+                .any(|a| a.external_receive.is_some())
+        {
+            return Err(Error::InvalidBackup);
+        }
+        super::online::external_receive::validate_originals(
+            &snapshot.transfer_artifacts,
+            &snapshot.db.get_db_data(false)?,
+        )?;
+
         // Restore the in-memory database
         self.database = Arc::new(snapshot.db);
 
@@ -3164,11 +3218,25 @@ impl Wallet {
             }
         }
 
+        for artifact in snapshot.transfer_artifacts.values() {
+            if let Some(original) = &artifact.external_receive {
+                let script = script_buf_from_recipient_id(original.recipient_id.clone())?
+                    .ok_or(Error::InvalidBackup)?;
+                if !matches!(
+                    self.bdk_wallet.derivation_of_spk(script),
+                    Some((KeychainKind::External, _))
+                ) {
+                    return Err(Error::InvalidBackup);
+                }
+            }
+        }
+
         // Restore complete pending transfers so send_end can resume after a page reload.
         self.transfer_artifacts = snapshot.transfer_artifacts;
 
         // Restore received consignments
         self.received_consignments = snapshot.received_consignments;
+        self.incoming_conflicts = snapshot.incoming_conflicts;
 
         // Restore address reuse pinned indices
         self.reuse_address_index = snapshot.reuse_address_index;
@@ -3269,6 +3337,7 @@ mod address_reuse_tests {
             transfer_artifacts: HashMap::new(),
             #[cfg(feature = "esplora")]
             received_consignments: HashMap::new(),
+            incoming_conflicts: HashMap::new(),
             idb_save_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idb_sequence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rgb_stock: std::rc::Rc::new(std::cell::RefCell::new(None)),

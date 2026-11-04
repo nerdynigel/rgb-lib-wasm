@@ -1,0 +1,37 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-safe-bitcoin-20261103)
+error[E0603]: struct import `PartialSigningRecord` is private
+   --> src/wallet/backup.rs:520:74
+    |
+520 |         use super::super::online::{collaborative_partial::tests::vector, PartialSigningRecord, TransferArtifacts};
+    |                                                                          ^^^^^^^^^^^^^^^^^^^^ private struct import
+    |
+note: the struct import `PartialSigningRecord` is defined here...
+   --> src/wallet/online.rs:32:5
+    |
+ 32 | use collaborative_partial::PartialSigningRecord;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: ...and refers to the struct `PartialSigningRecord` which is defined here
+   --> src/wallet/collaborative_partial.rs:26:1
+    |
+ 26 | pub(crate) struct PartialSigningRecord {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: struct import `PartialSigningRecord` is private
+   --> src/wallet/idb_store.rs:398:74
+    |
+398 |         use super::super::online::{collaborative_partial::tests::vector, PartialSigningRecord, TransferArtifacts};
+    |                                                                          ^^^^^^^^^^^^^^^^^^^^ private struct import
+    |
+note: the struct import `PartialSigningRecord` is defined here...
+   --> src/wallet/online.rs:32:5
+    |
+ 32 | use collaborative_partial::PartialSigningRecord;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: ...and refers to the struct `PartialSigningRecord` which is defined here
+   --> src/wallet/collaborative_partial.rs:26:1
+    |
+ 26 | pub(crate) struct PartialSigningRecord {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For more information about this error, try `rustc --explain E0603`.
+error: could not compile `rgb-lib-wasm` (lib test) due to 2 previous errors

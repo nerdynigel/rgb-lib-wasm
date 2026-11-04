@@ -1,0 +1,11 @@
+{
+  "src/wallet/backup.rs": "f85b084447d09caec733fdaedbb311860d9813475092d0f61770f9ccba9c157e",
+  "src/wallet/bitcoin_recovery.rs": "0b12ab1382a65ef2a14de56935591600c8687d8665003b5cf886b865a399ed8e",
+  "src/wallet/bitcoin_recovery_tests.rs": "336f86bdde5fc82907d808c9fb923b9e3c6561e1f465a1aea2d49d281bcec246",
+  "src/wallet/collaborative_partial.rs": "d524e69896a1a0610f79056f5e8506369d644cb7d07c49e0ad8f6bca6b359d23",
+  "src/wallet/external_receive.rs": "2ffa12a806f29a813f238706445b2967f5c7f5f45c2fcb5d7bff86d98e1921ed",
+  "src/wallet/idb_store.rs": "8f46f008c7bd6039c9373d0117a121e62f60df022e49cfe1843cb37ca857f43e",
+  "src/wallet/online.rs": "033a3908be49e2ca4d93499c26a654a1bb8dda087a027635a866b95edb70129e",
+  "src/wallet/safe_bitcoin.rs": "d6bc04367a9a995bf8d7c6d4c13d542e1f97b6e6e77233728d09009d5b7edcdd",
+  "src/wallet/wallet_transfer.rs": "68a1e4ca0ab586742280bc8b2657867465e307202b03bd30cc2a7e5cc62b9ae0"
+}

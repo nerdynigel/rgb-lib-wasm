@@ -1116,6 +1116,15 @@ impl InMemoryDb {
         colorings: Option<Vec<DbColoring>>,
         txos: Option<Vec<DbTxo>>,
     ) -> Result<Balance, Error> {
+        fn checked_sum(mut values: impl Iterator<Item = u64>) -> Result<u64, Error> {
+            values.try_fold(0u64, |total, value| {
+                total
+                    .checked_add(value)
+                    .ok_or_else(|| Error::Inconsistency {
+                        details: "RGB balance amount overflow".to_owned(),
+                    })
+            })
+        }
         let batch_transfers =
             batch_transfers.unwrap_or_else(|| self.iter_batch_transfers().unwrap_or_default());
         let asset_transfers =
@@ -1124,6 +1133,18 @@ impl InMemoryDb {
         let colorings = colorings.unwrap_or_else(|| self.iter_colorings().unwrap_or_default());
         let txos = txos.unwrap_or_else(|| self.iter_txos().unwrap_or_default());
 
+        // A witness request is provisional until its validated Receive coloring
+        // exists. Count the same asset/receive outpoint once, never both the
+        // request and its coloring. This changes no reservation or spendability.
+        let colored_receives: std::collections::HashSet<(i32, String, u32)> = colorings
+            .iter()
+            .filter(|c| c.r#type == ColoringType::Receive)
+            .filter_map(|c| {
+                txos.iter()
+                    .find(|t| t.idx == c.txo_idx && !t.spent)
+                    .map(|t| (c.asset_transfer_idx, t.txid.clone(), t.vout))
+            })
+            .collect();
         let txos_allocations = self.get_rgb_allocations(
             txos,
             Some(colorings),
@@ -1141,81 +1162,103 @@ impl InMemoryDb {
             .filter(|a| a.asset_id == Some(asset_id.clone()))
             .collect();
 
-        let settled: u64 = ass_allocations
-            .iter()
-            .filter(|a| a.settled())
-            .map(|a| a.assignment.main_amount())
-            .sum();
+        let settled = checked_sum(
+            ass_allocations
+                .iter()
+                .filter(|a| a.settled())
+                .map(|a| a.assignment.main_amount()),
+        )?;
 
-        let mut ass_pending_incoming: u64 = ass_allocations
-            .iter()
-            .filter(|a| !a.txo_spent && a.incoming && a.status.pending())
-            .map(|a| a.assignment.main_amount())
-            .sum();
-        let witness_pending: u64 = transfers
-            .iter()
-            .filter(|t| {
-                t.incoming && matches!(t.recipient_type, Some(RecipientTypeFull::Witness { .. }))
-            })
-            .filter_map(
-                |t| match t.related_transfers(&asset_transfers, &batch_transfers) {
-                    Ok((at, bt)) => {
-                        if bt.status.waiting_confirmations() {
-                            if at.asset_id.as_deref() != Some(asset_id.as_str()) {
-                                return None;
+        let ass_pending_incoming = checked_sum(
+            ass_allocations
+                .iter()
+                .filter(|a| !a.txo_spent && a.incoming && a.status.pending())
+                .map(|a| a.assignment.main_amount()),
+        )?;
+        let witness_pending = checked_sum(
+            transfers
+                .iter()
+                .filter(|t| {
+                    t.incoming
+                        && matches!(t.recipient_type, Some(RecipientTypeFull::Witness { .. }))
+                })
+                .filter_map(
+                    |t| match t.related_transfers(&asset_transfers, &batch_transfers) {
+                        Ok((at, bt)) => {
+                            if bt.status.waiting_confirmations() {
+                                if at.asset_id.as_deref() != Some(asset_id.as_str()) {
+                                    return None;
+                                }
+                                if let (
+                                    Some(txid),
+                                    Some(RecipientTypeFull::Witness { vout: Some(vout) }),
+                                ) = (&bt.txid, &t.recipient_type)
+                                    && colored_receives.contains(&(at.idx, txid.clone(), *vout))
+                                {
+                                    return None;
+                                }
+                                Some(Ok(t
+                                    .requested_assignment
+                                    .as_ref()
+                                    .map(|a| a.main_amount())
+                                    .unwrap_or(0)))
+                            } else {
+                                None
                             }
-                            Some(Ok(t
-                                .requested_assignment
-                                .as_ref()
-                                .map(|a| a.main_amount())
-                                .unwrap_or(0)))
-                        } else {
-                            None
                         }
-                    }
-                    Err(e) => Some(Err(e)),
-                },
-            )
-            .collect::<Result<Vec<u64>, InternalError>>()?
-            .iter()
-            .sum();
-        ass_pending_incoming += witness_pending;
-        let ass_pending_outgoing: u64 = ass_allocations
-            .iter()
-            .filter(|a| !a.incoming && a.status.pending())
-            .map(|a| a.assignment.main_amount())
-            .sum();
+                        Err(e) => Some(Err(e)),
+                    },
+                )
+                .collect::<Result<Vec<u64>, InternalError>>()?
+                .into_iter(),
+        )?;
+        let ass_pending_incoming =
+            checked_sum([ass_pending_incoming, witness_pending].into_iter())?;
+        let ass_pending_outgoing = checked_sum(
+            ass_allocations
+                .iter()
+                .filter(|a| !a.incoming && a.status.pending())
+                .map(|a| a.assignment.main_amount()),
+        )?;
         let ass_pending: i128 = ass_pending_incoming as i128 - ass_pending_outgoing as i128;
 
         let future = settled as i128 + ass_pending;
 
-        let unspendable: u64 = txos_allocations
-            .iter()
-            .filter(|u| {
-                let unspent_with_pending = !u.utxo.spent
-                    && (u.rgb_allocations.iter().any(|a| {
-                        (!a.incoming && !a.status.failed()) || (a.incoming && a.status.pending())
-                    }) || u.pending_blinded > 0);
-                let spent_waiting = u.utxo.spent
-                    && u.rgb_allocations
-                        .iter()
-                        .any(|a| !a.incoming && a.status.waiting_confirmations());
-                unspent_with_pending || spent_waiting
-            })
-            .map(|u| {
-                u.rgb_allocations
-                    .iter()
-                    .filter(|a| a.asset_id == Some(asset_id.clone()) && a.settled())
-                    .map(|a| a.assignment.main_amount())
-                    .sum::<u64>()
-            })
-            .sum();
+        let unspendable = checked_sum(
+            txos_allocations
+                .iter()
+                .filter(|u| {
+                    let unspent_with_pending = !u.utxo.spent
+                        && (u.rgb_allocations.iter().any(|a| {
+                            (!a.incoming && !a.status.failed())
+                                || (a.incoming && a.status.pending())
+                        }) || u.pending_blinded > 0);
+                    let spent_waiting = u.utxo.spent
+                        && u.rgb_allocations
+                            .iter()
+                            .any(|a| !a.incoming && a.status.waiting_confirmations());
+                    unspent_with_pending || spent_waiting
+                })
+                .flat_map(|u| u.rgb_allocations.iter())
+                .filter(|a| a.asset_id == Some(asset_id.clone()) && a.settled())
+                .map(|a| a.assignment.main_amount()),
+        )?;
 
         let spendable = settled.saturating_sub(unspendable);
 
+        // This is a conservative projection, never spending authority. Retained
+        // mutually conflicting proposals (an original and its RGB self-recovery)
+        // can temporarily subtract the same allocation twice. A wallet cannot
+        // have a negative asset balance: report zero rather than wrapping -2 to
+        // u64::MAX-1. Keep both DB reservations, actual settled allocations and
+        // the independently computed spendable amount unchanged. No cancellation
+        // or successful settlement is inferred from the projection.
+        let future = u64::try_from(future.max(0)).map_err(|_| Error::Inconsistency {
+            details: "RGB projected balance overflow".to_owned(),
+        })?;
         Ok(Balance {
             settled,
-            future: future as u64,
+            future,
             spendable,
         })
     }
@@ -2126,6 +2169,197 @@ mod tests {
         assert_eq!(balance.settled, 1000);
         assert_eq!(balance.future, 1000);
         assert_eq!(balance.spendable, 1000);
+    }
+
+    #[test]
+    fn test_witness_pending_receive_is_projected_once_with_or_without_coloring() {
+        let db = make_db();
+        let settled = db
+            .set_batch_transfer(make_batch_transfer_mod(TransferStatus::Settled))
+            .unwrap();
+        let asset = db
+            .set_asset_transfer(make_asset_transfer_mod(settled, Some("a1")))
+            .unwrap();
+        db.set_transfer(make_transfer_mod(asset, true)).unwrap();
+        let owned = db.set_txo(make_txo_mod("owned", 0, "1000")).unwrap();
+        db.set_coloring(make_coloring_mod(owned, asset, ColoringType::Issue, 2))
+            .unwrap();
+        let mut pending = make_batch_transfer_mod(TransferStatus::WaitingConfirmations);
+        pending.txid = ActiveValue::Set(Some("incoming".into()));
+        let batch = db.set_batch_transfer(pending).unwrap();
+        let asset = db
+            .set_asset_transfer(make_asset_transfer_mod(batch, Some("a1")))
+            .unwrap();
+        let mut transfer = make_transfer_mod(asset, true);
+        transfer.recipient_type =
+            ActiveValue::Set(Some(RecipientTypeFull::Witness { vout: Some(1) }));
+        transfer.requested_assignment = ActiveValue::Set(Some(Assignment::Fungible(2)));
+        db.set_transfer(transfer).unwrap();
+        let balance = db
+            .get_asset_balance("a1".into(), None, None, None, None, None)
+            .unwrap();
+        assert_eq!(
+            (balance.settled, balance.future, balance.spendable),
+            (2, 4, 2)
+        );
+        let receiving = db.set_txo(make_txo_mod("incoming", 1, "1000")).unwrap();
+        db.set_coloring(make_coloring_mod(
+            receiving,
+            asset,
+            ColoringType::Receive,
+            2,
+        ))
+        .unwrap();
+        let before = serde_json::to_value(&db).unwrap();
+        let balance = db
+            .get_asset_balance("a1".into(), None, None, None, None, None)
+            .unwrap();
+        assert_eq!(
+            (balance.settled, balance.future, balance.spendable),
+            (2, 4, 2)
+        );
+        assert_eq!(serde_json::to_value(&db).unwrap(), before);
+        // An independently failed incoming transfer contributes no projected or
+        // spendable units. Its request, coloring and history remain intact.
+        let mut failed: DbBatchTransferActMod = db
+            .iter_batch_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|b| b.idx == batch)
+            .unwrap()
+            .into();
+        failed.status = ActiveValue::Set(TransferStatus::Failed);
+        db.update_batch_transfer(&mut failed).unwrap();
+        let balance = db
+            .get_asset_balance("a1".into(), None, None, None, None, None)
+            .unwrap();
+        assert_eq!(
+            (balance.settled, balance.future, balance.spendable),
+            (2, 2, 2)
+        );
+        assert_eq!(db.iter_colorings().unwrap().len(), 2);
+        assert_eq!(db.iter_transfers().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_conflicting_pending_proposals_never_wrap_future_or_release_holds() {
+        let db = make_db();
+        let txo = db.set_txo(make_txo_mod("owned", 0, "2000")).unwrap();
+        let settled = db
+            .set_batch_transfer(make_batch_transfer_mod(TransferStatus::Settled))
+            .unwrap();
+        let asset = db
+            .set_asset_transfer(make_asset_transfer_mod(settled, Some("a1")))
+            .unwrap();
+        db.set_transfer(make_transfer_mod(asset, true)).unwrap();
+        db.set_coloring(make_coloring_mod(txo, asset, ColoringType::Issue, 2))
+            .unwrap();
+        let mut proposals = vec![];
+        for _ in 0..2 {
+            let batch = db
+                .set_batch_transfer(make_batch_transfer_mod(TransferStatus::Initiated))
+                .unwrap();
+            let asset = db
+                .set_asset_transfer(make_asset_transfer_mod(batch, Some("a1")))
+                .unwrap();
+            db.set_transfer(make_transfer_mod(asset, false)).unwrap();
+            db.set_coloring(make_coloring_mod(txo, asset, ColoringType::Input, 2))
+                .unwrap();
+            proposals.push(batch);
+        }
+        let before = serde_json::to_value((
+            db.iter_batch_transfers().unwrap(),
+            db.iter_asset_transfers().unwrap(),
+            db.iter_transfers().unwrap(),
+            db.iter_colorings().unwrap(),
+            db.iter_txos().unwrap(),
+        ))
+        .unwrap();
+        let balance = db
+            .get_asset_balance("a1".into(), None, None, None, None, None)
+            .unwrap();
+        assert_eq!(balance.settled, 2);
+        assert_eq!(balance.future, 0);
+        assert_eq!(balance.spendable, 0);
+        assert_eq!(
+            serde_json::to_value((
+                db.iter_batch_transfers().unwrap(),
+                db.iter_asset_transfers().unwrap(),
+                db.iter_transfers().unwrap(),
+                db.iter_colorings().unwrap(),
+                db.iter_txos().unwrap()
+            ))
+            .unwrap(),
+            before
+        );
+        // Proven unsigned cancellation removes only one pending deduction;
+        // the signed original still holds every unit.
+        let mut cancelled: DbBatchTransferActMod = db
+            .iter_batch_transfers()
+            .unwrap()
+            .into_iter()
+            .find(|b| b.idx == proposals[1])
+            .unwrap()
+            .into();
+        cancelled.status = ActiveValue::Set(TransferStatus::Failed);
+        db.update_batch_transfer(&mut cancelled).unwrap();
+        let balance = db
+            .get_asset_balance("a1".into(), None, None, None, None, None)
+            .unwrap();
+        assert_eq!(balance.future, 0);
+        assert_eq!(balance.spendable, 0);
+    }
+
+    #[test]
+    fn test_balance_amount_overflow_refuses_instead_of_wrapping() {
+        let db = make_db();
+        for (index, amount) in [u64::MAX, 1].into_iter().enumerate() {
+            let txo = db
+                .set_txo(make_txo_mod("owned", index as u32, "1000"))
+                .unwrap();
+            let batch = db
+                .set_batch_transfer(make_batch_transfer_mod(TransferStatus::Settled))
+                .unwrap();
+            let asset = db
+                .set_asset_transfer(make_asset_transfer_mod(batch, Some("a1")))
+                .unwrap();
+            db.set_transfer(make_transfer_mod(asset, true)).unwrap();
+            db.set_coloring(make_coloring_mod(txo, asset, ColoringType::Issue, amount))
+                .unwrap();
+        }
+        assert!(matches!(
+            db.get_asset_balance("a1".into(), None, None, None, None, None),
+            Err(Error::Inconsistency { .. })
+        ));
+    }
+
+    #[test]
+    fn test_positive_projected_balance_overflow_refuses() {
+        let db = make_db();
+        for (index, amount, status, coloring) in [
+            (0, u64::MAX, TransferStatus::Settled, ColoringType::Issue),
+            (
+                1,
+                1,
+                TransferStatus::WaitingConfirmations,
+                ColoringType::Receive,
+            ),
+        ] {
+            let txo = db.set_txo(make_txo_mod("owned", index, "1000")).unwrap();
+            let batch = db
+                .set_batch_transfer(make_batch_transfer_mod(status))
+                .unwrap();
+            let asset = db
+                .set_asset_transfer(make_asset_transfer_mod(batch, Some("a1")))
+                .unwrap();
+            db.set_transfer(make_transfer_mod(asset, true)).unwrap();
+            db.set_coloring(make_coloring_mod(txo, asset, coloring, amount))
+                .unwrap();
+        }
+        assert!(matches!(
+            db.get_asset_balance("a1".into(), None, None, None, None, None),
+            Err(Error::Inconsistency { .. })
+        ));
     }
 
     #[test]

@@ -1,0 +1,36 @@
+{
+  "scope": "REAL_BDK_AND_STANDARD_RGB_ON_INVENTED_LOCAL_GRAPH_NOT_FINANCIAL_ACCEPTANCE",
+  "test": "rgb_builder_handles_split_carriers_and_assignment_free_fee_input",
+  "native_tests_passed": 166,
+  "clippy": "PASS_WARNINGS_DENIED",
+  "stock_unchanged": true,
+  "production_source_changed": false,
+  "fixture_helper_fix": "Equal-value inputs use distinct invented parent outputs; they no longer accidentally conflict.",
+  "initial_failures": "Incorrect serialization helper name corrected; initial fixture accidentally double-spent one invented input, corrected. Both failure logs retained.",
+  "logs": [
+    {
+      "log": "split-carrier-builder-test.log.gz",
+      "uncompressed_sha256": "886c1ad54a30df24c511459cc360567a13e8b4df423ce76ef6c5c9ebe06b20fa"
+    },
+    {
+      "log": "split-carrier-builder-test-v2.log.gz",
+      "uncompressed_sha256": "1895c26d0cf67eb3c28bdc297708ad7a10caf019e50a6ed89c9d761612bedad1"
+    },
+    {
+      "log": "split-carrier-builder-test-v3.log.gz",
+      "uncompressed_sha256": "6aaa69d35952b93816673ada5c78675867e9dfb848a6f9e7b6494914af2dcb29"
+    },
+    {
+      "log": "split-carrier-builder-test-v4.log.gz",
+      "uncompressed_sha256": "db6f433bec370aa1121de75114e1cb35670e8b3e13fc00b7539c75d57dc9afaf"
+    },
+    {
+      "log": "split-carrier-native-all.log.gz",
+      "uncompressed_sha256": "c7e46b74ce330ece8911df5b4dd30b7d1a1212427b611b7b1cfc44a68bf51588"
+    },
+    {
+      "log": "split-carrier-native-clippy.log.gz",
+      "uncompressed_sha256": "58453134284aa65d6410786ef3a3ea354fd90a8bc0d2306afbfd973641b3a427"
+    }
+  ]
+}

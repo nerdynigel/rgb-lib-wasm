@@ -1,0 +1,25 @@
+{
+  "scope": "COMPONENT_GUARDS_NOT_NETWORK_RECOVERY",
+  "files": [
+    {
+      "name": "native-fee-recovery-final-full.log",
+      "sha256": "0facb3b74ee4859ea85ba62bff511f2622e88013890c2097732c680f06fa5eea",
+      "bytes": 13729
+    },
+    {
+      "name": "native-fee-recovery-final-clippy.log",
+      "sha256": "4c571cd0075afad3078d90dff17372a22f39e8f86b3d54996de1a090d0248ce5",
+      "bytes": 181
+    },
+    {
+      "name": "native-fee-recovery-final-format.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "name": "fee-recovery-timelock-tests.log",
+      "sha256": "e6aabe8278fa071235b4454a7ee08a4a8653936a0f466930f7a5d8e10812bda5",
+      "bytes": 1411
+    }
+  ]
+}

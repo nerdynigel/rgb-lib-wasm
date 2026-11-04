@@ -1,0 +1,30 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-safe-bitcoin-20261103)
+warning: unused variable: `colored_receives`
+    --> src/database/memory_db.rs:1139:13
+     |
+1139 |         let colored_receives: std::collections::HashSet<(i32, String, u32)> = colorings
+     |             ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_colored_receives`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `rgb-lib-wasm` (lib test) generated 1 warning (run `cargo fix --lib -p rgb-lib-wasm --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.26s
+     Running unittests src/lib.rs (/home/nigel/.cache/btcx-asm-release-20261101/native-target/debug/deps/rgb_lib_wasm-f6780f344ba8f335)
+
+running 1 test
+
+thread 'database::memory_db::tests::test_witness_pending_receive_is_projected_once_with_or_without_coloring' (912026) panicked at src/database/memory_db.rs:2209:9:
+assertion `left == right` failed
+  left: (2, 6, 2)
+ right: (2, 4, 2)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test database::memory_db::tests::test_witness_pending_receive_is_projected_once_with_or_without_coloring ... FAILED
+
+failures:
+
+failures:
+    database::memory_db::tests::test_witness_pending_receive_is_projected_once_with_or_without_coloring
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 188 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

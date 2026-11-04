@@ -1,0 +1,33 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-safe-bitcoin-20261103)
+error[E0603]: function `validate_retained_conflicts` is private
+    --> src/wallet/offline.rs:3186:43
+     |
+3186 |         super::online::incoming_conflict::validate_retained_conflicts(
+     |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^ private function
+     |
+note: the function `validate_retained_conflicts` is defined here
+    --> src/wallet/incoming_conflict.rs:61:1
+     |
+  61 | / pub(super) fn validate_retained_conflicts(
+  62 | |     receipts: &HashMap<String, IncomingRgbConflict>,
+  63 | |     consignments: &HashMap<String, Vec<u8>>,
+  64 | |     db: &DbData,
+...    |
+ 131 | |     Ok(())
+ 132 | | }
+     | |_^
+
+error[E0382]: borrow of moved value: `snapshot.db`
+    --> src/wallet/offline.rs:3189:14
+     |
+3121 |         self.database = Arc::new(snapshot.db);
+     |                                  ----------- value moved here
+...
+3189 |             &snapshot.db.get_db_data(false)?,
+     |              ^^^^^^^^^^^ value borrowed here after move
+     |
+     = note: move occurs because `snapshot.db` has type `memory_db::InMemoryDb`, which does not implement the `Copy` trait
+
+Some errors have detailed explanations: E0382, E0603.
+For more information about an error, try `rustc --explain E0382`.
+error: could not compile `rgb-lib-wasm` (lib test) due to 2 previous errors

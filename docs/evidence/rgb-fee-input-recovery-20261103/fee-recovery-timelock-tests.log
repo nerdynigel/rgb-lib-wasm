@@ -1,0 +1,16 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-safe-bitcoin-20261103)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.64s
+     Running unittests src/lib.rs (target/debug/deps/rgb_lib_wasm-f6780f344ba8f335)
+
+running 8 tests
+test wallet::online::rgb_fee_recovery::tests::rgb_seals_foreign_inputs_and_unrelated_operations_are_never_recovery_coins ... ok
+test wallet::online::rgb_fee_recovery::tests::established_bdk_signer_signs_only_the_new_separately_approved_self_payment ... ok
+test wallet::online::rgb_fee_recovery::tests::exact_fee_input_self_payment_preserves_original_and_all_native_holds ... ok
+test wallet::online::rgb_fee_recovery::tests::wrong_network_stale_new_approval_fees_overflow_and_other_caller_holds_refuse ... ok
+test wallet::online::rgb_fee_recovery::tests::altered_destination_amount_input_value_and_nonbinding_sighashes_are_not_signed ... ok
+test wallet::online::rgb_fee_recovery::tests::new_stock_assignment_or_another_native_original_blocks_previously_reviewed_fee_input ... ok
+test wallet::online::rgb_fee_recovery::tests::original_must_be_expired_and_keep_its_immutable_request_and_complete_signature ... ok
+test wallet::online::rgb_fee_recovery::tests::restored_dispatched_unsigned_and_nonprepared_originals_fail_closed ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 154 filtered out; finished in 5.07s
+

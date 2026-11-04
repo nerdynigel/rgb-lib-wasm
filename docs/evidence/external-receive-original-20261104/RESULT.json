@@ -1,0 +1,42 @@
+{
+  "scope": "SOURCE_CANDIDATE_NO_FINANCIAL_ACCEPTANCE",
+  "predecessor_native": "5aa053897cb3084ac9fa8529b838c868121ec5e7",
+  "native_tests": {
+    "cases": 216,
+    "passed": 216
+  },
+  "strict_library_clippy": "PASS",
+  "formatter": "PASS",
+  "wasm32_library_check": "PASS",
+  "native_backup_version": 6,
+  "managed_snapshot_version_for_incoming_originals": 4,
+  "source_sha256": {
+    "src/wallet/external_receive.rs": "ab29dae3dffad2bdec77e8cfc3dfe435e8fa23e3fe32af48f604c637615f8423",
+    "src/wallet/online.rs": "04535553f4c73efe368a044d0cbb9cef7f0c26a8bccccab7ffdd7e7fe132ddb8",
+    "src/wallet/rust_only.rs": "4e237c6886fe8c9722ed677570c1181eee3fe288c6f3f0eb050204589279bb7a",
+    "src/wallet/offline.rs": "7d9ea31a3120c82d5756af455e521a422e93a5e80557977cfadbd079ac4a5c39",
+    "src/wallet/backup.rs": "9861c7892782445e957e9b5472256791090ec3e174423267635dcb5c5e277fc0",
+    "src/wallet/idb_store.rs": "64dca4b4fe6c8890cec753d3e0f6748cd16e57dfd7b2b9c5e85dbe30206fb9a7",
+    "src/wallet/collaborative_partial.rs": "5791b48010ad752505c13dcee8e18c76510421598fb4df7309147e52c849a90f"
+  },
+  "evidence_sha256": {
+    "external-receive-first-native-tests.txt": "d5bd74d8c3cc853f2fa8e23fdfed4349751d440dfc17e325f0413ecd15d38ca0",
+    "external-receive-native-tests-2.txt": "f4780c841b21106833ed61d36a49804284a1e2c8d3f30d458722461874b0f38e",
+    "external-receive-native-tests-3.txt": "649acc175bdfb3ce81903f435339ca524658cfa1b568482ee3365a302c3c10a8",
+    "external-receive-native-tests-final.txt": "8dcf2d4097000ddd77f32aae82f079927ea030f3c026a84427fd20d440dbf99a",
+    "external-receive-native-clippy-final.txt": "a7bdd1d5fadc8acc8920d090726547a06b60cefb0a3c684ba7c8b5498d366092",
+    "external-receive-native-format-final.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "external-receive-native-wasm.txt": "0e4381a7f1e12f5f13c45d8c89b103820ecd9fa43268b1ae4eba836a9d0cabc2",
+    "external-receive-native-delete-guards.txt": "279b66bb2169526e2cb4105f7a427628ad5af180eb305da45d0cefcb33dfedbd",
+    "external-receive-native-tests-with-delete-guard.txt": "511ab992fc2b374b68206f74b1964be0698f48c64ab9c5aa28c2ae8fb67178a5",
+    "external-receive-native-clippy-with-delete-guard.txt": "0a5c80834b93a4b5e1d3c2a8b6af18b91f168bc000d2ab160c4c9c9224b7fe15",
+    "external-receive-native-wasm-with-delete-guard.txt": "7e17e0c8fc43fc1e4e77a2cc2be417467f9cb07b8b8c7559c033d529cd52ea8e",
+    "external-receive-native-format-with-delete-guard.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "actual_positive_async_native_persistence_test": false,
+  "funded_two_wallet_complete_input_acceptance": false,
+  "lab_contact_or_mutation": false,
+  "main_merge": false,
+  "first_failure": "Rust hash trait ambiguity; corrected with explicit Bitcoin Hash trait. Original compiler output retained.",
+  "deletion_guard_followup": "Single and bulk failed-transfer deletion preserve the original incoming database row. Full216, Clippy, wasm32 and format pass."
+}

@@ -1,0 +1,35 @@
+{
+  "scope": "NATIVE_REGTEST_READ_ONLY_FUNGIBLE_RGB_INPUT_QUALIFICATION_NOT_FUNDED_OR_INDEPENDENT_ACCEPTANCE",
+  "base_revision": "0a37e44a9a718a7b3914e22a4db30dd5d2981d3c",
+  "native_tests": 199,
+  "new_tests": 10,
+  "strict_clippy": "PASS",
+  "format": "PASS",
+  "wasm32_library_check": "PASS",
+  "new_engine_api": "Wallet::asset_spend_view",
+  "all_amounts_decimal_u64_strings": true,
+  "genesis_and_network_verified": true,
+  "database_stock_bdk_agreement_required": true,
+  "other_contracts_and_assignments_excluded": true,
+  "existing_original_operation_fence_reused": true,
+  "no_snapshot_or_backup_version_change": true,
+  "no_new_cryptography": true,
+  "new_funding_signing_broadcasting": false,
+  "new_runtime_or_lab_deployment": false,
+  "notes": [
+    "Initial filter before tests were written compiled with0tests; not acceptance.",
+    "One initial negative fixture passed a mutable reference to a by-value DB setter; fixture corrected before actual10/199case run."
+  ],
+  "source_sha256": {
+    "src/wallet/asset_spend.rs": "c3d6db4ca41f738e2651a79e5f805531122537bb1a36138d9dffb2bb64e2a85e",
+    "src/wallet/asset_spend_tests.rs": "4f4f63c2a545b87304d792fb16bd267f0cea611a30c2cb689434732ddf758b90",
+    "src/wallet/online.rs": "59d8748112a4025fc0691a99bfa7ee03e72a531dcc3cc384fb8382da1ddaa9ea"
+  },
+  "evidence_sha256": {
+    "focused-first.txt": "4b435e49930eacbb8979da01f78877c1feb67367ef40e39a91ed94025aec5f3d",
+    "native-tests.txt": "4baaab59dfbc5bb7b49048e3347458341cab420e8e451593953a3cc02d5ce359",
+    "native-clippy.txt": "d68623b8835d86a3decfacf8d00fcde02bf5cdb036437ec27badc90d2c013dde",
+    "native-format.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "native-wasm.txt": "2b5651265ae33d9631fe2acfa4a30a9b7c4b45cfde23a01b85c7fb4ed261508f"
+  }
+}

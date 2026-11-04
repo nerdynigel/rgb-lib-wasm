@@ -1,0 +1,27 @@
+{
+  "scope": "NATIVE_SOURCE_CANDIDATE_NOT_LIVE_ACCEPTANCE",
+  "tests": 189,
+  "exact_parent": "9ff7850442609e63bd89e038dc8ece6359e332c9",
+  "changes": [
+    "deduplicate witness projected receive by asset-transfer and exact unspent receive outpoint",
+    "missing original raw-404 returns None without status-404; malformed txid/contradictory raw/confirmed height refuse",
+    "regtest-only incoming NIA witness independently validated standard consignment, live ancestry, owned External script, distinct confirmed competing shared input; no failure from absence/expiry/mempool",
+    "append-only confirmed-conflict receipt, original received consignment and DB history retained; no Stock mutation or outgoing hold release",
+    "native backup v4 retains receipt; native v2/v3 readable without receipt; snapshot v2 rejects old readers and stale/missing receipt or consignment/revived batch"
+  ],
+  "new_native_api": false,
+  "new_shared_protocol": false,
+  "financial_operations": 0,
+  "live_acceptance": "REQUIRED_AFTER_EXACT_PIN_BUILD_AND_GUARDED_DEPLOY",
+  "logs": {
+    "receiver-native-final.log": "cc02882fa50650d8b8ac13b395e49999ee49c306213063e223759159f6f679ae",
+    "receiver-clippy-final.log": "c245911c59e4514681523bf353032417ad58c6dc0579060a9a87a1b1c1031b15",
+    "receiver-wasm-final.log": "1ccf91222022f91d201719032d9ba9b68330e4bb38758ef14eadeceba87f17fb",
+    "receiver-balance-negative-control.log": "6c773c9b10457aeb6d642379a47df1867c18d473b28fd3746bb471aab51e4609",
+    "receiver-balance-green.log": "46173cbbf41d211cb07a3098dfd1864cbb2a6a183e84e7b00cb5446d0a44d23a",
+    "receiver-focused.log": "4e2ebc4e3af9512ceba1bef0a5c9cf2ef0f27898fddd60879c7cc32136536e96",
+    "receiver-conflict-first.log": "9f7d197654604473c9354da020a87213ad3f906e692a208094078673907bc375",
+    "receiver-conflict-structural.log": "03199c781ffb98497ed004bcb6bec5ad77ad09b6759e112231505c2c2b880fa4",
+    "receiver-conflict-regressions.log": "e04f9fed8e477d0d0f7b03b9d12a3980226d480f876cb886937f733383c5b306"
+  }
+}

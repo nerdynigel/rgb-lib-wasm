@@ -1,0 +1,16 @@
+
+running 8 tests
+test wallet::online::asset_spend::tests::hidden_stock_without_database_is_not_invented_as_spendable ... ok
+test wallet::online::asset_spend::tests::positive_display_without_exact_stock_and_overflow_fail_closed ... ok
+test wallet::online::asset_spend::tests::wrong_native_prevout_amount_is_not_accepted_from_database ... ok
+test wallet::online::asset_spend::tests::actual_fragmented_inputs_have_exact_values_scripts_and_no_state_mutation ... ok
+test wallet::online::asset_spend::tests::native_original_hold_excludes_the_entire_carrier_without_releasing_history ... ok
+test wallet::online::asset_spend::tests::unconfirmed_or_immature_carriers_are_never_available ... ok
+test wallet::online::asset_spend::tests::ticker_malformed_unknown_contract_and_non_regtest_are_refused ... ok
+test wallet::online::asset_spend::tests::other_contracts_and_hidden_inflation_rights_never_burn_with_selected_asset ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 189 filtered out; finished in 2.13s
+
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-safe-bitcoin-20261103)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.49s
+     Running unittests src/lib.rs (target/debug/deps/rgb_lib_wasm-f6780f344ba8f335)

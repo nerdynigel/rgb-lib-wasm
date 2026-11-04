@@ -1,0 +1,158 @@
+    Checking libm v0.2.16
+   Compiling wasm-bindgen-test-macro v0.3.67
+    Checking oorandom v11.1.5
+    Checking nu-ansi-term v0.50.3
+    Checking cast v0.3.0
+    Checking wasm-bindgen-test-shared v0.2.117
+    Checking num-traits v0.2.19
+    Checking chrono v0.4.44
+    Checking idb v0.6.5
+    Checking wasm-bindgen-test v0.3.67
+    Checking rexie v0.6.2
+    Checking rgb-consensus v0.11.1-rc.10
+    Checking rgb-invoicing v0.11.1-rc.10
+    Checking rgb-ops v0.11.1-rc.10
+    Checking rgb-psbt-utils v0.11.1-rc.10
+    Checking rgb-schemas v0.11.1-rc.10
+    Checking rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-safe-bitcoin-20261103)
+error: usage of an `Arc` that is not `Send` and `Sync`
+    --> src/wallet/offline.rs:3259:23
+     |
+3259 |             database: Arc::new(crate::database::memory_db::InMemoryDb::new()),
+     |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `Arc<InMemoryDb>` is not `Send` and `Sync` as `InMemoryDb` is not `Sync`
+     = help: if the `Arc` will not be used across threads replace it with an `Rc`
+     = help: otherwise make `InMemoryDb` `Send` and `Sync` or consider a wrapper type such as `Mutex`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#arc_with_non_send_sync
+     = note: `-D clippy::arc-with-non-send-sync` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::arc_with_non_send_sync)]`
+
+error: usage of an `Arc` that is not `Send` and `Sync`
+    --> src/wallet/safe_bitcoin.rs:1048:31
+     |
+1048 |             wallet.database = Arc::new(crate::database::memory_db::InMemoryDb::new());
+     |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `Arc<InMemoryDb>` is not `Send` and `Sync` as `InMemoryDb` is not `Sync`
+     = help: if the `Arc` will not be used across threads replace it with an `Rc`
+     = help: otherwise make `InMemoryDb` `Send` and `Sync` or consider a wrapper type such as `Mutex`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#arc_with_non_send_sync
+
+error: usage of an `Arc` that is not `Send` and `Sync`
+    --> src/wallet/safe_bitcoin.rs:1072:39
+     |
+1072 |                     wallet.database = Arc::new(serde_json::from_value(serialized).unwrap());
+     |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `Arc<InMemoryDb>` is not `Send` and `Sync` as `InMemoryDb` is not `Sync`
+     = help: if the `Arc` will not be used across threads replace it with an `Rc`
+     = help: otherwise make `InMemoryDb` `Send` and `Sync` or consider a wrapper type such as `Mutex`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#arc_with_non_send_sync
+
+error: unused import: `std::collections::HashMap`
+ --> tests/external_send_wasm.rs:5:5
+  |
+5 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `-D unused-imports` implied by `-D warnings`
+  = help: to override `-D warnings` add `#[allow(unused_imports)]`
+
+error: unused import: `rgb_lib_wasm::bitcoin::absolute::LockTime`
+ --> tests/external_send_wasm.rs:8:5
+  |
+8 | use rgb_lib_wasm::bitcoin::absolute::LockTime;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: unused import: `rgb_lib_wasm::bitcoin::psbt::Psbt`
+ --> tests/external_send_wasm.rs:9:5
+  |
+9 | use rgb_lib_wasm::bitcoin::psbt::Psbt;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: unused import: `rgb_lib_wasm::bitcoin::transaction::Version`
+  --> tests/external_send_wasm.rs:10:5
+   |
+10 | use rgb_lib_wasm::bitcoin::transaction::Version;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: unused imports: `OutPoint`, `Sequence`, `Transaction`, `TxIn`, `TxOut`, `Txid`, and `Witness`
+  --> tests/external_send_wasm.rs:12:13
+   |
+12 |     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+   |             ^^^^^^^^             ^^^^^^^^  ^^^^^^^^^^^  ^^^^  ^^^^^  ^^^^  ^^^^^^^
+
+error: unused imports: `AssetColoringInfo` and `ColoringInfo`
+  --> tests/external_send_wasm.rs:14:39
+   |
+14 | use rgb_lib_wasm::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
+   |                                       ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^
+
+error: unused imports: `DatabaseType`, `Recipient`, `WalletData`, and `WitnessData`
+  --> tests/external_send_wasm.rs:15:28
+   |
+15 | use rgb_lib_wasm::wallet::{DatabaseType, Recipient, Wallet, WalletData, WitnessData};
+   |                            ^^^^^^^^^^^^  ^^^^^^^^^          ^^^^^^^^^^  ^^^^^^^^^^^
+
+error: unused imports: `AssetSchema`, `BitcoinNetwork`, and `generate_keys`
+  --> tests/external_send_wasm.rs:16:20
+   |
+16 | use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, generate_keys};
+   |                    ^^^^^^^^^^^              ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^
+
+error: unused import: `std::collections::HashMap`
+ --> tests/external_send_finalize_wasm.rs:5:5
+  |
+5 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `-D unused-imports` implied by `-D warnings`
+  = help: to override `-D warnings` add `#[allow(unused_imports)]`
+
+error: unused import: `rgb_lib_wasm::bitcoin::absolute::LockTime`
+ --> tests/external_send_finalize_wasm.rs:8:5
+  |
+8 | use rgb_lib_wasm::bitcoin::absolute::LockTime;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: unused import: `rgb_lib_wasm::bitcoin::psbt::Psbt`
+ --> tests/external_send_finalize_wasm.rs:9:5
+  |
+9 | use rgb_lib_wasm::bitcoin::psbt::Psbt;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: unused import: `rgb_lib_wasm::bitcoin::transaction::Version`
+  --> tests/external_send_finalize_wasm.rs:10:5
+   |
+10 | use rgb_lib_wasm::bitcoin::transaction::Version;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: unused imports: `OutPoint`, `Sequence`, `Transaction`, `TxIn`, `TxOut`, `Txid`, and `Witness`
+  --> tests/external_send_finalize_wasm.rs:12:13
+   |
+12 |     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+   |             ^^^^^^^^             ^^^^^^^^  ^^^^^^^^^^^  ^^^^  ^^^^^  ^^^^  ^^^^^^^
+
+error: unused imports: `AssetColoringInfo` and `ColoringInfo`
+  --> tests/external_send_finalize_wasm.rs:14:39
+   |
+14 | use rgb_lib_wasm::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
+   |                                       ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^
+
+error: unused imports: `DatabaseType`, `Recipient`, `WalletData`, and `WitnessData`
+  --> tests/external_send_finalize_wasm.rs:15:28
+   |
+15 | use rgb_lib_wasm::wallet::{DatabaseType, Recipient, Wallet, WalletData, WitnessData};
+   |                            ^^^^^^^^^^^^  ^^^^^^^^^          ^^^^^^^^^^  ^^^^^^^^^^^
+
+error: unused imports: `AssetSchema`, `Assignment`, `BitcoinNetwork`, and `generate_keys`
+  --> tests/external_send_finalize_wasm.rs:16:20
+   |
+16 | use rgb_lib_wasm::{AssetSchema, Assignment, BitcoinNetwork, generate_keys};
+   |                    ^^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^
+
+error: could not compile `rgb-lib-wasm` (test "external_send_wasm") due to 8 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `rgb-lib-wasm` (test "external_send_finalize_wasm") due to 8 previous errors
+error: could not compile `rgb-lib-wasm` (lib test) due to 3 previous errors

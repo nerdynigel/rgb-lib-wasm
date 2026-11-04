@@ -1,0 +1,7 @@
+{
+  "src/wallet/safe_bitcoin.rs": "dbe842b4a5fa404234fe112f5cbeab4ade2098d1c1c1c812d1d90f76f368053a",
+  "src/wallet/online.rs": "e0032500faa3f11c3dbf7deecb40da74a9b561399aa4f245095ef5f047d12f90",
+  "src/wallet/wallet_transfer.rs": "4d1ffd72f1cf36961717a210e81d436eff55a91d1d12e65a909c032e454200a4",
+  "Cargo.toml": "92334cb58fe1b8531899c9b84554471c2a3174634bd78e130ba19b535edef028",
+  "Cargo.lock": "6287c1b3bebd571efc5a78f325f52ca0274c87d77ed35d10f40d72408125014c"
+}

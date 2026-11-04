@@ -137,51 +137,7 @@ impl Wallet {
         txid: String,
         expected: String,
     ) -> Result<serde_json::Value, Error> {
-        use bitcoin::hashes::{Hash as _, sha256};
-        if bytes.len() > 2_097_152 {
-            return Err(Error::InvalidConsignment);
-        }
-        let validation = validate_consignment_offchain(bytes, &txid, self.bitcoin_network())?;
-        if !validation.valid {
-            return Err(Error::InvalidConsignment);
-        }
-        let transfer = RgbTransfer::load(bytes).map_err(InternalError::from)?;
-        if transfer.contract_id().to_string() != expected
-            || AssetSchema::try_from(transfer.schema_id())? != AssetSchema::Nia
-        {
-            return Err(Error::InvalidConsignment);
-        }
-        let mut found = Vec::new();
-        for bundle in &transfer.bundles {
-            if bundle.pub_witness.txid().to_string() != txid {
-                continue;
-            }
-            for known in &bundle.bundle.known_transitions {
-                if known.transition.contract_id.to_string() != expected {
-                    continue;
-                }
-                let mut allocations = BTreeMap::new();
-                for typed in known.transition.assignments.values() {
-                    for assignment in typed.as_fungible() {
-                        let (seal, state) =
-                            assignment.as_revealed().ok_or(Error::InvalidAssignment)?;
-                        if allocations
-                            .insert(seal.vout.into_u32().to_string(), state.as_u64().to_string())
-                            .is_some()
-                        {
-                            return Err(Error::InvalidAssignment);
-                        }
-                    }
-                }
-                found.push(serde_json::json!({"contract_id":expected,"txid":txid,
-                    "transition_id":known.opid.to_string(),"bundle_id":bundle.bundle.bundle_id().to_string(),
-                    "consignment_digest":<sha256::Hash as bitcoin::hashes::Hash>::hash(bytes).to_string(),"allocations":allocations,"valid":true}));
-            }
-        }
-        if found.len() != 1 {
-            return Err(Error::InvalidConsignment);
-        }
-        Ok(found.remove(0))
+        inspect_external_transfer_facts(bytes, txid, expected, self.bitcoin_network())
     }
 
     /// Independently validate every historical RGB witness against the live
@@ -1004,4 +960,58 @@ mod tests {
     fn indexer_protocol_display() {
         assert_eq!(IndexerProtocol::Esplora.to_string(), "Esplora");
     }
+}
+
+/// Standard validator shared by live inspection and exact original restore.
+/// Restore alone supplies no fresh chain observation or spending authority.
+pub(super) fn inspect_external_transfer_facts(
+    bytes: &[u8],
+    txid: String,
+    expected: String,
+    network: BitcoinNetwork,
+) -> Result<serde_json::Value, Error> {
+    use bitcoin::hashes::{Hash as _, sha256};
+    if bytes.len() > 2_097_152 {
+        return Err(Error::InvalidConsignment);
+    }
+    let validation = validate_consignment_offchain(bytes, &txid, network)?;
+    if !validation.valid {
+        return Err(Error::InvalidConsignment);
+    }
+    let transfer = RgbTransfer::load(bytes).map_err(InternalError::from)?;
+    if transfer.contract_id().to_string() != expected
+        || AssetSchema::try_from(transfer.schema_id())? != AssetSchema::Nia
+    {
+        return Err(Error::InvalidConsignment);
+    }
+    let mut found = Vec::new();
+    for bundle in &transfer.bundles {
+        if bundle.pub_witness.txid().to_string() != txid {
+            continue;
+        }
+        for known in &bundle.bundle.known_transitions {
+            if known.transition.contract_id.to_string() != expected {
+                continue;
+            }
+            let mut allocations = BTreeMap::new();
+            for typed in known.transition.assignments.values() {
+                for assignment in typed.as_fungible() {
+                    let (seal, state) = assignment.as_revealed().ok_or(Error::InvalidAssignment)?;
+                    if allocations
+                        .insert(seal.vout.into_u32().to_string(), state.as_u64().to_string())
+                        .is_some()
+                    {
+                        return Err(Error::InvalidAssignment);
+                    }
+                }
+            }
+            found.push(serde_json::json!({"contract_id":expected,"txid":txid,
+                    "transition_id":known.opid.to_string(),"bundle_id":bundle.bundle.bundle_id().to_string(),
+                    "consignment_digest":<sha256::Hash as bitcoin::hashes::Hash>::hash(bytes).to_string(),"allocations":allocations,"valid":true}));
+        }
+    }
+    if found.len() != 1 {
+        return Err(Error::InvalidConsignment);
+    }
+    Ok(found.remove(0))
 }

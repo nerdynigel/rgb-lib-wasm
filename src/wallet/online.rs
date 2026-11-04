@@ -6,10 +6,43 @@ use super::*;
 use crate::api::proxy::WasmProxyClient;
 use bitcoin::hashes::{Hash as _, sha256};
 
+#[path = "safe_bitcoin.rs"]
+mod safe_bitcoin;
+pub use safe_bitcoin::{BitcoinSpendInput, BitcoinSpendRequest, BitcoinSpendView};
+
+#[path = "bitcoin_recovery.rs"]
+pub(super) mod bitcoin_recovery;
+use bitcoin_recovery::BitcoinRecoveryRecord;
+pub use bitcoin_recovery::BitcoinRecoveryRequest;
+
+#[path = "rgb_fee_recovery.rs"]
+mod rgb_fee_recovery;
+pub use rgb_fee_recovery::{RgbFeeRecoveryPrepared, RgbFeeRecoveryRequest};
+
 #[path = "wallet_transfer.rs"]
 mod wallet_transfer;
-pub use wallet_transfer::WalletRgbSendRequest;
 use wallet_transfer::WalletTransferBinding;
+pub use wallet_transfer::{WalletRgbRecoveryBinding, WalletRgbSendRequest};
+
+#[path = "rgb_input_observation.rs"]
+mod rgb_input_observation;
+
+#[path = "asset_spend.rs"]
+mod asset_spend;
+pub use asset_spend::{AssetSpendInput, AssetSpendView};
+
+#[path = "collaborative_partial.rs"]
+pub(super) mod collaborative_partial;
+pub use collaborative_partial::CollaborativePartialRequest;
+use collaborative_partial::PartialSigningRecord;
+
+#[path = "incoming_conflict.rs"]
+pub(super) mod incoming_conflict;
+pub use incoming_conflict::IncomingRgbConflict;
+
+#[path = "external_receive.rs"]
+pub(super) mod external_receive;
+use external_receive::ExternalReceiveOriginal;
 
 const SCHEMAS_SUPPORTING_INFLATION: [database::enums::AssetSchema; 1] = [AssetSchema::Ifa];
 
@@ -184,6 +217,9 @@ pub(crate) struct InfoAssetTransfer {
 /// In-memory storage for transfer artifacts (replaces filesystem directories).
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub(crate) struct TransferArtifacts {
+    /// One exact Native Bitcoin self-recovery, held before signing/dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) bitcoin_recovery: Option<BitcoinRecoveryRecord>,
     pub(crate) batch_info: Option<InfoBatchTransfer>,
     pub(crate) asset_infos: BTreeMap<String, InfoAssetTransfer>,
     pub(crate) consignment_bytes: HashMap<String, Vec<u8>>,
@@ -192,6 +228,12 @@ pub(crate) struct TransferArtifacts {
     /// the prepared operation survives a reload/reopen before finalisation.
     #[serde(default)]
     pub(crate) external_send: Option<ExternalSendArtifact>,
+    /// One native signing attempt and exact original partial, never a balance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) partial_signing: Option<PartialSigningRecord>,
+    /// Validated original incoming proof, durably retained before approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) external_receive: Option<ExternalReceiveOriginal>,
 }
 
 /// Durable lifecycle state of an externally constructed RGB send.
@@ -236,6 +278,9 @@ pub(crate) struct ExternalSendArtifact {
     /// has no such binding and cannot enter the ordinary-send lifecycle.
     #[serde(default)]
     pub(crate) wallet_transfer: Option<WalletTransferBinding>,
+    /// Any restored pending external original must not mint a new partial.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) restored_for_partial: bool,
 }
 
 /// Stable result of preparing an externally constructed RGB send.
@@ -361,21 +406,34 @@ impl Indexer {
     pub(crate) async fn get_tx_confirmations(&self, txid: &str) -> Result<Option<u64>, Error> {
         Ok(match self {
             Indexer::EsploraAsync(client) => {
-                let txid = Txid::from_str(txid).unwrap();
-                let tx_status = client
+                let txid = Txid::from_str(txid).map_err(|_| Error::InvalidTxid)?;
+                // A missing transaction returns None. Its status endpoint may
+                // return 404, so requesting status first makes missing originals
+                // impossible to reconcile through this documented API.
+                let Some(transaction) = client.get_tx(&txid).await.map_err(IndexerError::from)?
+                else {
+                    return Ok(None);
+                };
+                if transaction.compute_txid() != txid {
+                    return Err(Error::InvalidConsignment);
+                }
+                let status = client
                     .get_tx_status(&txid)
                     .await
                     .map_err(IndexerError::from)?;
-                if let Some(tx_height) = tx_status.block_height {
+                if status.confirmed {
+                    let tx_height = status
+                        .block_height
+                        .filter(|h| *h > 0)
+                        .ok_or(Error::InvalidConsignment)?;
                     let height = client.get_height().await.map_err(IndexerError::from)?;
-                    Some((height - tx_height + 1) as u64)
-                } else if client
-                    .get_tx(&txid)
-                    .await
-                    .map_err(IndexerError::from)?
-                    .is_none()
-                {
-                    None
+                    Some(
+                        u64::from(
+                            height
+                                .checked_sub(tx_height)
+                                .ok_or(Error::InvalidConsignment)?,
+                        ) + 1,
+                    )
                 } else {
                     Some(0)
                 }
@@ -830,6 +888,25 @@ impl Wallet {
         lock_time: Option<u32>,
     ) -> Result<(Psbt, Option<BtcChange>), Error> {
         let change_addr = self.get_new_address()?.script_pubkey();
+        self.prepare_psbt_with_change(
+            input_outpoints,
+            witness_recipients,
+            fee_rate,
+            lock_time,
+            change_addr,
+        )
+    }
+
+    /// Same established BDK/RGB construction, with an explicitly owned change
+    /// descriptor chosen by the managed ordinary-transfer caller.
+    fn prepare_psbt_with_change(
+        &mut self,
+        input_outpoints: HashSet<BdkOutPoint>,
+        witness_recipients: &Vec<(ScriptBuf, u64)>,
+        fee_rate: FeeRate,
+        lock_time: Option<u32>,
+        change_addr: ScriptBuf,
+    ) -> Result<(Psbt, Option<BtcChange>), Error> {
         let mut builder = self.bdk_wallet.build_tx();
         builder
             .add_data(&[0; 32])
@@ -1657,7 +1734,12 @@ impl Wallet {
             .iter()
             .map(|i| i.previous_output)
             .collect();
-        let data = self.database.get_db_data(false)?;
+        let mut data = self.database.get_db_data(false)?;
+        if let Some(binding) = &wallet_transfer {
+            let request: WalletRgbSendRequest = serde_json::from_str(&binding.request_json)
+                .map_err(|_| Error::InvalidRecipientMap)?;
+            data = self.wallet_rgb_recovery_db_view(data, &request)?;
+        }
         let utxos = self.database.get_unspent_txos(data.txos.clone())?;
         let available = self.database.get_rgb_allocations(
             utxos,
@@ -2007,6 +2089,7 @@ impl Wallet {
                     status: ExternalSendStatus::Prepared,
                     conflict_txid: None,
                     wallet_transfer,
+                    restored_for_partial: false,
                 }),
                 ..Default::default()
             },
@@ -2909,6 +2992,16 @@ impl Wallet {
             self.logger,
             "Refusing invalid consignment for {recipient_id}"
         );
+        // A retained collaborative original cannot be failed or replaced by a
+        // proxy response. Keep it for explicit reconciliation instead.
+        if self.transfer_artifacts.values().any(|a| {
+            a.external_receive
+                .as_ref()
+                .is_some_and(|r| r.recipient_id == recipient_id)
+        }) {
+            return Err(Error::InvalidConsignment);
+        }
+
         match self
             .wasm_proxy_client
             .post_ack(&proxy_url, recipient_id, false)
@@ -2984,50 +3077,96 @@ impl Wallet {
             .expect("transfer should have a recipient ID");
         debug!(self.logger, "Recipient ID: {recipient_id}");
 
-        // check if a consignment has been posted
-        let tte_data = self
-            .database
-            .get_transfer_transport_endpoints_data(transfer.idx)?;
-        if let Some(updated_transfer) =
-            self._fail_batch_transfer_if_no_endpoints(batch_transfer, &tte_data)?
+        let retained = self.transfer_artifacts.iter().find_map(|(id, a)| {
+            a.external_receive
+                .as_ref()
+                .filter(|r| r.recipient_id == recipient_id)
+                .map(|r| (id.clone(), a.clone(), r.clone()))
+        });
+        let retained_source = retained.is_some();
+        let (consignment, proxy_url, txid, vout) = if let Some((id, artifact, original)) = retained
         {
-            return Ok(Some(updated_transfer));
-        }
-        let mut proxy_res = None;
-        for (transfer_transport_endpoint, transport_endpoint) in tte_data {
-            let result = match self
-                ._get_consignment_async(&transport_endpoint.endpoint, recipient_id.clone())
-                .await
+            external_receive::validate_original(&id, &artifact, db_data)?;
+            if self.bitcoin_network() != BitcoinNetwork::Regtest
+                || original.batch_transfer_idx != batch_transfer.idx
             {
-                Err(Error::NoConsignment) => {
-                    info!(
-                        self.logger,
-                        "Skipping transport endpoint: {:?}", &transport_endpoint
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-                Ok(r) => r,
-            };
-
-            proxy_res = Some((
-                result.consignment,
-                transport_endpoint.endpoint,
-                result.txid,
-                result.vout,
-            ));
-            let mut updated_transfer_transport_endpoint: DbTransferTransportEndpointActMod =
-                transfer_transport_endpoint.into();
-            updated_transfer_transport_endpoint.used = ActiveValue::Set(true);
-            self.database
-                .update_transfer_transport_endpoint(&mut updated_transfer_transport_endpoint)?;
-            break;
-        }
-
-        let (consignment, proxy_url, txid, vout) = if let Some(res) = proxy_res {
-            (res.0, res.1, res.2, res.3)
+                return Err(Error::InvalidConsignment);
+            }
+            // No balance/coloring/ACK is created from an unconfirmed proposal.
+            // Indexer failure, absence and a mempool observation retain it.
+            if self
+                .indexer()
+                .get_tx_confirmations(&id)
+                .await?
+                .is_none_or(|n| n < u64::from(batch_transfer.min_confirmations.max(1)))
+            {
+                return Ok(None);
+            }
+            let bytes = artifact
+                .consignment_bytes
+                .get(&original.contract_id)
+                .ok_or(Error::InvalidConsignment)?;
+            self.validate_external_transfer_ancestry(bytes, id.clone())
+                .await?;
+            let facts =
+                self.inspect_external_transfer(bytes, id.clone(), original.contract_id.clone())?;
+            if facts["allocations"][original.vout.to_string()].as_str()
+                != Some(original.amount.as_str())
+            {
+                return Err(Error::InvalidConsignment);
+            }
+            (
+                general_purpose::STANDARD.encode(bytes),
+                String::new(),
+                id,
+                Some(original.vout),
+            )
         } else {
-            return Ok(None);
+            // check if a consignment has been posted
+            let tte_data = self
+                .database
+                .get_transfer_transport_endpoints_data(transfer.idx)?;
+            if let Some(updated_transfer) =
+                self._fail_batch_transfer_if_no_endpoints(batch_transfer, &tte_data)?
+            {
+                return Ok(Some(updated_transfer));
+            }
+            let mut proxy_res = None;
+            for (transfer_transport_endpoint, transport_endpoint) in tte_data {
+                let result = match self
+                    ._get_consignment_async(&transport_endpoint.endpoint, recipient_id.clone())
+                    .await
+                {
+                    Err(Error::NoConsignment) => {
+                        info!(
+                            self.logger,
+                            "Skipping transport endpoint: {:?}", &transport_endpoint
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                    Ok(r) => r,
+                };
+
+                proxy_res = Some((
+                    result.consignment,
+                    transport_endpoint.endpoint,
+                    result.txid,
+                    result.vout,
+                ));
+                let mut updated_transfer_transport_endpoint: DbTransferTransportEndpointActMod =
+                    transfer_transport_endpoint.into();
+                updated_transfer_transport_endpoint.used = ActiveValue::Set(true);
+                self.database
+                    .update_transfer_transport_endpoint(&mut updated_transfer_transport_endpoint)?;
+                break;
+            }
+
+            if let Some(res) = proxy_res {
+                (res.0, res.1, res.2, res.3)
+            } else {
+                return Ok(None);
+            }
         };
 
         let mut updated_batch_transfer: DbBatchTransferActMod = batch_transfer.clone().into();
@@ -3353,22 +3492,24 @@ impl Wallet {
             "Consignment is valid. Received '{:?}' of contract '{}'", received, asset_id
         );
 
-        match self
-            .wasm_proxy_client
-            .post_ack(&proxy_url, recipient_id, true)
-            .await
-        {
-            Ok(r) => {
-                debug!(self.logger, "Consignment ACK response: {:?}", r);
-            }
-            Err(e) if e.to_string().contains("Cannot change ACK") => {
-                warn!(self.logger, "Found an NACK when trying ACK");
-            }
-            Err(e) => {
-                error!(self.logger, "Failed to post ACK: {e}");
-                return Err(e);
-            }
-        };
+        if !retained_source {
+            match self
+                .wasm_proxy_client
+                .post_ack(&proxy_url, recipient_id, true)
+                .await
+            {
+                Ok(r) => {
+                    debug!(self.logger, "Consignment ACK response: {:?}", r);
+                }
+                Err(e) if e.to_string().contains("Cannot change ACK") => {
+                    warn!(self.logger, "Found an NACK when trying ACK");
+                }
+                Err(e) => {
+                    error!(self.logger, "Failed to post ACK: {e}");
+                    return Err(e);
+                }
+            };
+        }
 
         let utxo_idx = match transfer.recipient_type {
             Some(RecipientTypeFull::Blind { ref unblinded_utxo }) => {
@@ -3530,6 +3671,11 @@ impl Wallet {
                 return Ok(None);
             }
         } else {
+            if incoming {
+                return self
+                    .reconcile_incoming_witness_conflict(batch_transfer, db_data)
+                    .await;
+            }
             return Ok(None);
         }
 
@@ -3753,6 +3899,19 @@ impl Wallet {
             Err(e) => Err(e),
             Ok(v) => Ok(v),
         }?;
+        // A retained original is never classified by a timer or missing reply.
+        let retained = self.transfer_artifacts.values().any(|a| {
+            a.external_receive
+                .as_ref()
+                .is_some_and(|r| r.batch_transfer_idx == batch_transfer.idx)
+        });
+        if retained && updated_batch_transfer.is_none() {
+            return if throw_err {
+                Err(Error::CannotFailBatchTransfer)
+            } else {
+                Ok(())
+            };
+        }
         // fail transfer if the status didn't change after a refresh
         if updated_batch_transfer.is_none() {
             self._fail_batch_transfer(batch_transfer)?;

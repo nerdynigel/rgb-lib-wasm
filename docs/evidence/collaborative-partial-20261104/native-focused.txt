@@ -1,0 +1,11 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-safe-bitcoin-20261103)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.76s
+     Running unittests src/lib.rs (target/debug/deps/rgb_lib_wasm-f6780f344ba8f335)
+
+running 3 tests
+test wallet::online::collaborative_partial::tests::actual_two_keychain_inputs_sign_all_own_and_no_foreign_inputs ... ok
+test wallet::online::collaborative_partial::tests::wrong_network_expiry_missing_or_foreign_owned_set_never_signs ... ok
+test wallet::online::collaborative_partial::tests::one_attempt_and_original_bytes_survive_serialization_without_new_signature ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 199 filtered out; finished in 0.90s
+
