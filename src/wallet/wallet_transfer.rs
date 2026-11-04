@@ -997,7 +997,7 @@ impl Wallet {
         }
         self._restore_missing_bdk_inputs(&inputs).await?;
         let safe_fee_points = self
-            .bitcoin_spend_view()?
+            .bitcoin_rgb_recovery_fee_view(&request)?
             .inputs
             .into_iter()
             .map(|u| OutPoint::from_str(&u.outpoint).map_err(|_| invalid()))

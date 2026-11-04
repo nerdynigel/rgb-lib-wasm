@@ -63,6 +63,10 @@ fn graph(
 }
 
 fn fixture() -> (Wallet, WalletRgbSendRequest, String, Vec<OutPoint>) {
+    fixture_with_fee(false)
+}
+
+fn fixture_with_fee(with_fee: bool) -> (Wallet, WalletRgbSendRequest, String, Vec<OutPoint>) {
     let mut w = wallet();
     let p = vec![
         coin(&mut w, KeychainKind::External, 1000, true, false),
@@ -139,9 +143,13 @@ fn fixture() -> (Wallet, WalletRgbSendRequest, String, Vec<OutPoint>) {
         })
         .unwrap();
     let original_destination = w._get_new_address(KeychainKind::External).unwrap();
+    let mut original_inputs = p.clone();
+    if with_fee {
+        original_inputs.push(coin(&mut w, KeychainKind::Internal, 100_000, true, false));
+    }
     let mut builder = w.bdk_wallet.build_tx();
     builder
-        .add_utxos(&p)
+        .add_utxos(&original_inputs)
         .unwrap()
         .manually_selected_only()
         .add_recipient(
@@ -261,7 +269,126 @@ fn fixture() -> (Wallet, WalletRgbSendRequest, String, Vec<OutPoint>) {
             max_fee_sats: 1000,
         }),
     };
-    (w, request, original, p)
+    (w, request, original, original_inputs)
+}
+
+#[test]
+fn original_bound_fee_selection_preserves_every_hold_and_refuses_unrelated_spending() {
+    let (w, r, original, points) = fixture_with_fee(true);
+    let before = serde_json::to_vec(w.database.as_ref()).unwrap();
+    let artifacts = serde_json::to_vec(&w.transfer_artifacts).unwrap();
+    assert_eq!(w.bitcoin_spend_view().unwrap().total_sats, "0");
+    let view = w.bitcoin_rgb_recovery_fee_view(&r).unwrap();
+    assert_eq!(view.total_sats, "100000");
+    assert_eq!(view.inputs.len(), 1);
+    assert_eq!(view.inputs[0].outpoint, points[2].to_string());
+    assert_eq!(w.bitcoin_spend_view().unwrap().total_sats, "0");
+    assert!(
+        w.managed_rgb_input_holds(None)
+            .unwrap()
+            .contains(&points[2])
+    );
+    assert_eq!(serde_json::to_vec(w.database.as_ref()).unwrap(), before);
+    assert_eq!(
+        serde_json::to_vec(&w.transfer_artifacts).unwrap(),
+        artifacts
+    );
+    let mut changed = r;
+    changed
+        .recovery_of
+        .as_mut()
+        .unwrap()
+        .original_signed_transaction_sha256 = "ee".repeat(32);
+    assert!(w.bitcoin_rgb_recovery_fee_view(&changed).is_err());
+    assert_eq!(
+        w.bitcoin_rgb_fee_inputs(
+            &serde_json::from_str::<WalletRgbSendRequest>(
+                &w.transfer_artifacts[&original]
+                    .external_send
+                    .as_ref()
+                    .unwrap()
+                    .wallet_transfer
+                    .as_ref()
+                    .unwrap()
+                    .request_json
+            )
+            .unwrap()
+            .operation_id
+        )
+        .unwrap()
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn source_and_child_keep_exact_fee_evidence_but_never_exempt_a_third_hold() {
+    let (mut w, mut r, original, points) = fixture_with_fee(true);
+    let recipient = XChainNet::<Beneficiary>::from_str(&r.recipient_id)
+        .unwrap()
+        .into_inner();
+    let Beneficiary::WitnessVout(pay_to, None) = recipient else {
+        panic!("own witness required")
+    };
+    let mut builder = w.bdk_wallet.build_tx();
+    builder
+        .add_utxos(&points)
+        .unwrap()
+        .manually_selected_only()
+        .add_recipient(pay_to.to_script(), BdkAmount::from_sat(1000))
+        .add_data(&bitcoin::script::PushBytesBuf::try_from(vec![9u8; 32]).unwrap())
+        .fee_absolute(BdkAmount::from_sat(1000));
+    let psbt = builder.finish().unwrap();
+    w.check_wallet_rgb_recovery_transaction(&r, &psbt).unwrap();
+    let (child, _) = retain_external(&mut w, &psbt, true);
+    w.transfer_artifacts
+        .get_mut(&child)
+        .unwrap()
+        .external_send
+        .as_mut()
+        .unwrap()
+        .wallet_transfer = Some(validate_request(&mut r).unwrap().binding);
+    assert_eq!(
+        w.wallet_rgb_recovery_peer_for_tx(&original).unwrap(),
+        Some(child.clone())
+    );
+    assert_eq!(
+        w.wallet_rgb_recovery_peer_for_tx(&child).unwrap(),
+        Some(original.clone())
+    );
+    let old_operation = r
+        .recovery_of
+        .as_ref()
+        .unwrap()
+        .original_operation_id
+        .clone();
+    assert_eq!(
+        w.bitcoin_rgb_fee_inputs(&old_operation).unwrap()[0].outpoint,
+        points[2].to_string()
+    );
+    assert_eq!(
+        w.bitcoin_rgb_fee_inputs(&r.operation_id).unwrap()[0].outpoint,
+        points[2].to_string()
+    );
+    assert_eq!(w.bitcoin_spend_view().unwrap().total_sats, "0");
+    w.check_wallet_rgb_recovery_transaction(&r, &psbt).unwrap();
+    let mut builder = w.bdk_wallet.build_tx();
+    builder
+        .add_utxo(points[2])
+        .unwrap()
+        .manually_selected_only()
+        .add_recipient(pay_to.to_script(), BdkAmount::from_sat(1000))
+        .fee_absolute(BdkAmount::from_sat(1000));
+    let third = builder.finish().unwrap();
+    retain_external(&mut w, &third, false);
+    assert!(w.bitcoin_rgb_fee_inputs(&old_operation).unwrap().is_empty());
+    assert!(
+        w.bitcoin_rgb_fee_inputs(&r.operation_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(w.check_wallet_rgb_recovery_transaction(&r, &psbt).is_err());
+    assert_eq!(w.bitcoin_spend_view().unwrap().total_sats, "0");
 }
 
 #[test]

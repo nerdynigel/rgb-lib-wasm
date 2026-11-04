@@ -84,7 +84,7 @@ impl Wallet {
         Ok((id, art, request, signed))
     }
 
-    pub(super) fn checked_wallet_rgb_recovery_source(
+    pub(in crate::wallet::online) fn checked_wallet_rgb_recovery_source(
         &self,
         request: &WalletRgbSendRequest,
     ) -> Result<Option<String>, Error> {
@@ -223,6 +223,50 @@ impl Wallet {
         self.checked_wallet_rgb_recovery_source(&request)
     }
 
+    /// The source and its single explicitly bound child may read their shared
+    /// fee evidence without making those coins available to ordinary spending.
+    /// Check both directions: reviewing the old signed original remains needed
+    /// while its new child is prepared. Never omit a third/unrelated hold.
+    pub(in crate::wallet::online) fn wallet_rgb_recovery_peer_for_tx(
+        &self,
+        txid: &str,
+    ) -> Result<Option<String>, Error> {
+        if self.transfer_artifacts.len() > 4096 {
+            return Err(invalid());
+        }
+        if let Some(source) = self.wallet_rgb_recovery_source_for_tx(txid)? {
+            return Ok(Some(source));
+        }
+        let mut peer = None;
+        for (candidate, artifacts) in &self.transfer_artifacts {
+            let Some(external) = &artifacts.external_send else {
+                continue;
+            };
+            let Some(binding) = &external.wallet_transfer else {
+                continue;
+            };
+            let request: WalletRgbSendRequest =
+                serde_json::from_str(&binding.request_json).map_err(|_| invalid())?;
+            if external.status == ExternalSendStatus::Cancelled
+                || request
+                    .recovery_of
+                    .as_ref()
+                    .is_none_or(|source| source.original_txid != txid)
+            {
+                continue;
+            }
+            if self
+                .checked_wallet_rgb_recovery_source(&request)?
+                .as_deref()
+                != Some(txid)
+                || peer.replace(candidate.clone()).is_some()
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(peer)
+    }
+
     /// View only: omit reservations of the exact unconsumed source proposal.
     /// No database row, Stock state, original artifact or input hold is changed.
     pub(in crate::wallet::online) fn wallet_rgb_recovery_db_view(
@@ -310,7 +354,7 @@ impl Wallet {
         {
             self.bitcoin_rgb_fee_inputs(&request.operation_id)?
         } else {
-            self.bitcoin_spend_view()?.inputs
+            self.bitcoin_rgb_recovery_fee_view(request)?.inputs
         };
         for (input, details) in psbt.unsigned_tx.input.iter().zip(&psbt.inputs) {
             let coin = coins

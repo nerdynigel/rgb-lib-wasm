@@ -1,0 +1,10 @@
+{
+  "source-fee-native-tests.log": {
+    "sha256": "69e7a77b41fdf1dc63a437618991dfd4f2cf34a35d0b88439644765e0d2cfd75",
+    "bytes": 8624
+  },
+  "source-fee-native-tests-final.log": {
+    "sha256": "412068042c76543f7be1aeea2845ed31393d7166f995113f39e8f6d0588c1b28",
+    "bytes": 420
+  }
+}
