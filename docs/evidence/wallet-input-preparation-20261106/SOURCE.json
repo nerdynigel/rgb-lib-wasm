@@ -1,0 +1,20 @@
+{
+  "parent": "77fe3294fffeb9026b1728754f55254c6ced6e4f",
+  "branch": "feat/asm-wallet-input-preparation-20261106",
+  "source": {
+    "src/wallet/rgb_input_preparation.rs": "bbeae0fc56f1d9df27acdc627a72143b7acefcf5df6a604708328065fff51482",
+    "src/wallet/wallet_transfer.rs": "28b082e6f4682dabc1f8b7778f5195d41b0c55f2fc0f079e1834d4d1b5cb2b3d",
+    "src/wallet/online.rs": "d4d42f8e586d0095d3c4d947b64999315b5c7071ad80418ef9187839ed82f526",
+    "src/wallet/safe_bitcoin.rs": "a28392256e1ebada6b3fcda589eab00acebbf3d5128c1b57cfc7c42e3050e72e",
+    "src/wallet/rgb_asset_recovery_tests.rs": "05fd464872672caee727f2f5bbf9e8106c57903a87f098e23d39fbf3657738dd",
+    "src/wallet/rgb_fee_recovery_tests.rs": "c33c6890e87c04703f23dff84fc75db846a164ba9638836d5c495d63c1857c55"
+  },
+  "library_tests_passed": 233,
+  "new_security_tests": 7,
+  "strict_library_clippy": "PASS",
+  "locked_wasm_library_check": "PASS",
+  "shared_market_wire_changed": false,
+  "dependencies_changed": false,
+  "deployed": false,
+  "funded_preparation_or_three_maker_acceptance": false
+}

@@ -929,6 +929,7 @@ pub(super) mod tests {
                 excluded_inputs: vec![],
                 expires_at: 1,
                 recovery_of: None,
+                input_preparation: None,
             })
             .unwrap(),
             signing_attempted: false,

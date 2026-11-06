@@ -176,6 +176,7 @@ fn fixture_with_fee(with_fee: bool) -> (Wallet, WalletRgbSendRequest, String, Ve
         excluded_inputs: vec![],
         expires_at: 1,
         recovery_of: None,
+        input_preparation: None,
     };
     let old_binding = validate_request(&mut old).unwrap().binding;
     let mut signed = psbt;
@@ -268,6 +269,7 @@ fn fixture_with_fee(with_fee: bool) -> (Wallet, WalletRgbSendRequest, String, Ve
             original_signed_transaction_sha256: signed_digest,
             max_fee_sats: 1000,
         }),
+        input_preparation: None,
     };
     (w, request, original, original_inputs)
 }

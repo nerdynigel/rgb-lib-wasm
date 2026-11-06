@@ -7,6 +7,10 @@ use serde::{Deserializer, Serializer};
 mod asset_recovery;
 pub use asset_recovery::WalletRgbRecoveryBinding;
 
+#[path = "rgb_input_preparation.rs"]
+mod input_preparation;
+pub use input_preparation::{WalletRgbInputPreparation, WalletRgbPreparationOutput};
+
 /// Explicit, bounded parameters for one ordinary REGTEST NIA transfer.
 /// Amounts serialize as integer strings at the SDK boundary.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -43,6 +47,10 @@ pub struct WalletRgbSendRequest {
     /// recovery entry point may create it; older request readers fail closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_of: Option<WalletRgbRecoveryBinding>,
+    /// Explicit wallet-owned input preparation. The ordinary-send entry point
+    /// refuses this additive purpose; old serialized requests stay byte-exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_preparation: Option<WalletRgbInputPreparation>,
 }
 
 mod integer_string {
@@ -86,6 +94,7 @@ struct ValidatedRequest {
     script: ScriptBuf,
     contract: ContractId,
     excluded: HashSet<OutPoint>,
+    additional: Vec<input_preparation::ValidatedOutput>,
 }
 
 fn invalid() -> Error {
@@ -158,6 +167,7 @@ fn validate_request(r: &mut WalletRgbSendRequest) -> Result<ValidatedRequest, Er
         }
     }
     r.excluded_inputs.sort();
+    let additional = input_preparation::validate_additional(r)?;
     let request_json = serde_json::to_string(r).map_err(InternalError::from)?;
     if request_json.len() > 65_536 {
         return Err(invalid());
@@ -182,6 +192,7 @@ fn validate_request(r: &mut WalletRgbSendRequest) -> Result<ValidatedRequest, Er
         script: pay_to.to_script(),
         contract,
         excluded,
+        additional,
     })
 }
 
@@ -195,7 +206,11 @@ impl Wallet {
         let mut request: WalletRgbSendRequest =
             serde_json::from_str(&binding.request_json).map_err(|_| invalid())?;
         validate_request(&mut request)?;
-        self.external_rgb_original_input_units(txid, &request.asset_id, request.amount)
+        self.external_rgb_original_input_units(
+            txid,
+            &request.asset_id,
+            input_preparation::requested_units(&request)?,
+        )
     }
 
     pub(super) fn external_rgb_original_input_units(
@@ -523,6 +538,7 @@ impl Wallet {
             return Err(conflict());
         }
         self.check_wallet_rgb_recovery_transaction(&request, &psbt)?;
+        self.check_wallet_rgb_input_preparation(&request, Some(&psbt))?;
         Ok((txid.clone(), psbt, request.expires_at))
     }
 
@@ -643,6 +659,7 @@ impl Wallet {
         }
         let signed = Psbt::from_str(expected_signed_psbt)?;
         self.check_wallet_rgb_recovery_transaction(&request, &signed)?;
+        self.check_wallet_rgb_input_preparation(&request, Some(&signed))?;
         if Self::tx_stripped_hex_from_unsigned(&signed.unsigned_tx) != external.expected_tx_hex {
             return Err(conflict());
         }
@@ -884,7 +901,7 @@ impl Wallet {
         online: Online,
         request: WalletRgbSendRequest,
     ) -> Result<ExternalSendPrepareResult, Error> {
-        if request.recovery_of.is_some() {
+        if request.recovery_of.is_some() || request.input_preparation.is_some() {
             return Err(invalid());
         }
         self.prepare_wallet_rgb_send_inner(online, request).await
@@ -900,6 +917,8 @@ impl Wallet {
         }
         self.check_online(online.clone())?;
         let mut valid = validate_request(&mut request)?;
+        self.check_wallet_rgb_input_preparation(&request, None)?;
+        let requested_units = input_preparation::requested_units(&request)?;
         if let Some((txid, _)) = self.wallet_transfer_by_operation(&request.operation_id)? {
             let txid = txid.clone();
             let art = self.transfer_artifacts[&txid]
@@ -982,7 +1001,7 @@ impl Wallet {
         let spend = self._select_rgb_inputs(
             request.asset_id.clone(),
             &AssignmentsCollection {
-                fungible: request.amount,
+                fungible: requested_units,
                 ..Default::default()
             },
             unspents,
@@ -1018,9 +1037,16 @@ impl Wallet {
         let remainder = spend
             .assignments_collected
             .fungible
-            .checked_sub(request.amount)
+            .checked_sub(requested_units)
             .ok_or_else(invalid)?;
         let mut outputs = vec![(valid.script, request.witness_sats)];
+        outputs.extend(
+            valid
+                .additional
+                .iter()
+                .map(|output| (output.script.clone(), output.witness_sats)),
+        );
+        let recipient_count = outputs.len();
         if remainder > 0 {
             // Keep only an explicit carrier with RGB change. Ordinary Bitcoin
             // change must not become trapped inside that asset assignment.
@@ -1098,13 +1124,35 @@ impl Wallet {
         );
         let mut output_map =
             HashMap::from([(1u32.checked_sub(shift).ok_or_else(invalid)?, request.amount)]);
-        if remainder > 0 {
-            if psbt.unsigned_tx.output.get(2).is_none_or(|o| {
-                o.script_pubkey != outputs[1].0 || o.value.to_sat() != request.witness_sats
+        for (index, output) in valid.additional.iter().enumerate() {
+            let vout = u32::try_from(index + 2).map_err(|_| invalid())?;
+            if psbt.unsigned_tx.output.get(index + 2).is_none_or(|actual| {
+                actual.script_pubkey != output.script
+                    || actual.value.to_sat() != output.witness_sats
             }) {
                 return Err(invalid());
             }
-            output_map.insert(2u32.checked_sub(shift).ok_or_else(invalid)?, remainder);
+            output_map.insert(vout.checked_sub(shift).ok_or_else(invalid)?, output.amount);
+        }
+        if remainder > 0 {
+            if psbt
+                .unsigned_tx
+                .output
+                .get(recipient_count + 1)
+                .is_none_or(|o| {
+                    o.script_pubkey != outputs[recipient_count].0
+                        || o.value.to_sat() != request.witness_sats
+                })
+            {
+                return Err(invalid());
+            }
+            output_map.insert(
+                u32::try_from(recipient_count + 1)
+                    .map_err(|_| invalid())?
+                    .checked_sub(shift)
+                    .ok_or_else(invalid)?,
+                remainder,
+            );
         }
         let (fascia, _) = self.color_psbt(
             &mut psbt,
@@ -1121,8 +1169,11 @@ impl Wallet {
             },
         )?;
         self.check_wallet_rgb_recovery_transaction(&request, &psbt)?;
+        self.check_wallet_rgb_input_preparation(&request, Some(&psbt))?;
+        let mut recipients = vec![valid.recipient];
+        recipients.extend(valid.additional.into_iter().map(|output| output.recipient));
         self.prepare_external_rgb_send_bound(
-            HashMap::from([(request.asset_id, vec![valid.recipient])]),
+            HashMap::from([(request.asset_id, recipients)]),
             &psbt,
             &fascia,
             request.min_confirmations,
@@ -1825,6 +1876,7 @@ mod tests {
             ],
             expires_at: 1_800_000_000,
             recovery_of: None,
+            input_preparation: None,
         }
     }
     #[test]

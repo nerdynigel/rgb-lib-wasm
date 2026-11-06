@@ -34,6 +34,7 @@ fn fixture() -> (Wallet, RgbFeeRecoveryRequest, OutPoint, String) {
         excluded_inputs: vec![],
         expires_at: 1,
         recovery_of: None,
+        input_preparation: None,
     };
     let mut signed = original;
     w._sign_psbt(&mut signed, None).unwrap();

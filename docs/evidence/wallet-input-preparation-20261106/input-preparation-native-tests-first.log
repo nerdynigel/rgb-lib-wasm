@@ -1,0 +1,35 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-input-preparation-20261106)
+error[E0618]: expected function, found `offline::Wallet`
+   --> src/wallet/rgb_input_preparation.rs:489:27
+    |
+476 |         let (wallet, request, psbt) = fixture();
+    |              ------ `wallet` has type `offline::Wallet`
+...
+489 |         let mut foreign = wallet();
+    |                           ^^^^^^--
+    |                           |
+    |                           call expression requires function
+    |
+   ::: src/wallet/safe_bitcoin.rs:748:5
+    |
+748 |     pub(in crate::wallet::online) fn wallet() -> Wallet {
+    |     --------------------------------------------------- this function of the same name is available here, but it's shadowed by the local binding
+
+error[E0618]: expected function, found `offline::Wallet`
+   --> src/wallet/rgb_input_preparation.rs:526:84
+    |
+505 |         let (wallet, request, original) = fixture();
+    |              ------ `wallet` has type `offline::Wallet`
+...
+526 |                     changed.unsigned_tx.output.last_mut().unwrap().script_pubkey = wallet()
+    |                                                                                    ^^^^^^--
+    |                                                                                    |
+    |                                                                                    call expression requires function
+    |
+   ::: src/wallet/safe_bitcoin.rs:748:5
+    |
+748 |     pub(in crate::wallet::online) fn wallet() -> Wallet {
+    |     --------------------------------------------------- this function of the same name is available here, but it's shadowed by the local binding
+
+For more information about this error, try `rustc --explain E0618`.
+error: could not compile `rgb-lib-wasm` (lib test) due to 2 previous errors

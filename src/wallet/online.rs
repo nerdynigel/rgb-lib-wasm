@@ -22,7 +22,10 @@ pub use rgb_fee_recovery::{RgbFeeRecoveryPrepared, RgbFeeRecoveryRequest};
 #[path = "wallet_transfer.rs"]
 mod wallet_transfer;
 use wallet_transfer::WalletTransferBinding;
-pub use wallet_transfer::{WalletRgbRecoveryBinding, WalletRgbSendRequest};
+pub use wallet_transfer::{
+    WalletRgbInputPreparation, WalletRgbPreparationOutput, WalletRgbRecoveryBinding,
+    WalletRgbSendRequest,
+};
 
 #[path = "rgb_input_observation.rs"]
 mod rgb_input_observation;

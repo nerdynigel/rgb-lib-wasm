@@ -1,0 +1,12 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-input-preparation-20261106)
+error[E0599]: no method named `is_err_or` found for enum `Result<T, E>` in the current scope
+   --> src/wallet/rgb_input_preparation.rs:200:43
+    |
+200 |                     u64::try_from(expiry).is_err_or(|expiry| expiry < request.expires_at)
+    |                                           ^^^^^^^^^
+    |
+help: there is a method `is_err` with a similar name, but with different arguments
+   --> /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/result.rs:646:4
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `rgb-lib-wasm` (lib test) due to 1 previous error
