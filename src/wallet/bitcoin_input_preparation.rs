@@ -52,6 +52,63 @@ pub(in crate::wallet) mod tests {
     }
 
     #[test]
+    fn exact_original_input_view_is_readonly_keeps_holds_and_excludes_other_free_coins() {
+        let (mut wallet, request, txid) = fixture();
+        coin(&mut wallet, KeychainKind::Internal, 20_000, true, false);
+        assert_eq!(wallet.bitcoin_spend_view().unwrap().total_sats, "20000");
+        let before = serde_json::to_value(&wallet.transfer_artifacts).unwrap();
+        let value = wallet
+            .bitcoin_inputs_view(request.operation_id.clone())
+            .unwrap();
+        assert_eq!(value["txid"], txid);
+        assert_eq!(value["operation_id"], request.operation_id);
+        assert_eq!(value["view"]["total_sats"], "100000");
+        assert_eq!(value["view"]["inputs"].as_array().unwrap().len(), 1);
+        assert_eq!(wallet.bitcoin_spend_view().unwrap().total_sats, "20000");
+        assert_eq!(
+            serde_json::to_value(&wallet.transfer_artifacts).unwrap(),
+            before
+        );
+        for id in ["invalid", "01900000-0000-7000-8000-000000000002"] {
+            assert!(wallet.bitcoin_inputs_view(id.into()).is_err());
+        }
+    }
+
+    #[test]
+    fn exact_original_input_view_never_exempts_another_native_original() {
+        let (mut wallet, request, txid) = fixture();
+        let mut other = wallet.transfer_artifacts[&txid].clone();
+        let record = other.bitcoin_recovery.as_mut().unwrap();
+        let purpose = record.request.input_preparation.as_mut().unwrap();
+        purpose.request.operation_id = "01900000-0000-7000-8000-000000000002".into();
+        purpose.request.output_sats[0] = "4001".into();
+        let target = ScriptBuf::from_hex(&purpose.output_scripts[0]).unwrap();
+        let change = ScriptBuf::from_hex(&purpose.change_script).unwrap();
+        let mut psbt = Psbt::from_str(&record.request.psbt).unwrap();
+        for output in &mut psbt.unsigned_tx.output {
+            if output.script_pubkey == target {
+                output.value += BdkAmount::from_sat(1);
+            }
+            if output.script_pubkey == change {
+                output.value -= BdkAmount::from_sat(1);
+            }
+        }
+        record.request.psbt = psbt.to_string();
+        let other_id = psbt.unsigned_tx.compute_txid().to_string();
+        validate_bitcoin_recovery_artifact(&other_id, &other).unwrap();
+        wallet.transfer_artifacts.insert(other_id, other);
+        let before = serde_json::to_value(&wallet.transfer_artifacts).unwrap();
+        let value = wallet.bitcoin_inputs_view(request.operation_id).unwrap();
+        assert_eq!(value["view"]["inputs"], serde_json::json!([]));
+        assert_eq!(value["view"]["total_sats"], "0");
+        assert_eq!(
+            serde_json::to_value(&wallet.transfer_artifacts).unwrap(),
+            before
+        );
+        assert_eq!(wallet.bitcoin_spend_view().unwrap().total_sats, "0");
+    }
+
+    #[test]
     fn preparation_retains_owned_unsigned_original_and_holds_before_any_signature() {
         let (wallet, request, txid) = fixture();
         let data = wallet.bitcoin_inputs_data(request.operation_id).unwrap();
@@ -680,6 +737,39 @@ impl Wallet {
             .bitcoin_preparation_by_operation(&operation_id)?
             .ok_or_else(refused)?;
         self.bitcoin_recovery_data(txid)
+    }
+
+    /// Current qualification for only this retained original's inputs. The
+    /// existing BDK/DB/Stock view exempts this one original, keeps all other
+    /// holds and excludes spent, immature, unconfirmed or RGB-bearing coins.
+    /// This observation never releases a hold or grants signing authority.
+    pub fn bitcoin_inputs_view(&self, operation_id: String) -> Result<serde_json::Value, Error> {
+        let txid = self
+            .bitcoin_preparation_by_operation(&operation_id)?
+            .ok_or_else(refused)?;
+        let record = self.transfer_artifacts[&txid]
+            .bitcoin_recovery
+            .as_ref()
+            .unwrap();
+        let (_, points, _) = parse_request(&record.request)?;
+        let mut view = self.bitcoin_preparation_input_view(&txid)?;
+        view.inputs.retain(|coin| {
+            points
+                .iter()
+                .any(|point| point.to_string() == coin.outpoint)
+        });
+        view.total_sats = view
+            .inputs
+            .iter()
+            .try_fold(0u64, |sum, coin| {
+                sum.checked_add(integer(&coin.amount_sats)?)
+                    .ok_or_else(refused)
+            })?
+            .to_string();
+        Ok(
+            serde_json::json!({"version":1,"kind":"wallet-bitcoin-input-preparation-inputs",
+            "operation_id":operation_id,"txid":txid,"view":view}),
+        )
     }
 
     /// Sign once through the established durable Native self-payment barrier.

@@ -1,0 +1,13 @@
+{
+  "parent": "39e8301596f98934e699cba8b122916de94230ca",
+  "files": {
+    "src/wallet/bitcoin_input_preparation.rs": "e693dee50033567a2ef735eddce0bd14ff7d2578ec5b502ec36843df03165c76",
+    "src/wallet/safe_bitcoin.rs": "1f837c3dbe53aef00b3d2343f1a15c24d10f5c3b81c6cdd548e1d9061cd82f2c"
+  },
+  "library_tests_passed": 244,
+  "clippy_strict": "PASS",
+  "format": "PASS",
+  "locked_wasm_check": "PASS",
+  "financial_acceptance": false,
+  "deployed": false
+}

@@ -443,6 +443,13 @@ impl Wallet {
         self.bitcoin_spend_view_with_originals(None, Some(txid), None, None)
     }
 
+    pub(super) fn bitcoin_preparation_input_view(
+        &self,
+        txid: &str,
+    ) -> Result<BitcoinSpendView, Error> {
+        self.bitcoin_spend_view_with_originals(None, None, Some(txid), None)
+    }
+
     fn bitcoin_spend_view_with_originals(
         &self,
         own_rgb: Option<&str>,
