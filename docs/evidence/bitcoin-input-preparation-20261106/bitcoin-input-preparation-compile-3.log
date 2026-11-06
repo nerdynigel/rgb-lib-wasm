@@ -1,0 +1,3 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-input-preparation-20261106)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.93s
+  Executable unittests src/lib.rs (/home/nigel/Projects/btcx/.worktrees/asm-rgb-safe-bitcoin-20261103/target/debug/deps/rgb_lib_wasm-f6780f344ba8f335)

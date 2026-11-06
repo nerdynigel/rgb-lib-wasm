@@ -101,7 +101,7 @@ fn invalid() -> Error {
     Error::InvalidRecipientMap
 }
 
-fn valid_operation_id(id: &str) -> bool {
+pub(in crate::wallet::online) fn valid_operation_id(id: &str) -> bool {
     let b = id.as_bytes();
     b.len() == 36
         && b.iter().enumerate().all(|(i, c)| {

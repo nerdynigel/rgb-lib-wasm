@@ -729,6 +729,63 @@ mod tests {
     }
 
     #[test]
+    fn bitcoin_preparation_encrypted_backup_retains_unsigned_original_and_restored_fence() {
+        use super::super::online::bitcoin_recovery::input_preparation::tests::fixture;
+        let (wallet, _, id) = fixture();
+        let payload = WalletBackupPayload {
+            wallet_identity: Some((
+                "regtest".into(),
+                "synthetic-vanilla".into(),
+                "synthetic-colored".into(),
+            )),
+            db: crate::database::memory_db::InMemoryDb::new(),
+            bdk_changeset: None,
+            stock_stash_b64: "stash".into(),
+            stock_state_b64: "state".into(),
+            stock_index_b64: "index".into(),
+            reuse_address_index: Default::default(),
+            transfer_artifacts: wallet.transfer_artifacts,
+            received_consignments: Default::default(),
+            incoming_conflicts: Default::default(),
+        };
+        let encoded =
+            serde_json::to_vec(&serde_json::json!({"version":7,"wallet_state":payload})).unwrap();
+        let (ciphertext, public) =
+            encrypt_payload(&encoded, "synthetic-preparation-backup").unwrap();
+        assert!(decrypt_payload(&ciphertext, "wrong-password", &public).is_err());
+        let plaintext =
+            decrypt_payload(&ciphertext, "synthetic-preparation-backup", &public).unwrap();
+        let mut restored = decode_wallet_payload(&plaintext, Some(7)).unwrap();
+        let original = restored.transfer_artifacts[&id]
+            .bitcoin_recovery
+            .as_ref()
+            .unwrap()
+            .request
+            .clone();
+        fence_restored_pending_transfers(&mut restored.transfer_artifacts);
+        let record = restored.transfer_artifacts[&id]
+            .bitcoin_recovery
+            .as_ref()
+            .unwrap();
+        assert!(record.restored);
+        assert!(!record.attempted && !record.broadcast_attempted && !record.cancelled);
+        assert_eq!(record.request, original);
+        assert!(
+            !super::super::online::bitcoin_recovery::retained_bitcoin_recovery_inputs(&id, record)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(restored.transfer_artifacts[&id].signed_psbt.is_none());
+        for version in [2, 3, 4, 5, 6] {
+            let mut bad: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            bad["version"] = serde_json::json!(version);
+            assert!(
+                decode_wallet_payload(&serde_json::to_vec(&bad).unwrap(), Some(version)).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn bitcoin_recovery_backup_v7_preserves_exact_original_and_fences_restored_attempts() {
         use super::super::online::{
             TransferArtifacts,
@@ -741,6 +798,7 @@ mod tests {
         let artifact = TransferArtifacts {
             bitcoin_recovery: Some(BitcoinRecoveryRecord {
                 request: request.clone(),
+                cancelled: false,
                 attempted: true,
                 broadcast_attempted: true,
                 restored: false,

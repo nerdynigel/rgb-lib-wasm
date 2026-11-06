@@ -587,6 +587,24 @@ impl Wallet {
         signed: bool,
         own_bitcoin: Option<&str>,
     ) -> Result<Psbt, Error> {
+        let maximum_outputs = own_bitcoin
+            .and_then(|txid| self.transfer_artifacts.get(txid))
+            .and_then(|artifact| artifact.bitcoin_recovery.as_ref())
+            .and_then(|record| record.request.input_preparation.as_ref())
+            .map_or(2, |preparation| preparation.request.output_sats.len() + 1);
+        self.checked_bitcoin_psbt_with_output_limit(encoded, signed, own_bitcoin, maximum_outputs)
+    }
+
+    pub(in crate::wallet::online) fn checked_bitcoin_psbt_with_output_limit(
+        &self,
+        encoded: &str,
+        signed: bool,
+        own_bitcoin: Option<&str>,
+        maximum_outputs: usize,
+    ) -> Result<Psbt, Error> {
+        if !(1..=9).contains(&maximum_outputs) {
+            return Err(refused());
+        }
         if encoded.is_empty() || encoded.len() > 180_000 {
             return Err(refused());
         }
@@ -595,7 +613,7 @@ impl Wallet {
             || psbt.inputs.len() > MAX_PSBT_INPUTS
             || psbt.inputs.len() != psbt.unsigned_tx.input.len()
             || psbt.unsigned_tx.output.is_empty()
-            || psbt.unsigned_tx.output.len() > 2
+            || psbt.unsigned_tx.output.len() > maximum_outputs
             || psbt
                 .unsigned_tx
                 .output

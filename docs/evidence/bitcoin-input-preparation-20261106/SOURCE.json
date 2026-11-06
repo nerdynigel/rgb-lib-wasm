@@ -1,0 +1,23 @@
+{
+  "parent": "332f6a360deffd35bfd98964784479ec97f65045",
+  "branch": "feat/asm-wallet-input-preparation-20261106",
+  "files": {
+    "src/wallet/backup.rs": "91d39c42d583c9f337008c67f6f203dd8894ed8b56043ff89bda6451c8556306",
+    "src/wallet/bitcoin_recovery.rs": "81db587ef7517b477787589a30e8055a72907a3df60a4b613c53d14bad260c45",
+    "src/wallet/bitcoin_recovery_tests.rs": "5289eb0f025359b12107941d957470d18d157598253d2f72ff8c6b3d0f0589cd",
+    "src/wallet/idb_store.rs": "6bdab160901d432c0f73f3acce35ab2d0c2842e484fe0cf053a751a73bb127fe",
+    "src/wallet/online.rs": "cfaf057fe37bea565ab91caf87cc8b106ee3147e657a34ae315b8081d88e5805",
+    "src/wallet/safe_bitcoin.rs": "15697a5973c2d8e6b73ceb6b39d87435b7bc9e1377232b57e567bbb699463633",
+    "src/wallet/wallet_transfer.rs": "dc722d76fd7aeefc2b259069de78170c0364d7331d6e7743dd59d43f00e152e6",
+    "src/wallet/bitcoin_input_preparation.rs": "4e5bdfb41dace1135a0e26f442fb0c5479aebb5c4f077484f8d70eec445d0e72"
+  },
+  "native_library_tests_passed": 242,
+  "strict_library_clippy": "PASS",
+  "locked_wasm32_library_check": "PASS",
+  "format": "PASS",
+  "diff_whitespace": "PASS",
+  "funded_preparation_tested": false,
+  "multi_maker_financial_acceptance": false,
+  "deployed": false,
+  "dependencies_changed": false
+}

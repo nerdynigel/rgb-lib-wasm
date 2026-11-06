@@ -2,6 +2,10 @@
 //! This state is never an RGB receipt, market approval or reservation release.
 use super::*;
 
+#[path = "bitcoin_input_preparation.rs"]
+pub(in crate::wallet) mod input_preparation;
+pub use input_preparation::{BitcoinInputPreparation, BitcoinInputPreparationRequest};
+
 /// Exact wallet-local self-recovery approval. No key or secret is a field.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -18,6 +22,10 @@ pub struct BitcoinRecoveryRequest {
     pub maximum_fee_sats: String,
     /// One bounded signing approval in canonical Unix seconds.
     pub expires_at: String,
+    /// Explicit separate wallet-owned output preparation; legacy recovery
+    /// requests omit this field and keep their original one-output semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_preparation: Option<BitcoinInputPreparation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -27,6 +35,12 @@ pub(crate) struct BitcoinRecoveryRecord {
     pub(crate) attempted: bool,
     pub(crate) broadcast_attempted: bool,
     pub(crate) restored: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) cancelled: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn refused() -> Error {
@@ -45,6 +59,9 @@ fn integer(value: &str) -> Result<u64, Error> {
 fn parse_request(
     request: &BitcoinRecoveryRequest,
 ) -> Result<(Psbt, HashSet<OutPoint>, u64), Error> {
+    if request.input_preparation.is_some() {
+        return input_preparation::parse_preparation(request);
+    }
     let rate = integer(&request.fee_rate)?;
     let cap = integer(&request.maximum_fee_sats)?;
     let expiry = integer(&request.expires_at)?;
@@ -125,10 +142,20 @@ pub(in crate::wallet) fn retained_bitcoin_recovery_inputs(
     record: &BitcoinRecoveryRecord,
 ) -> Result<HashSet<OutPoint>, Error> {
     let (psbt, points, _) = parse_request(&record.request)?;
-    if !record.attempted || psbt.unsigned_tx.compute_txid().to_string() != txid {
+    if (!record.attempted && record.request.input_preparation.is_none())
+        || psbt.unsigned_tx.compute_txid().to_string() != txid
+        || (record.cancelled
+            && (record.request.input_preparation.is_none()
+                || record.attempted
+                || record.broadcast_attempted))
+    {
         return Err(refused());
     }
-    Ok(points)
+    Ok(if record.cancelled {
+        HashSet::new()
+    } else {
+        points
+    })
 }
 /// Validate new-format artifacts before restore/write. A failed signer may have
 /// retained incomplete bytes; they still bind the exact transaction and must
@@ -141,6 +168,11 @@ pub(in crate::wallet) fn validate_bitcoin_recovery_artifact(
         return Ok(());
     };
     retained_bitcoin_recovery_inputs(txid, record)?;
+    if (artifact.signed_psbt.is_some() && (!record.attempted || record.cancelled))
+        || (record.broadcast_attempted && !record.attempted)
+    {
+        return Err(refused());
+    }
     if artifact.external_send.is_some()
         || artifact.external_receive.is_some()
         || artifact.partial_signing.is_some()
@@ -198,14 +230,27 @@ impl Wallet {
                 || record.restored
                 || record.broadcast_attempted
                 || !record.attempted
+                || record.cancelled
                 || artifact.signed_psbt.is_some()
             {
                 return Err(refused());
             }
-        } else if self.transfer_artifacts.contains_key(&txid) {
-            return Err(refused());
+        } else if let Some(artifact) = self.transfer_artifacts.get(&txid) {
+            let record = artifact.bitcoin_recovery.as_ref().ok_or_else(refused)?;
+            if request.input_preparation.is_none()
+                || record.request != *request
+                || record.attempted
+                || record.broadcast_attempted
+                || record.restored
+                || record.cancelled
+                || artifact.signed_psbt.is_some()
+            {
+                return Err(refused());
+            }
         }
-        if !matches!(
+        if request.input_preparation.is_some() {
+            self.check_bitcoin_preparation_outputs(request, &psbt)?;
+        } else if !matches!(
             self.bdk_wallet
                 .derivation_of_spk(psbt.unsigned_tx.output[0].script_pubkey.clone()),
             Some((KeychainKind::Internal, _))
@@ -215,13 +260,24 @@ impl Wallet {
         self.checked_bitcoin_psbt_for_recovery(
             &request.psbt,
             false,
-            after_attempt.then_some(txid.as_str()),
+            (after_attempt || request.input_preparation.is_some()).then_some(txid.as_str()),
         )
     }
 
     /// Persist one attempt before BDK and the exact verified original before ACK.
     /// A second call never signs, including after expiry, reload or file restore.
     pub async fn sign_bitcoin_recovery(
+        &mut self,
+        online: Online,
+        request: BitcoinRecoveryRequest,
+    ) -> Result<serde_json::Value, Error> {
+        if request.input_preparation.is_some() {
+            return Err(refused());
+        }
+        self.sign_bitcoin_self_payment(online, request).await
+    }
+
+    async fn sign_bitcoin_self_payment(
         &mut self,
         online: Online,
         request: BitcoinRecoveryRequest,
@@ -243,6 +299,7 @@ impl Wallet {
             attempted: true,
             broadcast_attempted: false,
             restored: false,
+            cancelled: false,
         });
         self.flush().await?;
         let mut psbt =
@@ -277,13 +334,15 @@ impl Wallet {
         self.bitcoin_recovery_data(txid.to_string())?;
         let artifact = self.transfer_artifacts.get(txid).ok_or_else(refused)?;
         let record = artifact.bitcoin_recovery.as_ref().ok_or_else(refused)?;
-        if record.restored || record.broadcast_attempted != continuing {
+        if record.restored || record.cancelled || record.broadcast_attempted != continuing {
             return Err(refused());
         }
         let encoded = artifact.signed_psbt.as_deref().ok_or_else(refused)?;
         let signed = verify_original(record, encoded)?;
         self.checked_bitcoin_psbt_for_recovery(encoded, true, Some(txid))?;
-        if !matches!(
+        if record.request.input_preparation.is_some() {
+            self.check_bitcoin_preparation_outputs(&record.request, &signed)?;
+        } else if !matches!(
             self.bdk_wallet
                 .derivation_of_spk(signed.unsigned_tx.output[0].script_pubkey.clone()),
             Some((KeychainKind::Internal, _))
@@ -295,6 +354,24 @@ impl Wallet {
 
     /// Dispatch once after both host and Native attempts have committed.
     pub async fn broadcast_bitcoin_recovery(
+        &mut self,
+        online: Online,
+        txid: String,
+        expires_at: String,
+    ) -> Result<String, Error> {
+        let record = self
+            .transfer_artifacts
+            .get(&txid)
+            .and_then(|artifact| artifact.bitcoin_recovery.as_ref())
+            .ok_or_else(refused)?;
+        if record.request.input_preparation.is_some() {
+            return Err(refused());
+        }
+        self.broadcast_bitcoin_self_payment(online, txid, expires_at)
+            .await
+    }
+
+    async fn broadcast_bitcoin_self_payment(
         &mut self,
         online: Online,
         txid: String,
@@ -364,9 +441,13 @@ impl Wallet {
             .signed_psbt
             .as_deref()
             .is_some_and(|v| verify_original(record, v).is_ok());
-        Ok(
-            serde_json::json!({"version":1,"kind":"wallet-bitcoin-recovery-original","scope":"RETAINED_BITCOIN_SELF_RECOVERY_NOT_SETTLEMENT","network":"regtest","txid":txid,"request":record.request,"attempted":record.attempted,"broadcast_attempted":record.broadcast_attempted,"restored":record.restored,"own_signatures_complete":complete,"signed_psbt":artifact.signed_psbt}),
-        )
+        let mut result = serde_json::json!({"version":1,"kind":"wallet-bitcoin-recovery-original","scope":"RETAINED_BITCOIN_SELF_RECOVERY_NOT_SETTLEMENT","network":"regtest","txid":txid,"request":record.request,"attempted":record.attempted,"broadcast_attempted":record.broadcast_attempted,"restored":record.restored,"own_signatures_complete":complete,"signed_psbt":artifact.signed_psbt});
+        if record.request.input_preparation.is_some() {
+            result["kind"] = serde_json::json!("wallet-bitcoin-input-preparation");
+            result["scope"] = serde_json::json!("OWN_INPUT_PREPARATION_NOT_MARKET_SETTLEMENT");
+            result["cancelled"] = serde_json::json!(record.cancelled);
+        }
+        Ok(result)
     }
 }
 

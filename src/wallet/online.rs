@@ -13,7 +13,7 @@ pub use safe_bitcoin::{BitcoinSpendInput, BitcoinSpendRequest, BitcoinSpendView}
 #[path = "bitcoin_recovery.rs"]
 pub(super) mod bitcoin_recovery;
 use bitcoin_recovery::BitcoinRecoveryRecord;
-pub use bitcoin_recovery::BitcoinRecoveryRequest;
+pub use bitcoin_recovery::{BitcoinInputPreparationRequest, BitcoinRecoveryRequest};
 
 #[path = "rgb_fee_recovery.rs"]
 mod rgb_fee_recovery;

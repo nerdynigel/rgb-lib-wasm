@@ -1,0 +1,14 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-input-preparation-20261106)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.97s
+     Running unittests src/lib.rs (/home/nigel/Projects/btcx/.worktrees/asm-rgb-safe-bitcoin-20261103/target/debug/deps/rgb_lib_wasm-f6780f344ba8f335)
+
+running 6 tests
+test wallet::online::bitcoin_recovery::input_preparation::tests::exact_unsigned_cancel_does_not_erase_original_and_restores_only_its_held_inputs ... ok
+test wallet::online::bitcoin_recovery::input_preparation::tests::standard_native_signatures_verify_and_replay_or_restored_dispatch_refuses ... ok
+test wallet::online::bitcoin_recovery::input_preparation::tests::preparation_retains_owned_unsigned_original_and_holds_before_any_signature ... ok
+test wallet::online::bitcoin_recovery::input_preparation::tests::foreign_outputs_altered_values_and_legacy_purpose_do_not_authorize ... ok
+test wallet::online::bitcoin_recovery::input_preparation::tests::malformed_budgets_and_excluded_or_unconfirmed_funds_refuse ... ok
+test wallet::online::bitcoin_recovery::input_preparation::tests::attempted_restored_or_changed_preparation_never_cancels ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 233 filtered out; finished in 1.79s
+

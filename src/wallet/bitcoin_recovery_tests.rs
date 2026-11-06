@@ -56,6 +56,7 @@ pub(in crate::wallet) fn vector(count: usize) -> (Wallet, BitcoinRecoveryRequest
             fee_rate: "2".into(),
             maximum_fee_sats: "10000".into(),
             expires_at: (now + 120).to_string(),
+            input_preparation: None,
         },
         now,
     )
@@ -73,6 +74,7 @@ fn retain(w: &mut Wallet, r: &BitcoinRecoveryRequest) -> String {
                 request: r.clone(),
                 attempted: true,
                 broadcast_attempted: false,
+                cancelled: false,
                 restored: false,
             }),
             ..Default::default()

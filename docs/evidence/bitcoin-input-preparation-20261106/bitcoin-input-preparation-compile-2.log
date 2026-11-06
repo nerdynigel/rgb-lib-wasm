@@ -1,0 +1,9 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-input-preparation-20261106)
+error[E0063]: missing field `cancelled` in initializer of `bitcoin_recovery::BitcoinRecoveryRecord`
+   --> src/wallet/backup.rs:742:36
+    |
+742 |             bitcoin_recovery: Some(BitcoinRecoveryRecord {
+    |                                    ^^^^^^^^^^^^^^^^^^^^^ missing `cancelled`
+
+For more information about this error, try `rustc --explain E0063`.
+error: could not compile `rgb-lib-wasm` (lib test) due to 1 previous error

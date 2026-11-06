@@ -200,7 +200,15 @@ fn snapshot_write_required(
             let next = candidate.transfer_artifacts.get(txid).ok_or_else(refused)?;
             let new = next.bitcoin_recovery.as_ref().ok_or_else(refused)?;
             if old.request != new.request
-                || !new.attempted
+                || (old.attempted && !new.attempted)
+                || (old.request.input_preparation.is_none() && !new.attempted)
+                || (old.cancelled && !new.cancelled)
+                || (new.cancelled
+                    && (old.attempted
+                        || old.broadcast_attempted
+                        || old.restored
+                        || old_artifact.signed_psbt.is_some())
+                    && !old.cancelled)
                 || (old.restored && !new.restored)
                 || (old.broadcast_attempted && !new.broadcast_attempted)
                 || (old_artifact.signed_psbt.is_some()
@@ -531,6 +539,94 @@ mod tests {
     use schemata::NonInflatableAsset;
 
     #[test]
+    fn bitcoin_preparation_snapshots_preserve_unsigned_holds_cancellation_and_attempt_fences() {
+        use super::super::online::bitcoin_recovery::input_preparation::tests::fixture;
+        let (wallet, _, id) = fixture();
+        let snapshot: WalletSnapshot = serde_json::from_value(serde_json::json!({
+            "sequence":7, "db":InMemoryDb::new(), "bdk_changeset":null,
+            "transfer_artifacts":wallet.transfer_artifacts
+        }))
+        .unwrap();
+        let encoded = encode_snapshot(&snapshot).unwrap();
+        let unsigned = decode_snapshot(&encoded).unwrap();
+        let mut next = decode_snapshot(&encoded).unwrap();
+        assert!(snapshot_write_required(&unsigned, &next).is_err());
+        next.sequence += 1;
+        assert_eq!(snapshot_write_required(&unsigned, &next), Ok(true));
+        next.transfer_artifacts
+            .get_mut(&id)
+            .unwrap()
+            .bitcoin_recovery
+            .as_mut()
+            .unwrap()
+            .cancelled = true;
+        assert_eq!(snapshot_write_required(&unsigned, &next), Ok(true));
+        let cancelled = decode_snapshot(&encode_snapshot(&next).unwrap()).unwrap();
+        next.sequence += 1;
+        next.transfer_artifacts
+            .get_mut(&id)
+            .unwrap()
+            .bitcoin_recovery
+            .as_mut()
+            .unwrap()
+            .cancelled = false;
+        assert!(snapshot_write_required(&cancelled, &next).is_err());
+        next.transfer_artifacts
+            .get_mut(&id)
+            .unwrap()
+            .bitcoin_recovery
+            .as_mut()
+            .unwrap()
+            .attempted = true;
+        assert_eq!(snapshot_write_required(&unsigned, &next), Ok(true));
+        assert!(snapshot_write_required(&cancelled, &next).is_err());
+        let attempted = decode_snapshot(&encode_snapshot(&next).unwrap()).unwrap();
+        next.sequence += 1;
+        next.transfer_artifacts
+            .get_mut(&id)
+            .unwrap()
+            .bitcoin_recovery
+            .as_mut()
+            .unwrap()
+            .attempted = false;
+        assert!(snapshot_write_required(&attempted, &next).is_err());
+        next.transfer_artifacts
+            .get_mut(&id)
+            .unwrap()
+            .bitcoin_recovery
+            .as_mut()
+            .unwrap()
+            .cancelled = true;
+        assert!(snapshot_write_required(&attempted, &next).is_err());
+        next.transfer_artifacts
+            .get_mut(&id)
+            .unwrap()
+            .bitcoin_recovery
+            .as_mut()
+            .unwrap()
+            .cancelled = false;
+        next.transfer_artifacts
+            .get_mut(&id)
+            .unwrap()
+            .bitcoin_recovery
+            .as_mut()
+            .unwrap()
+            .restored = true;
+        let restored = decode_snapshot(&encode_snapshot(&next).unwrap()).unwrap();
+        next.sequence += 1;
+        next.transfer_artifacts
+            .get_mut(&id)
+            .unwrap()
+            .bitcoin_recovery
+            .as_mut()
+            .unwrap()
+            .cancelled = true;
+        assert!(snapshot_write_required(&restored, &next).is_err());
+        next.transfer_artifacts.clear();
+        assert!(snapshot_write_required(&unsigned, &next).is_err());
+    }
+
+    #[test]
     fn bitcoin_recovery_snapshot_v5_fences_downgrade_stale_writes_original_and_attempt_loss() {
         use super::super::online::{
             TransferArtifacts,
@@ -543,6 +639,7 @@ mod tests {
         let artifact = TransferArtifacts {
             bitcoin_recovery: Some(BitcoinRecoveryRecord {
                 request,
+                cancelled: false,
                 attempted: true,
                 restored: false,
                 broadcast_attempted: false,
