@@ -125,6 +125,41 @@ pub(in crate::wallet) mod tests {
     }
 
     #[test]
+    fn intent_observation_preserves_pending_restored_and_terminal_state_without_new_authority() {
+        for aborted in [false, true] {
+            let mut wallet = unbound_fixture(aborted);
+            let id = wallet
+                .bitcoin_preparation_intents
+                .keys()
+                .next()
+                .unwrap()
+                .clone();
+            for restored in [false, true] {
+                wallet
+                    .bitcoin_preparation_intents
+                    .get_mut(&id)
+                    .unwrap()
+                    .restored = restored;
+                let before = wallet.bitcoin_preparation_intents.clone();
+                let intent = wallet.bitcoin_input_preparation_intent(id.clone()).unwrap();
+                assert_eq!(intent, before[&id]);
+                assert_eq!(intent.aborted, aborted);
+                assert_eq!(intent.restored, restored);
+                assert_eq!(wallet.bitcoin_preparation_intents, before);
+                assert!(wallet.transfer_artifacts.is_empty());
+                for unknown in ["invalid", "01900000-0000-7000-8000-000000000082"] {
+                    assert!(
+                        wallet
+                            .bitcoin_input_preparation_intent(unknown.into())
+                            .is_err()
+                    );
+                }
+                assert_eq!(wallet.bitcoin_preparation_intents, before);
+            }
+        }
+    }
+
+    #[test]
     fn failed_selection_can_abort_only_its_registered_budget_and_never_rebuild() {
         let (_, request, _) = fixture();
         let mut wallet = new_wallet();
@@ -909,6 +944,25 @@ impl Wallet {
         }
         original.aborted = true;
         Ok(())
+    }
+
+    /// Read an exact retained registration or terminal receipt. This never
+    /// creates an absent registration, changes a restore fence, flushes, selects
+    /// inputs or grants cancellation/execution authority. Absence is an error.
+    pub fn bitcoin_input_preparation_intent(
+        &self,
+        operation_id: String,
+    ) -> Result<BitcoinInputPreparationIntent, Error> {
+        if self.bitcoin_network() != BitcoinNetwork::Regtest
+            || !super::super::wallet_transfer::valid_operation_id(&operation_id)
+        {
+            return Err(refused());
+        }
+        validate_intents(&self.bitcoin_preparation_intents, &self.transfer_artifacts)?;
+        self.bitcoin_preparation_intents
+            .get(&operation_id)
+            .cloned()
+            .ok_or_else(refused)
     }
 
     /// Durably abort only a registered, unrestored request with no transaction
