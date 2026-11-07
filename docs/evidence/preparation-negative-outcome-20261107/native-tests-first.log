@@ -1,0 +1,81 @@
+   Compiling rgb-lib-wasm v0.3.0-beta.5 (/home/nigel/Projects/btcx/.worktrees/asm-rgb-input-preparation-20261106)
+error[E0425]: cannot find type `BitcoinInputPreparationIntent` in module `super::online`
+  --> src/wallet/backup.rs:51:58
+   |
+51 |         std::collections::HashMap<String, super::online::BitcoinInputPreparationIntent>,
+   |                                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+  ::: src/wallet/bitcoin_input_preparation.rs:9:1
+   |
+ 9 | pub struct BitcoinInputPreparationRequest {
+   | ----------------------------------------- similarly named struct `BitcoinInputPreparationRequest` defined here
+   |
+help: a struct with a similar name exists
+   |
+51 -         std::collections::HashMap<String, super::online::BitcoinInputPreparationIntent>,
+51 +         std::collections::HashMap<String, super::online::BitcoinInputPreparationRequest>,
+   |
+help: consider importing this struct through its public re-export
+   |
+ 3 + use crate::wallet::bitcoin_recovery::BitcoinInputPreparationIntent;
+   |
+help: if you import `BitcoinInputPreparationIntent`, refer to it directly
+   |
+51 -         std::collections::HashMap<String, super::online::BitcoinInputPreparationIntent>,
+51 +         std::collections::HashMap<String, BitcoinInputPreparationIntent>,
+   |
+
+error[E0425]: cannot find type `BitcoinInputPreparationIntent` in module `super::online`
+  --> src/wallet/idb_store.rs:30:40
+   |
+30 |         HashMap<String, super::online::BitcoinInputPreparationIntent>,
+   |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+  ::: src/wallet/bitcoin_input_preparation.rs:9:1
+   |
+ 9 | pub struct BitcoinInputPreparationRequest {
+   | ----------------------------------------- similarly named struct `BitcoinInputPreparationRequest` defined here
+   |
+help: a struct with a similar name exists
+   |
+30 -         HashMap<String, super::online::BitcoinInputPreparationIntent>,
+30 +         HashMap<String, super::online::BitcoinInputPreparationRequest>,
+   |
+help: consider importing this struct through its public re-export
+   |
+ 3 + use crate::wallet::bitcoin_recovery::BitcoinInputPreparationIntent;
+   |
+help: if you import `BitcoinInputPreparationIntent`, refer to it directly
+   |
+30 -         HashMap<String, super::online::BitcoinInputPreparationIntent>,
+30 +         HashMap<String, BitcoinInputPreparationIntent>,
+   |
+
+error[E0425]: cannot find type `BitcoinInputPreparationIntent` in module `super::online`
+    --> src/wallet/offline.rs:1006:40
+     |
+1006 |         HashMap<String, super::online::BitcoinInputPreparationIntent>,
+     |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+    ::: src/wallet/bitcoin_input_preparation.rs:9:1
+     |
+   9 | pub struct BitcoinInputPreparationRequest {
+     | ----------------------------------------- similarly named struct `BitcoinInputPreparationRequest` defined here
+     |
+help: a struct with a similar name exists
+     |
+1006 -         HashMap<String, super::online::BitcoinInputPreparationIntent>,
+1006 +         HashMap<String, super::online::BitcoinInputPreparationRequest>,
+     |
+help: consider importing this struct through its public re-export
+     |
+   5 + use crate::wallet::bitcoin_recovery::BitcoinInputPreparationIntent;
+     |
+help: if you import `BitcoinInputPreparationIntent`, refer to it directly
+     |
+1006 -         HashMap<String, super::online::BitcoinInputPreparationIntent>,
+1006 +         HashMap<String, BitcoinInputPreparationIntent>,
+     |
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `rgb-lib-wasm` (lib test) due to 3 previous errors

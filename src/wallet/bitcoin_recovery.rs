@@ -4,7 +4,9 @@ use super::*;
 
 #[path = "bitcoin_input_preparation.rs"]
 pub(in crate::wallet) mod input_preparation;
-pub use input_preparation::{BitcoinInputPreparation, BitcoinInputPreparationRequest};
+pub use input_preparation::{
+    BitcoinInputPreparation, BitcoinInputPreparationIntent, BitcoinInputPreparationRequest,
+};
 
 /// Exact wallet-local self-recovery approval. No key or secret is a field.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]

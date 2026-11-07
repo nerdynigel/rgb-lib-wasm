@@ -24,6 +24,10 @@ pub struct WalletSnapshot {
     pub bdk_changeset: Option<ChangeSet>,
     /// Complete pending transfer state keyed by txid.
     pub(crate) transfer_artifacts: HashMap<String, super::online::TransferArtifacts>,
+    /// Append-only preparation registrations and explicit negative outcomes.
+    #[serde(default)]
+    pub(crate) bitcoin_preparation_intents:
+        HashMap<String, super::online::BitcoinInputPreparationIntent>,
     /// Received consignment bytes keyed by recipient_id.
     #[serde(default)]
     pub received_consignments: HashMap<String, Vec<u8>>,
@@ -54,20 +58,30 @@ struct ManagedSnapshot {
 }
 
 fn managed_transfers(snapshot: &WalletSnapshot) -> bool {
-    snapshot.transfer_artifacts.values().any(|a| {
-        a.bitcoin_recovery.is_some()
-            || a.external_receive.is_some()
-            || a.partial_signing.is_some()
-            || a.external_send
-                .as_ref()
-                .is_some_and(|e| e.restored_for_partial)
-            || a.external_send
-                .as_ref()
-                .is_some_and(|e| e.wallet_transfer.is_some())
-    })
+    !snapshot.bitcoin_preparation_intents.is_empty()
+        || snapshot.transfer_artifacts.values().any(|a| {
+            a.bitcoin_recovery.is_some()
+                || a.external_receive.is_some()
+                || a.partial_signing.is_some()
+                || a.external_send
+                    .as_ref()
+                    .is_some_and(|e| e.restored_for_partial)
+                || a.external_send
+                    .as_ref()
+                    .is_some_and(|e| e.wallet_transfer.is_some())
+        })
+}
+
+fn validate_preparation_intents(snapshot: &WalletSnapshot) -> Result<(), String> {
+    super::online::bitcoin_recovery::input_preparation::validate_intents(
+        &snapshot.bitcoin_preparation_intents,
+        &snapshot.transfer_artifacts,
+    )
+    .map_err(|_| "Invalid preparation intent state".to_string())
 }
 
 fn encode_snapshot(snapshot: &WalletSnapshot) -> Result<String, String> {
+    validate_preparation_intents(snapshot)?;
     for (txid, artifact) in &snapshot.transfer_artifacts {
         super::online::bitcoin_recovery::validate_bitcoin_recovery_artifact(txid, artifact)
             .map_err(|_| "Invalid Bitcoin recovery artifact".to_string())?;
@@ -79,7 +93,9 @@ fn encode_snapshot(snapshot: &WalletSnapshot) -> Result<String, String> {
             managed_wallet_state: &'a WalletSnapshot,
         }
         serde_json::to_string(&Envelope {
-            version: if snapshot
+            version: if !snapshot.bitcoin_preparation_intents.is_empty() {
+                6
+            } else if snapshot
                 .transfer_artifacts
                 .values()
                 .any(|a| a.bitcoin_recovery.is_some())
@@ -117,7 +133,12 @@ fn decode_snapshot(json: &str) -> Result<WalletSnapshot, String> {
     if value.get("managed_wallet_state").is_some() || value.get("version").is_some() {
         let envelope: ManagedSnapshot = serde_json::from_value(value)
             .map_err(|_| "Unsupported managed wallet snapshot".to_string())?;
-        if ![1, 2, 3, 4, 5].contains(&envelope.version)
+        if ![1, 2, 3, 4, 5, 6].contains(&envelope.version)
+            || (envelope.version < 6
+                && !envelope
+                    .managed_wallet_state
+                    .bitcoin_preparation_intents
+                    .is_empty())
             || (envelope.version < 5
                 && envelope
                     .managed_wallet_state
@@ -145,6 +166,7 @@ fn decode_snapshot(json: &str) -> Result<WalletSnapshot, String> {
             super::online::bitcoin_recovery::validate_bitcoin_recovery_artifact(txid, artifact)
                 .map_err(|_| "Invalid Bitcoin recovery artifact".to_string())?;
         }
+        validate_preparation_intents(&envelope.managed_wallet_state)?;
         Ok(envelope.managed_wallet_state)
     } else {
         let snapshot: WalletSnapshot = serde_json::from_value(value)
@@ -164,6 +186,21 @@ fn snapshot_write_required(
     candidate: &WalletSnapshot,
 ) -> Result<bool, String> {
     let refused = || "Managed wallet snapshot is stale or loses original obligations".to_string();
+    validate_preparation_intents(existing)?;
+    validate_preparation_intents(candidate)?;
+    for (id, old) in &existing.bitcoin_preparation_intents {
+        let new = candidate
+            .bitcoin_preparation_intents
+            .get(id)
+            .ok_or_else(refused)?;
+        if old.request != new.request
+            || (old.restored && !new.restored)
+            || (old.aborted && !new.aborted)
+            || (old.restored && !old.aborted && new.aborted)
+        {
+            return Err(refused());
+        }
+    }
     if existing.sequence >= candidate.sequence {
         return if managed_transfers(existing)
             || managed_transfers(candidate)
@@ -539,6 +576,95 @@ mod tests {
     use schemata::NonInflatableAsset;
 
     #[test]
+    fn preparation_intent_snapshot_v6_refuses_rollback_downgrade_and_stale_abort() {
+        use super::super::online::bitcoin_recovery::input_preparation::tests::fixture;
+        let (wallet, request, _) = fixture();
+        let original: WalletSnapshot = serde_json::from_value(serde_json::json!({
+            "sequence": 1, "db": InMemoryDb::new(), "bdk_changeset":null,
+            "transfer_artifacts": {}, "bitcoin_preparation_intents": wallet.bitcoin_preparation_intents,
+        })).unwrap();
+        let json = encode_snapshot(&original).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["version"], 6);
+        for version in 1..=5 {
+            let mut old = value.clone();
+            old["version"] = serde_json::json!(version);
+            assert!(decode_snapshot(&old.to_string()).is_err());
+        }
+        assert!(decode_snapshot(&serde_json::to_string(&original).unwrap()).is_err());
+        let next = || {
+            let mut v = decode_snapshot(&json).unwrap();
+            v.sequence += 1;
+            v
+        };
+        assert!(snapshot_write_required(&original, &original).is_err());
+        let mut candidate = next();
+        assert_eq!(snapshot_write_required(&original, &candidate), Ok(true));
+        candidate.bitcoin_preparation_intents.clear();
+        assert!(snapshot_write_required(&original, &candidate).is_err());
+        candidate = next();
+        candidate
+            .bitcoin_preparation_intents
+            .get_mut(&request.operation_id)
+            .unwrap()
+            .request
+            .maximum_fee_sats = "999".into();
+        assert!(snapshot_write_required(&original, &candidate).is_err());
+        candidate = next();
+        candidate
+            .bitcoin_preparation_intents
+            .get_mut(&request.operation_id)
+            .unwrap()
+            .restored = true;
+        let restored = decode_snapshot(&encode_snapshot(&candidate).unwrap()).unwrap();
+        candidate.sequence += 1;
+        candidate
+            .bitcoin_preparation_intents
+            .get_mut(&request.operation_id)
+            .unwrap()
+            .restored = false;
+        assert!(snapshot_write_required(&restored, &candidate).is_err());
+        candidate
+            .bitcoin_preparation_intents
+            .get_mut(&request.operation_id)
+            .unwrap()
+            .restored = true;
+        candidate
+            .bitcoin_preparation_intents
+            .get_mut(&request.operation_id)
+            .unwrap()
+            .aborted = true;
+        assert!(snapshot_write_required(&restored, &candidate).is_err());
+        candidate = next();
+        candidate
+            .bitcoin_preparation_intents
+            .get_mut(&request.operation_id)
+            .unwrap()
+            .aborted = true;
+        assert_eq!(snapshot_write_required(&original, &candidate), Ok(true));
+        let aborted = decode_snapshot(&encode_snapshot(&candidate).unwrap()).unwrap();
+        candidate.sequence += 1;
+        candidate
+            .bitcoin_preparation_intents
+            .get_mut(&request.operation_id)
+            .unwrap()
+            .aborted = false;
+        assert!(snapshot_write_required(&aborted, &candidate).is_err());
+        // A stale tab cannot omit a transaction original which another tab has committed.
+        let mut built = next();
+        built.transfer_artifacts = wallet.transfer_artifacts;
+        let built = decode_snapshot(&encode_snapshot(&built).unwrap()).unwrap();
+        candidate = next();
+        candidate.sequence = built.sequence + 1;
+        candidate
+            .bitcoin_preparation_intents
+            .get_mut(&request.operation_id)
+            .unwrap()
+            .aborted = true;
+        assert!(snapshot_write_required(&built, &candidate).is_err());
+    }
+
+    #[test]
     fn bitcoin_preparation_snapshots_preserve_unsigned_holds_cancellation_and_attempt_fences() {
         use super::super::online::bitcoin_recovery::input_preparation::tests::fixture;
         let (wallet, _, id) = fixture();
@@ -769,6 +895,7 @@ mod tests {
             bdk_changeset: None,
             transfer_artifacts: HashMap::from([("original".into(), artifact)]),
             received_consignments: HashMap::new(),
+            bitcoin_preparation_intents: Default::default(),
             incoming_conflicts: HashMap::new(),
             stock_stash_b64: None,
             stock_state_b64: None,
@@ -897,6 +1024,7 @@ mod tests {
             bdk_changeset: None,
             transfer_artifacts: HashMap::new(),
             received_consignments: HashMap::new(),
+            bitcoin_preparation_intents: Default::default(),
             incoming_conflicts: HashMap::new(),
             stock_stash_b64: None,
             stock_state_b64: None,
@@ -1087,6 +1215,7 @@ mod tests {
             bdk_changeset: None,
             transfer_artifacts: HashMap::from([("funding-txid".to_owned(), transfer_artifact)]),
             received_consignments: HashMap::new(),
+            bitcoin_preparation_intents: Default::default(),
             incoming_conflicts: HashMap::new(),
             stock_stash_b64: Some(s),
             stock_state_b64: Some(st),

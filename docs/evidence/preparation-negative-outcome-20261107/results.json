@@ -1,0 +1,28 @@
+{
+  "parent_revision": "1f01a5300abfa61ef0d18b0b6af34cfd5e9841ff",
+  "tests": {
+    "command": "cargo test --locked --lib -- --test-threads=4",
+    "passed": 253,
+    "failed": 0,
+    "ignored": 0,
+    "seconds": 224.76,
+    "new_cases": 9
+  },
+  "production_library_clippy": "PASS: cargo clippy --locked --lib -- -D warnings",
+  "broader_test_clippy": "FAIL: pre-existing test-only diagnostics retained; source comparison, no baseline execution claimed",
+  "format": "PASS: cargo fmt --all -- --check",
+  "wasm": "PASS: cargo check --locked --target wasm32-unknown-unknown",
+  "snapshot_reader_version": 6,
+  "encrypted_backup_version": 8,
+  "sdk_integrated": false,
+  "wallet_integrated": false,
+  "lab_deployed": false,
+  "funded_or_atomic_acceptance": false,
+  "main_changed": false,
+  "secure_sdk_next_methods": [
+    "secureWalletRegisterBitcoinInputPreparationJson",
+    "secureWalletAbortBitcoinInputPreparationJson"
+  ],
+  "dependency_changes": false,
+  "caller_requirement": "Durable exact registration ACK before host financial preparing barrier and any prepare dispatch. No original absence/error/expiry release; old unregistered unknown barriers remain unresolved."
+}

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::Error;
 use crate::error::InternalError;
 
-pub(crate) const BACKUP_VERSION: u8 = 7;
+pub(crate) const BACKUP_VERSION: u8 = 8;
 /// 24-byte nonce for XChaCha20Poly1305 (single-shot mode).
 const NONCE_LEN: usize = 24;
 
@@ -47,6 +47,9 @@ pub(crate) struct WalletBackupPayload {
     pub(crate) transfer_artifacts:
         std::collections::HashMap<String, super::online::TransferArtifacts>,
     #[serde(default)]
+    pub(crate) bitcoin_preparation_intents:
+        std::collections::HashMap<String, super::online::BitcoinInputPreparationIntent>,
+    #[serde(default)]
     pub(crate) received_consignments: std::collections::HashMap<String, Vec<u8>>,
     #[serde(default)]
     pub(crate) incoming_conflicts:
@@ -69,7 +72,9 @@ fn decode_wallet_payload(bytes: &[u8], version: Option<u8>) -> Result<WalletBack
     if value.get("wallet_state").is_some() || value.get("version").is_some() {
         let envelope: VersionedWalletBackup =
             serde_json::from_value(value).map_err(|_| Error::InvalidBackup)?;
-        if ![3, 4, 5, 6, BACKUP_VERSION].contains(&envelope.version)
+        if ![3, 4, 5, 6, 7, BACKUP_VERSION].contains(&envelope.version)
+            || (envelope.version < 8
+                && !envelope.wallet_state.bitcoin_preparation_intents.is_empty())
             || (envelope.version < 7
                 && envelope
                     .wallet_state
@@ -98,6 +103,11 @@ fn decode_wallet_payload(bytes: &[u8], version: Option<u8>) -> Result<WalletBack
             super::online::bitcoin_recovery::validate_bitcoin_recovery_artifact(txid, artifact)
                 .map_err(|_| Error::InvalidBackup)?;
         }
+        super::online::bitcoin_recovery::input_preparation::validate_intents(
+            &envelope.wallet_state.bitcoin_preparation_intents,
+            &envelope.wallet_state.transfer_artifacts,
+        )
+        .map_err(|_| Error::InvalidBackup)?;
         Ok(envelope.wallet_state)
     } else {
         if version.is_some_and(|v| v != 2) {
@@ -105,7 +115,8 @@ fn decode_wallet_payload(bytes: &[u8], version: Option<u8>) -> Result<WalletBack
         }
         let payload: WalletBackupPayload =
             serde_json::from_value(value).map_err(|_| Error::InvalidBackup)?;
-        if !payload.incoming_conflicts.is_empty()
+        if !payload.bitcoin_preparation_intents.is_empty()
+            || !payload.incoming_conflicts.is_empty()
             || payload.transfer_artifacts.values().any(|a| {
                 a.external_send
                     .as_ref()
@@ -207,7 +218,7 @@ pub(crate) fn decrypt_payload(
     password: &str,
     pub_data: &BackupPubData,
 ) -> Result<Vec<u8>, Error> {
-    if ![2, 3, 4, 5, 6, BACKUP_VERSION].contains(&pub_data.version) {
+    if ![2, 3, 4, 5, 6, 7, BACKUP_VERSION].contains(&pub_data.version) {
         return Err(Error::UnsupportedBackupVersion {
             version: pub_data.version.to_string(),
         });
@@ -276,6 +287,15 @@ impl super::Wallet {
                 return Ok(false);
             }
             expected.indexer = actual.indexer.clone();
+        }
+        for (id, expected) in &mut payload.bitcoin_preparation_intents {
+            if self
+                .bitcoin_preparation_intents
+                .get(id)
+                .is_some_and(|i| i.restored)
+            {
+                expected.restored = true;
+            }
         }
         for (txid, expected) in &mut payload.transfer_artifacts {
             if self
@@ -375,18 +395,26 @@ impl super::Wallet {
         // Device recovery is permitted only into an empty engine. Never
         // overwrite newer financial state or discard unresolved obligations.
         let current = self.database.get_db_data(false)?;
-        if !current.batch_transfers.is_empty() || !current.txos.is_empty() {
+        if !current.batch_transfers.is_empty()
+            || !current.txos.is_empty()
+            || !self.transfer_artifacts.is_empty()
+            || !self.bitcoin_preparation_intents.is_empty()
+        {
             return Err(Error::InvalidBackup);
         }
         // A file may predate a later signature on another device. Restoring
         // cannot grant a fresh attempt for any pending original operation.
         fence_restored_pending_transfers(&mut payload.transfer_artifacts);
+        for intent in payload.bitcoin_preparation_intents.values_mut() {
+            intent.restored = true;
+        }
         let snapshot = super::idb_store::WalletSnapshot {
             sequence: 0,
             db: payload.db,
             bdk_changeset: payload.bdk_changeset,
             transfer_artifacts: payload.transfer_artifacts,
             received_consignments: payload.received_consignments,
+            bitcoin_preparation_intents: payload.bitcoin_preparation_intents,
             incoming_conflicts: payload.incoming_conflicts,
             stock_stash_b64: Some(payload.stock_stash_b64),
             stock_state_b64: Some(payload.stock_state_b64),
@@ -522,6 +550,10 @@ impl super::Wallet {
 
     /// Serialize the wallet state to JSON bytes (shared by local backup and VSS).
     fn serialize_backup_payload(&self) -> Result<Vec<u8>, Error> {
+        super::online::bitcoin_recovery::input_preparation::validate_intents(
+            &self.bitcoin_preparation_intents,
+            &self.transfer_artifacts,
+        )?;
         let stock_ref = self.rgb_stock.borrow();
         let stock = stock_ref.as_ref().ok_or_else(|| Error::Internal {
             details: s!("RGB stock is currently in use (runtime active)"),
@@ -552,6 +584,7 @@ impl super::Wallet {
             reuse_address_index: self.reuse_address_index.clone(),
             transfer_artifacts: self.transfer_artifacts.clone(),
             received_consignments: self.received_consignments.clone(),
+            bitcoin_preparation_intents: self.bitcoin_preparation_intents.clone(),
             incoming_conflicts: self.incoming_conflicts.clone(),
         };
 
@@ -581,6 +614,96 @@ impl super::Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_only_backup_v8_retains_pending_and_terminal_receipts_and_fences_restore() {
+        use super::super::online::bitcoin_recovery::input_preparation::tests::unbound_fixture;
+        for aborted in [false, true] {
+            let wallet = unbound_fixture(aborted);
+            let encoded = wallet.serialize_backup_payload().unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(envelope["version"], 8);
+            assert!(wallet.transfer_artifacts.is_empty());
+            for version in 2..=7 {
+                let mut bad = envelope.clone();
+                bad["version"] = serde_json::json!(version);
+                assert!(
+                    decode_wallet_payload(&serde_json::to_vec(&bad).unwrap(), Some(version))
+                        .is_err()
+                );
+            }
+            assert!(
+                decode_wallet_payload(
+                    &serde_json::to_vec(&envelope["wallet_state"]).unwrap(),
+                    Some(2)
+                )
+                .is_err()
+            );
+            let mut target = super::super::Wallet::new(wallet.wallet_data.clone()).unwrap();
+            target
+                .install_backup_payload(decode_wallet_payload(&encoded, Some(8)).unwrap())
+                .unwrap();
+            assert_eq!(target.bitcoin_preparation_intents.len(), 1);
+            let receipt = target.bitcoin_preparation_intents.values().next().unwrap();
+            assert!(receipt.restored);
+            assert_eq!(receipt.aborted, aborted);
+            assert_eq!(
+                receipt.request,
+                wallet
+                    .bitcoin_preparation_intents
+                    .values()
+                    .next()
+                    .unwrap()
+                    .request
+            );
+            let before = target.bitcoin_preparation_intents.clone();
+            // Even a registration-only engine is nonempty and cannot be overwritten.
+            assert!(
+                target
+                    .install_backup_payload(decode_wallet_payload(&encoded, Some(8)).unwrap())
+                    .is_err()
+            );
+            assert_eq!(target.bitcoin_preparation_intents, before);
+            assert!(target.transfer_artifacts.is_empty());
+        }
+    }
+
+    #[test]
+    fn encrypted_v8_preparation_roundtrip_preserves_original_and_registration_fences() {
+        use super::super::online::bitcoin_recovery::input_preparation::tests::fixture;
+        let (wallet, request, txid) = fixture();
+        let encoded = wallet.serialize_backup_payload().unwrap();
+        let (encrypted, public) =
+            encrypt_payload(&encoded, "unfunded-negative-outcome-test").unwrap();
+        let bytes = encode_backup(&encrypted, &public).unwrap();
+        let decoded =
+            decrypt_payload(&encrypted, "unfunded-negative-outcome-test", &public).unwrap();
+        let mut target = super::super::Wallet::new(wallet.wallet_data.clone()).unwrap();
+        target
+            .install_backup_payload(decode_wallet_payload(&decoded, Some(8)).unwrap())
+            .unwrap();
+        assert!(target.bitcoin_preparation_intents[&request.operation_id].restored);
+        assert!(!target.bitcoin_preparation_intents[&request.operation_id].aborted);
+        let original = target.transfer_artifacts[&txid]
+            .bitcoin_recovery
+            .as_ref()
+            .unwrap();
+        assert!(original.restored);
+        assert!(!original.attempted && !original.broadcast_attempted && !original.cancelled);
+        assert_eq!(
+            original.request,
+            wallet.transfer_artifacts[&txid]
+                .bitcoin_recovery
+                .as_ref()
+                .unwrap()
+                .request
+        );
+        assert!(
+            target
+                .matches_backup_state(&bytes, "unfunded-negative-outcome-test")
+                .unwrap()
+        );
+    }
 
     #[test]
     fn legacy_v3_through_v6_encrypted_envelopes_remain_decryptable() {
@@ -694,6 +817,7 @@ mod tests {
             reuse_address_index: Default::default(),
             transfer_artifacts: std::collections::HashMap::from([(id.clone(), artifact)]),
             received_consignments: Default::default(),
+            bitcoin_preparation_intents: Default::default(),
             incoming_conflicts: Default::default(),
         };
         let encoded =
@@ -746,6 +870,7 @@ mod tests {
             reuse_address_index: Default::default(),
             transfer_artifacts: wallet.transfer_artifacts,
             received_consignments: Default::default(),
+            bitcoin_preparation_intents: Default::default(),
             incoming_conflicts: Default::default(),
         };
         let encoded =
@@ -820,6 +945,7 @@ mod tests {
             reuse_address_index: Default::default(),
             transfer_artifacts: std::collections::HashMap::from([(id.clone(), artifact)]),
             received_consignments: Default::default(),
+            bitcoin_preparation_intents: Default::default(),
             incoming_conflicts: Default::default(),
         };
         let encoded =
@@ -844,9 +970,15 @@ mod tests {
             .unwrap();
         assert!(record.restored && record.attempted && record.broadcast_attempted);
         assert_eq!(record.request, request);
-        let (ciphertext, mut public) =
-            encrypt_payload(&encoded, "synthetic-unfunded-recovery-test").unwrap();
-        assert_eq!(public.version, 7);
+        let (ciphertext, mut public) = encrypt_payload(
+            &serde_json::to_vec(
+                &serde_json::json!({"version": BACKUP_VERSION, "wallet_state":payload}),
+            )
+            .unwrap(),
+            "synthetic-unfunded-recovery-test",
+        )
+        .unwrap();
+        assert_eq!(public.version, BACKUP_VERSION);
         let plaintext =
             decrypt_payload(&ciphertext, "synthetic-unfunded-recovery-test", &public).unwrap();
         decode_wallet_payload(&plaintext, Some(public.version)).unwrap();
@@ -932,6 +1064,7 @@ mod tests {
                 artifacts,
             )]),
             incoming_conflicts: std::collections::HashMap::new(),
+            bitcoin_preparation_intents: Default::default(),
             received_consignments: std::collections::HashMap::from([(
                 "recipient".into(),
                 vec![4, 5, 6],

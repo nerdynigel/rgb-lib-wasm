@@ -25,6 +25,65 @@ pub struct BitcoinInputPreparationRequest {
     pub excluded_inputs: Vec<String>,
 }
 
+/// Durable registration made before input selection. An aborted intent proves
+/// only that this registered request produced no Native transaction original.
+/// A restored pending registration cannot acquire new execution/abort authority.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BitcoinInputPreparationIntent {
+    /// Exact original canonical budget, including the operation identifier.
+    pub request: BitcoinInputPreparationRequest,
+    /// Conservative file-recovery fence; never cleared on reload or retry.
+    pub restored: bool,
+    /// Append-only terminal negative outcome, never inferred from getter absence.
+    pub aborted: bool,
+}
+
+pub(in crate::wallet) fn validate_intents(
+    intents: &HashMap<String, BitcoinInputPreparationIntent>,
+    artifacts: &HashMap<String, TransferArtifacts>,
+) -> Result<(), Error> {
+    if intents.len() > 128 {
+        return Err(refused());
+    }
+    for (id, intent) in intents {
+        validate_budget(&intent.request)?;
+        if id != &intent.request.operation_id
+            || intent
+                .request
+                .excluded_inputs
+                .windows(2)
+                .any(|v| v[0] >= v[1])
+        {
+            return Err(refused());
+        }
+        let mut matches = 0;
+        for (txid, artifact) in artifacts {
+            let Some(record) = &artifact.bitcoin_recovery else {
+                continue;
+            };
+            let Some(purpose) = &record.request.input_preparation else {
+                continue;
+            };
+            if &purpose.request.operation_id != id {
+                continue;
+            }
+            validate_bitcoin_recovery_artifact(txid, artifact)?;
+            matches += 1;
+            if intent.aborted
+                || purpose.request != intent.request
+                || (intent.restored && !record.restored)
+            {
+                return Err(refused());
+            }
+        }
+        if matches > 1 {
+            return Err(refused());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(in crate::wallet) mod tests {
     //! Real native BDK graph and signatures; invented local coins, no network,
@@ -49,6 +108,213 @@ pub(in crate::wallet) mod tests {
         let data = wallet.build_bitcoin_inputs(request.clone()).unwrap();
         let txid = data["txid"].as_str().unwrap().to_owned();
         (wallet, request, txid)
+    }
+
+    pub(in crate::wallet) fn unbound_fixture(abort: bool) -> Wallet {
+        let (_, request, _) = fixture();
+        let mut wallet = new_wallet();
+        wallet
+            .register_bitcoin_preparation_before_flush(request.clone())
+            .unwrap();
+        if abort {
+            wallet
+                .abort_bitcoin_preparation_before_flush(request)
+                .unwrap();
+        }
+        wallet
+    }
+
+    #[test]
+    fn failed_selection_can_abort_only_its_registered_budget_and_never_rebuild() {
+        let (_, request, _) = fixture();
+        let mut wallet = new_wallet();
+        assert!(
+            wallet
+                .abort_bitcoin_preparation_before_flush(request.clone())
+                .is_err()
+        );
+        assert!(wallet.build_bitcoin_inputs(request.clone()).is_err());
+        assert!(wallet.transfer_artifacts.is_empty());
+        assert_eq!(wallet.bitcoin_preparation_intents.len(), 1);
+        assert!(!wallet.bitcoin_preparation_intents[&request.operation_id].aborted);
+        let mut changed = request.clone();
+        changed.maximum_fee_sats = "999".into();
+        assert!(
+            wallet
+                .abort_bitcoin_preparation_before_flush(changed)
+                .is_err()
+        );
+        wallet
+            .abort_bitcoin_preparation_before_flush(request.clone())
+            .unwrap();
+        let receipt = wallet.bitcoin_preparation_intents[&request.operation_id].clone();
+        assert!(receipt.aborted && !receipt.restored);
+        assert_eq!(receipt.request, request);
+        wallet
+            .abort_bitcoin_preparation_before_flush(request.clone())
+            .unwrap();
+        assert_eq!(
+            wallet.bitcoin_preparation_intents[&request.operation_id],
+            receipt
+        );
+        coin(&mut wallet, KeychainKind::Internal, 100_000, true, false);
+        assert!(wallet.build_bitcoin_inputs(request.clone()).is_err());
+        assert!(
+            wallet
+                .register_bitcoin_preparation_before_flush(request)
+                .is_err()
+        );
+        assert!(wallet.transfer_artifacts.is_empty());
+        assert_eq!(wallet.bitcoin_spend_view().unwrap().total_sats, "100000");
+    }
+
+    #[test]
+    fn registration_is_metadata_only_exact_idempotent_and_never_renews_terms() {
+        let (_, request, _) = fixture();
+        let mut wallet = new_wallet();
+        let before = wallet.bdk_database.get_data().clone();
+        wallet
+            .register_bitcoin_preparation_before_flush(request.clone())
+            .unwrap();
+        wallet
+            .register_bitcoin_preparation_before_flush(request.clone())
+            .unwrap();
+        assert_eq!(wallet.bitcoin_preparation_intents.len(), 1);
+        assert!(wallet.transfer_artifacts.is_empty());
+        assert_eq!(wallet.bdk_database.get_data(), &before);
+        let mut changed = request.clone();
+        changed.expires_at = (integer(&request.expires_at).unwrap() + 1).to_string();
+        assert!(
+            wallet
+                .register_bitcoin_preparation_before_flush(changed)
+                .is_err()
+        );
+        let record = wallet
+            .bitcoin_preparation_intents
+            .get_mut(&request.operation_id)
+            .unwrap();
+        record.request.expires_at = "1".into();
+        let expired = record.request.clone();
+        wallet
+            .register_bitcoin_preparation_before_flush(expired.clone())
+            .unwrap();
+        assert!(wallet.build_bitcoin_inputs(expired.clone()).is_err());
+        wallet
+            .abort_bitcoin_preparation_before_flush(expired)
+            .unwrap();
+    }
+
+    #[test]
+    fn pending_restored_registration_cannot_abort_build_or_register_again() {
+        let (_, request, _) = fixture();
+        let mut wallet = new_wallet();
+        wallet
+            .register_bitcoin_preparation_before_flush(request.clone())
+            .unwrap();
+        wallet
+            .bitcoin_preparation_intents
+            .get_mut(&request.operation_id)
+            .unwrap()
+            .restored = true;
+        let before = wallet.bitcoin_preparation_intents.clone();
+        assert!(
+            wallet
+                .register_bitcoin_preparation_before_flush(request.clone())
+                .is_err()
+        );
+        assert!(wallet.build_bitcoin_inputs(request.clone()).is_err());
+        assert!(
+            wallet
+                .abort_bitcoin_preparation_before_flush(request)
+                .is_err()
+        );
+        assert_eq!(wallet.bitcoin_preparation_intents, before);
+        assert!(wallet.transfer_artifacts.is_empty());
+    }
+
+    #[test]
+    fn any_original_including_cancelled_refuses_preoriginal_abort_and_rebuild() {
+        let (mut wallet, request, txid) = fixture();
+        assert!(
+            wallet
+                .abort_bitcoin_preparation_before_flush(request.clone())
+                .is_err()
+        );
+        assert!(wallet.build_bitcoin_inputs(request.clone()).is_err());
+        let psbt = wallet.transfer_artifacts[&txid]
+            .bitcoin_recovery
+            .as_ref()
+            .unwrap()
+            .request
+            .psbt
+            .clone();
+        wallet
+            .cancel_bitcoin_inputs_before_flush(request.operation_id.clone(), psbt)
+            .unwrap();
+        assert!(
+            wallet
+                .abort_bitcoin_preparation_before_flush(request.clone())
+                .is_err()
+        );
+        assert!(wallet.build_bitcoin_inputs(request.clone()).is_err());
+        assert_eq!(wallet.transfer_artifacts.len(), 1);
+        assert!(!wallet.bitcoin_preparation_intents[&request.operation_id].aborted);
+    }
+
+    #[test]
+    fn intent_validation_rejects_forged_negative_outcome_and_changed_original() {
+        let (wallet, request, _) = fixture();
+        let mut intents = wallet.bitcoin_preparation_intents.clone();
+        intents.get_mut(&request.operation_id).unwrap().aborted = true;
+        assert!(validate_intents(&intents, &wallet.transfer_artifacts).is_err());
+        intents = wallet.bitcoin_preparation_intents.clone();
+        intents
+            .get_mut(&request.operation_id)
+            .unwrap()
+            .request
+            .maximum_fee_sats = "999".into();
+        assert!(validate_intents(&intents, &wallet.transfer_artifacts).is_err());
+        intents = wallet.bitcoin_preparation_intents.clone();
+        intents.get_mut(&request.operation_id).unwrap().restored = true;
+        assert!(validate_intents(&intents, &wallet.transfer_artifacts).is_err());
+        intents = wallet.bitcoin_preparation_intents.clone();
+        let old = intents.remove(&request.operation_id).unwrap();
+        intents.insert("01900000-0000-7000-8000-000000000002".into(), old);
+        assert!(validate_intents(&intents, &wallet.transfer_artifacts).is_err());
+    }
+
+    #[test]
+    fn registration_capacity_and_malformed_new_budgets_refuse_without_eviction() {
+        let (_, request, _) = fixture();
+        let mut wallet = new_wallet();
+        let mut bad = request.clone();
+        bad.expires_at = "1".into();
+        assert!(
+            wallet
+                .register_bitcoin_preparation_before_flush(bad)
+                .is_err()
+        );
+        let mut bad = request.clone();
+        bad.version = 2;
+        assert!(
+            wallet
+                .register_bitcoin_preparation_before_flush(bad)
+                .is_err()
+        );
+        for n in 0..128 {
+            let mut next = request.clone();
+            next.operation_id = format!("01900000-0000-7000-8000-{n:012x}");
+            wallet
+                .register_bitcoin_preparation_before_flush(next)
+                .unwrap();
+        }
+        let before = wallet.bitcoin_preparation_intents.clone();
+        assert!(
+            wallet
+                .register_bitcoin_preparation_before_flush(request)
+                .is_err()
+        );
+        assert_eq!(wallet.bitcoin_preparation_intents, before);
     }
 
     #[test]
@@ -566,6 +832,99 @@ pub(super) fn parse_preparation(
 }
 
 impl Wallet {
+    fn register_bitcoin_preparation_before_flush(
+        &mut self,
+        mut request: BitcoinInputPreparationRequest,
+    ) -> Result<(), Error> {
+        validate_budget(&request)?;
+        request.excluded_inputs.sort();
+        if self.bitcoin_network() != BitcoinNetwork::Regtest {
+            return Err(refused());
+        }
+        validate_intents(&self.bitcoin_preparation_intents, &self.transfer_artifacts)?;
+        if let Some(old) = self.bitcoin_preparation_intents.get(&request.operation_id) {
+            if old.request != request || old.aborted || old.restored {
+                return Err(refused());
+            }
+            return Ok(());
+        }
+        if self.bitcoin_preparation_intents.len() >= 128
+            || self
+                .bitcoin_preparation_by_operation(&request.operation_id)?
+                .is_some()
+        {
+            return Err(refused());
+        }
+        let now = super::super::safe_bitcoin::unix_seconds()?;
+        let expiry = integer(&request.expires_at)?;
+        if expiry <= now || expiry > now.checked_add(120).ok_or_else(refused)? {
+            return Err(refused());
+        }
+        self.bitcoin_preparation_intents.insert(
+            request.operation_id.clone(),
+            BitcoinInputPreparationIntent {
+                request,
+                restored: false,
+                aborted: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Persist the exact budget before the host creates its preparation barrier.
+    /// No input selection, signature, broadcast or balance change occurs here.
+    /// Registration retries keep the original terms and do not renew its expiry.
+    pub async fn register_bitcoin_input_preparation(
+        &mut self,
+        request: BitcoinInputPreparationRequest,
+    ) -> Result<BitcoinInputPreparationIntent, Error> {
+        let id = request.operation_id.clone();
+        self.register_bitcoin_preparation_before_flush(request)?;
+        self.flush().await?;
+        Ok(self.bitcoin_preparation_intents[&id].clone())
+    }
+
+    fn abort_bitcoin_preparation_before_flush(
+        &mut self,
+        mut request: BitcoinInputPreparationRequest,
+    ) -> Result<(), Error> {
+        validate_budget(&request)?;
+        request.excluded_inputs.sort();
+        if self.bitcoin_network() != BitcoinNetwork::Regtest {
+            return Err(refused());
+        }
+        validate_intents(&self.bitcoin_preparation_intents, &self.transfer_artifacts)?;
+        if self
+            .bitcoin_preparation_by_operation(&request.operation_id)?
+            .is_some()
+        {
+            return Err(refused());
+        }
+        let original = self
+            .bitcoin_preparation_intents
+            .get_mut(&request.operation_id)
+            .ok_or_else(refused)?;
+        if original.request != request || (original.restored && !original.aborted) {
+            return Err(refused());
+        }
+        original.aborted = true;
+        Ok(())
+    }
+
+    /// Durably abort only a registered, unrestored request with no transaction
+    /// original. Unknown IDs, restored pending intents and any original refuse.
+    /// Existing unsigned originals require the separate exact-PSBT cancellation.
+    /// A failed flush is not an acknowledgement: the caller must retain its hold.
+    pub async fn abort_bitcoin_input_preparation(
+        &mut self,
+        request: BitcoinInputPreparationRequest,
+    ) -> Result<BitcoinInputPreparationIntent, Error> {
+        let id = request.operation_id.clone();
+        self.abort_bitcoin_preparation_before_flush(request)?;
+        self.flush().await?;
+        Ok(self.bitcoin_preparation_intents[&id].clone())
+    }
+
     fn bitcoin_preparation_by_operation(&self, id: &str) -> Result<Option<String>, Error> {
         if !super::super::wallet_transfer::valid_operation_id(id)
             || self.transfer_artifacts.len() > 32768
@@ -629,6 +988,8 @@ impl Wallet {
             self.flush().await?;
             return self.bitcoin_recovery_data(txid);
         }
+        self.register_bitcoin_input_preparation(request.clone())
+            .await?;
         self.require_wallet_rgb_regtest(&online).await?;
         self.sync_db_txos(false).await?;
         let result = self.build_bitcoin_inputs(request)?;
@@ -638,9 +999,16 @@ impl Wallet {
 
     pub(in crate::wallet) fn build_bitcoin_inputs(
         &mut self,
-        request: BitcoinInputPreparationRequest,
+        mut request: BitcoinInputPreparationRequest,
     ) -> Result<serde_json::Value, Error> {
-        validate_budget(&request)?;
+        request.excluded_inputs.sort();
+        self.register_bitcoin_preparation_before_flush(request.clone())?;
+        if self
+            .bitcoin_preparation_by_operation(&request.operation_id)?
+            .is_some()
+        {
+            return Err(refused());
+        }
         let now = super::super::safe_bitcoin::unix_seconds()?;
         let expiry = integer(&request.expires_at)?;
         if expiry <= now || expiry > now.checked_add(120).ok_or_else(refused)? {

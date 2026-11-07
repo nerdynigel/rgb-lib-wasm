@@ -1,0 +1,49 @@
+{
+  "baseline_revision": "1f01a5300abfa61ef0d18b0b6af34cfd5e9841ff",
+  "baseline_broad_clippy_executed": false,
+  "comparison": "Source comparison of reported pre-existing test-only patterns; not a claim that the broader command passed. Strict production --lib Clippy passes.",
+  "files": [
+    {
+      "file": "tests/external_send_finalize_wasm.rs",
+      "baseline_sha256": "4009b8c311798fa602eb17cde1e2fdeb04bacab3d195b93fe6bb43ee57946919",
+      "current_sha256": "4009b8c311798fa602eb17cde1e2fdeb04bacab3d195b93fe6bb43ee57946919",
+      "existing_patterns_verified": [
+        "use std::collections::HashMap;"
+      ]
+    },
+    {
+      "file": "tests/external_send_wasm.rs",
+      "baseline_sha256": "4595b1f3efa9323d9dd9366d32036eb074ec0718249fec9030c34ff60033e102",
+      "current_sha256": "4595b1f3efa9323d9dd9366d32036eb074ec0718249fec9030c34ff60033e102",
+      "existing_patterns_verified": [
+        "use std::collections::HashMap;"
+      ]
+    },
+    {
+      "file": "src/wallet/rust_only.rs",
+      "baseline_sha256": "4e237c6886fe8c9722ed677570c1181eee3fe288c6f3f0eb050204589279bb7a",
+      "current_sha256": "4e237c6886fe8c9722ed677570c1181eee3fe288c6f3f0eb050204589279bb7a",
+      "existing_patterns_verified": [
+        "#[cfg(test)]",
+        "pub(super) fn inspect_external_transfer_facts("
+      ]
+    },
+    {
+      "file": "src/wallet/offline.rs",
+      "baseline_sha256": "7d9ea31a3120c82d5756af455e521a422e93a5e80557977cfadbd079ac4a5c39",
+      "current_sha256": "2c8727ec12fcddeda15f62dae398bc15fccc72b69e60baa56be1deba232e49c2",
+      "existing_patterns_verified": [
+        "database: Arc::new(crate::database::memory_db::InMemoryDb::new()),"
+      ]
+    },
+    {
+      "file": "src/wallet/safe_bitcoin.rs",
+      "baseline_sha256": "1f837c3dbe53aef00b3d2343f1a15c24d10f5c3b81c6cdd548e1d9061cd82f2c",
+      "current_sha256": "1f837c3dbe53aef00b3d2343f1a15c24d10f5c3b81c6cdd548e1d9061cd82f2c",
+      "existing_patterns_verified": [
+        "wallet.database = Arc::new(crate::database::memory_db::InMemoryDb::new());",
+        "wallet.database = Arc::new(serde_json::from_value(serialized).unwrap());"
+      ]
+    }
+  ]
+}

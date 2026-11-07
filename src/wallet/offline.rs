@@ -1000,6 +1000,10 @@ pub struct Wallet {
     /// Key: txid
     #[cfg(feature = "esplora")]
     pub(crate) transfer_artifacts: HashMap<String, super::online::TransferArtifacts>,
+    /// Exact wallet-local preparation registration/abort records.
+    #[cfg(feature = "esplora")]
+    pub(crate) bitcoin_preparation_intents:
+        HashMap<String, super::online::BitcoinInputPreparationIntent>,
     /// In-memory storage for received consignment bytes (replaces filesystem on wasm32).
     /// Key: recipient_id
     #[cfg(feature = "esplora")]
@@ -1159,6 +1163,7 @@ impl Wallet {
             online_data: None,
             #[cfg(feature = "esplora")]
             transfer_artifacts: HashMap::new(),
+            bitcoin_preparation_intents: HashMap::new(),
             #[cfg(feature = "esplora")]
             received_consignments: HashMap::new(),
             incoming_conflicts: HashMap::new(),
@@ -3074,6 +3079,7 @@ impl Wallet {
             db: self.database.as_ref().clone(),
             bdk_changeset: self.bdk_database.get_data().clone(),
             transfer_artifacts: self.transfer_artifacts.clone(),
+            bitcoin_preparation_intents: self.bitcoin_preparation_intents.clone(),
             received_consignments: self.received_consignments.clone(),
             incoming_conflicts: self.incoming_conflicts.clone(),
             stock_stash_b64: Some(stock_stash_b64),
@@ -3157,6 +3163,16 @@ impl Wallet {
             &snapshot.db.get_db_data(false)?,
         )?;
 
+        super::online::bitcoin_recovery::input_preparation::validate_intents(
+            &snapshot.bitcoin_preparation_intents,
+            &snapshot.transfer_artifacts,
+        )?;
+        if self.bitcoin_network() != BitcoinNetwork::Regtest
+            && !snapshot.bitcoin_preparation_intents.is_empty()
+        {
+            return Err(Error::InvalidBackup);
+        }
+
         // Restore the in-memory database
         self.database = Arc::new(snapshot.db);
 
@@ -3233,6 +3249,7 @@ impl Wallet {
 
         // Restore complete pending transfers so send_end can resume after a page reload.
         self.transfer_artifacts = snapshot.transfer_artifacts;
+        self.bitcoin_preparation_intents = snapshot.bitcoin_preparation_intents;
 
         // Restore received consignments
         self.received_consignments = snapshot.received_consignments;
@@ -3335,6 +3352,7 @@ mod address_reuse_tests {
             online_data: None,
             #[cfg(feature = "esplora")]
             transfer_artifacts: HashMap::new(),
+            bitcoin_preparation_intents: HashMap::new(),
             #[cfg(feature = "esplora")]
             received_consignments: HashMap::new(),
             incoming_conflicts: HashMap::new(),
