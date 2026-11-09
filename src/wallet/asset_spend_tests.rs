@@ -487,17 +487,108 @@ fn verify_control(proof: &InventoryControlProof) {
     }
 }
 
+#[cfg(unix)]
+fn write_public_control_fixture(path: &std::path::Path, value: &serde_json::Value) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    // create_new protects other work; rename publishes complete bytes to the
+    // second process. No partial JSON is observed and no existing file replaced.
+    let temporary = path.with_extension("writing");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .unwrap();
+    file.write_all(&serde_json::to_vec_pretty(value).unwrap())
+        .unwrap();
+    file.sync_all().unwrap();
+    std::fs::hard_link(&temporary, path).unwrap();
+    std::fs::remove_file(temporary).unwrap();
+}
+
+#[cfg(unix)]
+fn public_bitcoin_control_fixture(
+    w: &Wallet,
+    c: &InventoryControlChallenge,
+    proof: Option<&InventoryControlProof>,
+) -> serde_json::Value {
+    let mut inventory = w.bitcoin_spend_view().unwrap();
+    inventory.inputs.retain(|i| {
+        c.inputs
+            .iter()
+            .any(|selected| selected.outpoint == i.outpoint)
+    });
+    inventory.inputs.sort_by(|a, b| a.outpoint.cmp(&b.outpoint));
+    inventory.total_sats = c
+        .inputs
+        .iter()
+        .try_fold(0u64, |sum, i| {
+            sum.checked_add(i.input_sats.parse::<u64>().unwrap())
+        })
+        .unwrap()
+        .to_string();
+    let parents = c.inputs.iter().map(|input| {
+        let point: OutPoint = input.outpoint.parse().unwrap();
+        let tx = w.bdk_wallet.get_tx(point.txid).unwrap();
+        serde_json::json!({"outpoint":input.outpoint,"transaction_hex":bitcoin::consensus::encode::serialize_hex(tx.tx_node.tx.as_ref())})
+    }).collect::<Vec<_>>();
+    serde_json::json!({"scope":"PUBLIC_NATIVE_BDK_BTC_CONTROL_LOCAL_GRAPH_NOT_LAB_OR_CORE","proof":proof,"inventory":inventory,"parents":parents})
+}
+
 #[test]
 fn inventory_control_signs_both_real_bdk_keychains_without_any_durable_mutation() {
     let mut w = wallet();
     let a = coin(&mut w, KeychainKind::Internal, 10000, true, false);
     let b = coin(&mut w, KeychainKind::External, 20000, true, false);
-    let c = control_challenge(&w, &[a, b], None);
+    let mut c = control_challenge(&w, &[a, b], None);
+    let hash =
+        |text: &str| <sha256::Hash as bitcoin::hashes::Hash>::hash(text.as_bytes()).to_string();
+    c.origin_sha256 = hash("https://market.example");
+    c.session_sha256 = hash(&"b".repeat(64));
+    c.owner_sha256 = hash(&"a".repeat(64));
+    #[cfg(unix)]
+    if let Ok(directory) = std::env::var("BTCX_TEST_PUBLIC_BITCOIN_CONTROL_EXCHANGE") {
+        // Explicit cross-component conformance handshake. Only public graph and
+        // challenge bytes cross this private test directory; the ephemeral
+        // wallet and its signing keys remain in this process throughout.
+        let directory = std::path::Path::new(&directory);
+        write_public_control_fixture(
+            &directory.join("native-view.json"),
+            &public_bitcoin_control_fixture(&w, &c, None),
+        );
+        let path = directory.join("challenge.json");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    assert!(bytes.len() <= 32768);
+                    c = serde_json::from_slice(&bytes).unwrap();
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "public challenge deadline"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(error) => panic!("public challenge read failed: {error}"),
+            }
+        }
+    }
     let before = control_snapshot(&w);
     let p = w.prove_inventory_control(c.clone()).unwrap();
     assert_eq!(p.challenge, c);
     verify_control(&p);
     assert_eq!(control_snapshot(&w), before);
+    #[cfg(unix)]
+    if let Ok(path) = std::env::var("BTCX_TEST_PUBLIC_BITCOIN_CONTROL_VECTOR") {
+        write_public_control_fixture(
+            std::path::Path::new(&path),
+            &public_bitcoin_control_fixture(&w, &c, Some(&p)),
+        );
+    }
     let value = serde_json::to_value(p).unwrap();
     assert_eq!(value.as_object().unwrap().len(), 4);
     assert!(value.get("psbt").is_none() && value.get("transaction").is_none());
