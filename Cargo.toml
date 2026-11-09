@@ -16,6 +16,8 @@ description = "RGB wallet library (WASM-only)"
 members = [".", "bindings/wasm"]
 
 [dependencies]
+# Patched standard message proofs only; never transaction authorization.
+bip322 = "=0.0.11"
 base64 = { version = "0.22.1", default-features = false, features = [
     "std",
 ] }

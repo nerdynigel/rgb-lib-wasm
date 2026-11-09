@@ -1,0 +1,57 @@
+{
+  "scope": "protocol_message_bytes_not_cryptographic_or_financial_acceptance",
+  "vectors": [
+    {
+      "challenge": {
+        "version": 1,
+        "purpose": "inventory-control-only",
+        "network": "regtest",
+        "proof_kind": "bitcoin",
+        "origin_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "session_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "owner_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "nonce": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "expires_at": "1794222060",
+        "contract_id": "rgb:Kpai9_2X-uhBiC5K-moZtGkh-hwThNSE-h96Pbck-gfJQRHY",
+        "consignment_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "tip_height": 280,
+        "tip_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "inputs": [
+          {
+            "outpoint": "2222222222222222222222222222222222222222222222222222222222222222:0",
+            "input_sats": "10000",
+            "rgb_units": "0",
+            "script_hex": "51203333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ]
+      },
+      "message": "urn:asm:wallet-inventory-control:v1\nPurpose: selected input control only; no transaction or spending permission\nNetwork: regtest\nKind: bitcoin\nOrigin SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nSession SHA256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nOwner SHA256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\nNonce: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\nExpires: 1794222060\nContract: rgb:Kpai9_2X-uhBiC5K-moZtGkh-hwThNSE-h96Pbck-gfJQRHY\nTip: 280:1111111111111111111111111111111111111111111111111111111111111111\nConsignment SHA256: 0000000000000000000000000000000000000000000000000000000000000000\nOutpoint: 2222222222222222222222222222222222222222222222222222222222222222:0\nScript: 51203333333333333333333333333333333333333333333333333333333333333333\nSatoshis: 10000\nRGB units: 0"
+    },
+    {
+      "challenge": {
+        "version": 1,
+        "purpose": "inventory-control-only",
+        "network": "regtest",
+        "proof_kind": "rgb",
+        "origin_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "session_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "owner_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "nonce": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "expires_at": "1794222060",
+        "contract_id": "rgb:Kpai9_2X-uhBiC5K-moZtGkh-hwThNSE-h96Pbck-gfJQRHY",
+        "consignment_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "tip_height": 280,
+        "tip_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "inputs": [
+          {
+            "outpoint": "2222222222222222222222222222222222222222222222222222222222222222:0",
+            "input_sats": "10000",
+            "rgb_units": "1",
+            "script_hex": "51203333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ]
+      },
+      "message": "urn:asm:wallet-inventory-control:v1\nPurpose: selected input control only; no transaction or spending permission\nNetwork: regtest\nKind: rgb\nOrigin SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nSession SHA256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nOwner SHA256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\nNonce: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\nExpires: 1794222060\nContract: rgb:Kpai9_2X-uhBiC5K-moZtGkh-hwThNSE-h96Pbck-gfJQRHY\nTip: 280:1111111111111111111111111111111111111111111111111111111111111111\nConsignment SHA256: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\nOutpoint: 2222222222222222222222222222222222222222222222222222222222222222:0\nScript: 51203333333333333333333333333333333333333333333333333333333333333333\nSatoshis: 10000\nRGB units: 1"
+    }
+  ]
+}
