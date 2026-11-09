@@ -651,34 +651,59 @@ pub(in crate::wallet) mod tests {
             .unwrap()
             .request
             .clone();
-        for case in ["value", "fee", "foreign", "legacy", "sighash", "metadata"] {
-            let mut changed = original.clone();
-            let mut psbt = parse_preparation(&changed).unwrap().0;
-            match case {
-                "value" => psbt.unsigned_tx.output[0].value += BdkAmount::from_sat(1),
-                "fee" => changed.maximum_fee_sats = "1".into(),
-                "foreign" => {
-                    psbt.unsigned_tx.output[0].script_pubkey = new_wallet()
-                        ._get_new_address(KeychainKind::Internal)
-                        .unwrap()
-                        .script_pubkey()
+        let approved_script =
+            original.input_preparation.as_ref().unwrap().output_scripts[0].clone();
+        let base = parse_preparation(&original).unwrap().0;
+        // BDK shuffles recipients and change. Exercise every possible output0;
+        // mutating an allowed change amount is not a changed-recipient test.
+        for first in 0..base.outputs.len() {
+            let mut reordered = original.clone();
+            let mut psbt = base.clone();
+            psbt.unsigned_tx.output.swap(0, first);
+            psbt.outputs.swap(0, first);
+            reordered.psbt = psbt.to_string();
+            assert!(
+                parse_request(&reordered).is_ok(),
+                "valid output permutation {first}"
+            );
+            for case in ["value", "fee", "foreign", "legacy", "sighash", "metadata"] {
+                let mut changed = reordered.clone();
+                let mut psbt = parse_preparation(&changed).unwrap().0;
+                let recipient = psbt
+                    .unsigned_tx
+                    .output
+                    .iter()
+                    .position(|o| o.script_pubkey.to_hex_string() == approved_script)
+                    .expect("exact approved recipient exists in every permutation");
+                match case {
+                    "value" => psbt.unsigned_tx.output[recipient].value += BdkAmount::from_sat(1),
+                    "fee" => changed.maximum_fee_sats = "1".into(),
+                    "foreign" => {
+                        psbt.unsigned_tx.output[recipient].script_pubkey = new_wallet()
+                            ._get_new_address(KeychainKind::Internal)
+                            .unwrap()
+                            .script_pubkey()
+                    }
+                    "legacy" => changed.input_preparation = None,
+                    "sighash" => {
+                        psbt.inputs[0].sighash_type =
+                            Some(bitcoin::sighash::TapSighashType::AllPlusAnyoneCanPay.into())
+                    }
+                    "metadata" => {
+                        psbt.outputs[0].tap_internal_key = Some(
+                            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                                .parse()
+                                .unwrap(),
+                        )
+                    }
+                    _ => unreachable!(),
                 }
-                "legacy" => changed.input_preparation = None,
-                "sighash" => {
-                    psbt.inputs[0].sighash_type =
-                        Some(bitcoin::sighash::TapSighashType::AllPlusAnyoneCanPay.into())
-                }
-                "metadata" => {
-                    psbt.outputs[0].tap_internal_key = Some(
-                        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-                            .parse()
-                            .unwrap(),
-                    )
-                }
-                _ => unreachable!(),
+                changed.psbt = psbt.to_string();
+                assert!(
+                    parse_request(&changed).is_err(),
+                    "output permutation {first}: {case}"
+                );
             }
-            changed.psbt = psbt.to_string();
-            assert!(parse_request(&changed).is_err(), "{case}");
         }
     }
 

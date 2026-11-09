@@ -36,6 +36,10 @@ mod rgb_input_observation;
 mod asset_spend;
 pub use asset_spend::{AssetSpendInput, AssetSpendView};
 
+#[path = "asset_inventory.rs"]
+mod asset_inventory;
+pub use asset_inventory::AssetInventoryProof;
+
 #[path = "collaborative_partial.rs"]
 pub(super) mod collaborative_partial;
 pub use collaborative_partial::CollaborativePartialRequest;

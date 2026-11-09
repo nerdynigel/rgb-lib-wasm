@@ -153,6 +153,120 @@ fn unconfirmed_or_immature_carriers_are_never_available() {
 }
 
 #[test]
+fn inventory_proof_exports_standard_selected_state_without_any_wallet_mutation() {
+    let mut w = wallet();
+    let a = coin(&mut w, KeychainKind::External, 1000, true, false);
+    let b = coin(&mut w, KeychainKind::External, 2000, true, false);
+    let id = issue(&w, &[(a, 3), (b, 7)], "Fake inventory proof");
+    allocation(&w, a, &id, 3);
+    allocation(&w, b, &id, 7);
+    let before_db = serde_json::to_vec(w.database.as_ref()).unwrap();
+    let before_stock =
+        crate::wallet::idb_store::serialize_stock(w.rgb_stock.borrow().as_ref().unwrap()).unwrap();
+    let before_artifacts = serde_json::to_vec(&w.transfer_artifacts).unwrap();
+    let sequence = w.idb_sequence.load(std::sync::atomic::Ordering::SeqCst);
+    let before_bdk = serde_json::to_vec(&w.bdk_wallet.staged()).unwrap();
+    let proof = w
+        .asset_inventory_proof(id.clone(), vec![b.to_string()])
+        .unwrap();
+    assert_eq!(proof.version, 1);
+    assert_eq!(
+        proof.scope,
+        "standard-rgb-inventory-proof-not-ownership-or-reservation"
+    );
+    assert_eq!(proof.selected.total_sats, "2000");
+    assert_eq!(proof.selected.total_units, "7");
+    assert_eq!(proof.selected.inputs.len(), 1);
+    assert_eq!(proof.selected.inputs[0].outpoint, b.to_string());
+    let bytes = hex::decode(&proof.consignment_hex).unwrap();
+    let transfer = RgbTransfer::load(bytes.as_slice()).unwrap();
+    assert_eq!(transfer.contract_id().to_string(), id);
+    assert_eq!(
+        AssetSchema::try_from(transfer.schema_id()).unwrap(),
+        AssetSchema::Nia
+    );
+    assert!(
+        transfer
+            .clone()
+            .validate(&DumbResolver, &ValidationConfig::default())
+            .is_err()
+    );
+    transfer
+        .validate(
+            &DumbResolver,
+            &ValidationConfig {
+                chain_net: w.chain_net(),
+                trusted_typesystem: AssetSchema::Nia.types(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(serde_json::to_vec(w.database.as_ref()).unwrap(), before_db);
+    assert_eq!(
+        crate::wallet::idb_store::serialize_stock(w.rgb_stock.borrow().as_ref().unwrap()).unwrap(),
+        before_stock
+    );
+    assert_eq!(
+        serde_json::to_vec(&w.transfer_artifacts).unwrap(),
+        before_artifacts
+    );
+    assert_eq!(
+        serde_json::to_vec(&w.bdk_wallet.staged()).unwrap(),
+        before_bdk
+    );
+    assert_eq!(
+        w.idb_sequence.load(std::sync::atomic::Ordering::SeqCst),
+        sequence
+    );
+    assert_eq!(
+        w.asset_inventory_proof(id, vec![b.to_string()]).unwrap(),
+        proof
+    );
+}
+
+#[test]
+fn inventory_proof_refuses_noncanonical_duplicate_foreign_or_unqualified_selections() {
+    let (mut w, point, id) = fixture(true, false);
+    let other = OutPoint {
+        txid: bitcoin::Txid::from_str(&"ff".repeat(32)).unwrap(),
+        vout: 0,
+    };
+    let mut unsorted = vec![point.to_string(), other.to_string()];
+    unsorted.sort();
+    unsorted.reverse();
+    for requested in [
+        vec![],
+        vec![point.to_string(); 2],
+        vec![point.to_string(); 33],
+        vec![other.to_string()],
+        vec!["invalid".into()],
+        vec![format!("{}:00", point.txid)],
+        vec![point.to_string().to_uppercase()],
+        unsorted,
+    ] {
+        assert!(w.asset_inventory_proof(id.clone(), requested).is_err());
+    }
+    for asset in ["USDT".to_string(), "rgb:invalid".to_string()] {
+        assert!(
+            w.asset_inventory_proof(asset, vec![point.to_string()])
+                .is_err()
+        );
+    }
+    w.wallet_data.bitcoin_network = BitcoinNetwork::Mainnet;
+    assert!(
+        w.asset_inventory_proof(id, vec![point.to_string()])
+            .is_err()
+    );
+    for (confirmed, coinbase) in [(false, false), (true, true)] {
+        let (w, point, id) = fixture(confirmed, coinbase);
+        assert!(
+            w.asset_inventory_proof(id, vec![point.to_string()])
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn ticker_malformed_unknown_contract_and_non_regtest_are_refused() {
     let (mut w, _, id) = fixture(true, false);
     for bad in ["USDT", "", "rgb:invalid", &"x".repeat(193)] {
@@ -192,7 +306,8 @@ fn other_contracts_and_hidden_inflation_rights_never_burn_with_selected_asset() 
     let (w, p, id) = fixture(true, false);
     let other = issue(&w, &[(p, 2)], "Other fake contract on same seal");
     assert_ne!(id, other);
-    assert!(w.asset_spend_view(id).unwrap().inputs.is_empty());
+    assert!(w.asset_spend_view(id.clone()).unwrap().inputs.is_empty());
+    assert!(w.asset_inventory_proof(id, vec![p.to_string()]).is_err());
     let (w, p, id) = fixture(true, false);
     assign_stock(&w, p, true);
     assert!(w.asset_spend_view(id).unwrap().inputs.is_empty());
@@ -221,6 +336,10 @@ fn native_original_hold_excludes_the_entire_carrier_without_releasing_history() 
     let (txid, _) = retain_external(&mut w, &psbt, false);
     let before = serde_json::to_vec(&w.transfer_artifacts).unwrap();
     assert!(w.asset_spend_view(id.clone()).unwrap().inputs.is_empty());
+    assert!(
+        w.asset_inventory_proof(id.clone(), vec![p.to_string()])
+            .is_err()
+    );
     assert_eq!(serde_json::to_vec(&w.transfer_artifacts).unwrap(), before);
     w.transfer_artifacts.remove(&txid);
     assert!(w.asset_spend_view(id).is_err());
