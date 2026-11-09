@@ -40,6 +40,12 @@ pub use asset_spend::{AssetSpendInput, AssetSpendView};
 mod asset_inventory;
 pub use asset_inventory::AssetInventoryProof;
 
+#[path = "inventory_control.rs"]
+mod inventory_control;
+pub use inventory_control::{
+    InventoryControlChallenge, InventoryControlProof, InventoryInputProof,
+};
+
 #[path = "collaborative_partial.rs"]
 pub(super) mod collaborative_partial;
 pub use collaborative_partial::CollaborativePartialRequest;

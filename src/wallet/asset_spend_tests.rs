@@ -400,3 +400,301 @@ fn wrong_native_prevout_amount_is_not_accepted_from_database() {
     w.database.update_txo(txo).unwrap();
     assert!(w.asset_spend_view(id).is_err());
 }
+
+// These are real BDK signatures on synthetic BIP-322 message transactions over
+// invented local graphs. No network funding, spending or settlement claim.
+fn control_challenge(
+    w: &Wallet,
+    points: &[OutPoint],
+    rgb: Option<&str>,
+) -> InventoryControlChallenge {
+    let contract = rgb.unwrap_or("rgb:Kpai9_2X-uhBiC5K-moZtGkh-hwThNSE-h96Pbck-gfJQRHY");
+    let mut points = points.iter().map(ToString::to_string).collect::<Vec<_>>();
+    points.sort();
+    let (height, hash, inputs, consignment) = if rgb.is_some() {
+        let p = w.asset_inventory_proof(contract.into(), points).unwrap();
+        (
+            p.selected.tip_height,
+            p.selected.tip_hash,
+            p.selected.inputs,
+            <sha256::Hash as bitcoin::hashes::Hash>::hash(&hex::decode(p.consignment_hex).unwrap())
+                .to_string(),
+        )
+    } else {
+        let v = w.bitcoin_spend_view().unwrap();
+        (
+            v.tip_height,
+            v.tip_hash,
+            points
+                .iter()
+                .map(|p| {
+                    let i = v.inputs.iter().find(|i| &i.outpoint == p).unwrap();
+                    AssetSpendInput {
+                        outpoint: i.outpoint.clone(),
+                        input_sats: i.amount_sats.clone(),
+                        rgb_units: "0".into(),
+                        script_hex: i.script_hex.clone(),
+                    }
+                })
+                .collect(),
+            "0".repeat(64),
+        )
+    };
+    InventoryControlChallenge {
+        version: 1,
+        purpose: "inventory-control-only".into(),
+        network: "regtest".into(),
+        proof_kind: if rgb.is_some() { "rgb" } else { "bitcoin" }.into(),
+        origin_sha256: "a".repeat(64),
+        session_sha256: "b".repeat(64),
+        owner_sha256: "c".repeat(64),
+        nonce: "d".repeat(64),
+        expires_at: (super::super::safe_bitcoin::unix_seconds().unwrap() + 60).to_string(),
+        contract_id: contract.into(),
+        consignment_sha256: consignment,
+        tip_height: height,
+        tip_hash: hash,
+        inputs,
+    }
+}
+
+fn control_snapshot(w: &Wallet) -> Vec<u8> {
+    serde_json::to_vec(&(
+        w.database.as_ref(),
+        crate::wallet::idb_store::serialize_stock(w.rgb_stock.borrow().as_ref().unwrap()).unwrap(),
+        &w.transfer_artifacts,
+        w.bdk_wallet.staged(),
+        w.idb_sequence.load(std::sync::atomic::Ordering::SeqCst),
+    ))
+    .unwrap()
+}
+
+fn verify_control(proof: &InventoryControlProof) {
+    assert_eq!(proof.scheme, "bip322-simple-p2tr-default");
+    assert_eq!(proof.proofs.len(), proof.challenge.inputs.len());
+    for (p, i) in proof.proofs.iter().zip(&proof.challenge.inputs) {
+        assert_eq!(p.outpoint, i.outpoint);
+        assert_eq!(p.witness_hex.len(), 132);
+        assert!(p.witness_hex.starts_with("0140"));
+        let witness: bitcoin::Witness =
+            bitcoin::consensus::deserialize(&hex::decode(&p.witness_hex).unwrap()).unwrap();
+        let address = BdkAddress::from_script(
+            &bitcoin::ScriptBuf::from_hex(&i.script_hex).unwrap(),
+            BdkNetwork::Regtest,
+        )
+        .unwrap();
+        bip322::verify_simple(&address, proof.challenge.message(i), witness).unwrap();
+    }
+}
+
+#[test]
+fn inventory_control_signs_both_real_bdk_keychains_without_any_durable_mutation() {
+    let mut w = wallet();
+    let a = coin(&mut w, KeychainKind::Internal, 10000, true, false);
+    let b = coin(&mut w, KeychainKind::External, 20000, true, false);
+    let c = control_challenge(&w, &[a, b], None);
+    let before = control_snapshot(&w);
+    let p = w.prove_inventory_control(c.clone()).unwrap();
+    assert_eq!(p.challenge, c);
+    verify_control(&p);
+    assert_eq!(control_snapshot(&w), before);
+    let value = serde_json::to_value(p).unwrap();
+    assert_eq!(value.as_object().unwrap().len(), 4);
+    assert!(value.get("psbt").is_none() && value.get("transaction").is_none());
+}
+
+#[test]
+fn inventory_control_signs_exact_standard_rgb_inputs_without_stock_or_artifact_changes() {
+    let mut w = wallet();
+    let a = coin(&mut w, KeychainKind::External, 1000, true, false);
+    let b = coin(&mut w, KeychainKind::External, 2000, true, false);
+    let id = issue(&w, &[(a, 3), (b, 7)], "Fake control proof");
+    allocation(&w, a, &id, 3);
+    allocation(&w, b, &id, 7);
+    let c = control_challenge(&w, &[a, b], Some(&id));
+    let before = control_snapshot(&w);
+    let p = w.prove_inventory_control(c.clone()).unwrap();
+    assert_eq!(p.challenge, c);
+    verify_control(&p);
+    assert_eq!(control_snapshot(&w), before);
+}
+
+#[test]
+fn inventory_control_refuses_foreign_changed_stale_and_noncanonical_claims_before_returning_proof()
+{
+    for rgb in [false, true] {
+        let (mut w, p, id) = fixture(true, false);
+        let point = if rgb {
+            p
+        } else {
+            coin(&mut w, KeychainKind::Internal, 10000, true, false)
+        };
+        let original = control_challenge(&w, &[point], rgb.then_some(id.as_str()));
+        let before = control_snapshot(&w);
+        for kind in [
+            "network",
+            "version",
+            "purpose",
+            "kind",
+            "expired",
+            "too_long",
+            "expiry_encoding",
+            "origin",
+            "nonce",
+            "tip_height",
+            "tip_hash",
+            "consignment",
+            "foreign_point",
+            "sats",
+            "units",
+            "script",
+            "duplicate",
+            "no_inputs",
+            "asset",
+            "amount_encoding",
+            "overflow",
+            "unknown",
+        ] {
+            let mut c = serde_json::to_value(&original).unwrap();
+            match kind {
+                "network" => c["network"] = "mainnet".into(),
+                "version" => c["version"] = 2.into(),
+                "purpose" => c["purpose"] = "approve-transaction".into(),
+                "kind" => c["proof_kind"] = "external".into(),
+                "expired" => c["expires_at"] = "1".into(),
+                "too_long" => {
+                    c["expires_at"] = (super::super::safe_bitcoin::unix_seconds().unwrap() + 120)
+                        .to_string()
+                        .into()
+                }
+                "expiry_encoding" => c["expires_at"] = "01".into(),
+                "origin" => c["origin_sha256"] = "a\nHost:evil".into(),
+                "nonce" => c["nonce"] = "D".repeat(64).into(),
+                "tip_height" => c["tip_height"] = 199.into(),
+                "tip_hash" => c["tip_hash"] = "e".repeat(64).into(),
+                "consignment" => c["consignment_sha256"] = "e".repeat(64).into(),
+                "foreign_point" => {
+                    c["inputs"][0]["outpoint"] = format!("{}:0", "f".repeat(64)).into()
+                }
+                "sats" => c["inputs"][0]["input_sats"] = "1".into(),
+                "units" => c["inputs"][0]["rgb_units"] = "2".into(),
+                "script" => c["inputs"][0]["script_hex"] = format!("5120{}", "f".repeat(64)).into(),
+                "duplicate" => {
+                    let i = c["inputs"][0].clone();
+                    c["inputs"].as_array_mut().unwrap().push(i);
+                }
+                "no_inputs" => c["inputs"] = serde_json::json!([]),
+                "asset" => c["contract_id"] = "USDT".into(),
+                "amount_encoding" => c["inputs"][0]["input_sats"] = "01".into(),
+                "overflow" => c["inputs"][0]["input_sats"] = "18446744073709551616".into(),
+                "unknown" => c["psbt"] = "must not reach signer".into(),
+                _ => unreachable!(),
+            }
+            match serde_json::from_value::<InventoryControlChallenge>(c) {
+                Ok(c) => assert!(
+                    w.prove_inventory_control(c).is_err(),
+                    "rgb={rgb} kind={kind}"
+                ),
+                Err(_) => assert_eq!(kind, "unknown"),
+            }
+            assert_eq!(control_snapshot(&w), before, "{kind}");
+        }
+    }
+}
+
+#[test]
+fn inventory_control_witness_rejects_each_changed_context_and_another_wallet_key() {
+    let mut w = wallet();
+    let point = coin(&mut w, KeychainKind::Internal, 10000, true, false);
+    let c = control_challenge(&w, &[point], None);
+    let p = w.prove_inventory_control(c.clone()).unwrap();
+    let witness: bitcoin::Witness =
+        bitcoin::consensus::deserialize(&hex::decode(&p.proofs[0].witness_hex).unwrap()).unwrap();
+    let address = BdkAddress::from_script(
+        &bitcoin::ScriptBuf::from_hex(&c.inputs[0].script_hex).unwrap(),
+        BdkNetwork::Regtest,
+    )
+    .unwrap();
+    for field in [
+        "kind",
+        "origin",
+        "session",
+        "owner",
+        "nonce",
+        "expiry",
+        "contract",
+        "height",
+        "hash",
+        "consignment",
+        "outpoint",
+        "script",
+        "sats",
+        "units",
+    ] {
+        let mut bad = c.clone();
+        match field {
+            "kind" => bad.proof_kind = "rgb".into(),
+            "origin" => bad.origin_sha256 = "e".repeat(64),
+            "session" => bad.session_sha256 = "e".repeat(64),
+            "owner" => bad.owner_sha256 = "e".repeat(64),
+            "nonce" => bad.nonce = "e".repeat(64),
+            "expiry" => bad.expires_at = "1".into(),
+            "contract" => bad.contract_id = "USDT".into(),
+            "height" => bad.tip_height = 1,
+            "hash" => bad.tip_hash = "e".repeat(64),
+            "consignment" => bad.consignment_sha256 = "e".repeat(64),
+            "outpoint" => bad.inputs[0].outpoint = format!("{}:0", "e".repeat(64)),
+            "script" => bad.inputs[0].script_hex = format!("5120{}", "e".repeat(64)),
+            "sats" => bad.inputs[0].input_sats = "1".into(),
+            "units" => bad.inputs[0].rgb_units = "1".into(),
+            _ => unreachable!(),
+        }
+        assert!(
+            bip322::verify_simple(&address, bad.message(&bad.inputs[0]), witness.clone()).is_err(),
+            "{field}"
+        );
+    }
+    let mut other = wallet();
+    let op = coin(&mut other, KeychainKind::Internal, 10000, true, false);
+    let other_challenge = control_challenge(&other, &[op], None);
+    let other_proof = other.prove_inventory_control(other_challenge).unwrap();
+    let foreign: bitcoin::Witness =
+        bitcoin::consensus::deserialize(&hex::decode(&other_proof.proofs[0].witness_hex).unwrap())
+            .unwrap();
+    assert!(bip322::verify_simple(&address, c.message(&c.inputs[0]), foreign).is_err());
+    assert!(other.prove_inventory_control(c).is_err());
+}
+
+#[test]
+fn inventory_control_does_not_sign_bitcoin_that_acquires_rgb_or_pending_native_holds() {
+    let mut w = wallet();
+    let p = coin(&mut w, KeychainKind::External, 10000, true, false);
+    let c = control_challenge(&w, &[p], None);
+    assign_stock(&w, p, false);
+    let before = control_snapshot(&w);
+    assert!(w.prove_inventory_control(c).is_err());
+    assert_eq!(control_snapshot(&w), before);
+
+    let mut w = wallet();
+    let p = coin(&mut w, KeychainKind::External, 10000, true, false);
+    let c = control_challenge(&w, &[p], None);
+    // Existing reservation-graph fixture; no preparation API, signer or network.
+    let tx = BdkTransaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: p,
+            ..Default::default()
+        }],
+        output: vec![TxOut {
+            value: BdkAmount::from_sat(9000),
+            script_pubkey: w.bdk_wallet.get_utxo(p).unwrap().txout.script_pubkey,
+        }],
+    };
+    let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+    psbt.inputs[0].witness_utxo = Some(w.bdk_wallet.get_utxo(p).unwrap().txout);
+    retain_external(&mut w, &psbt, false);
+    let before = control_snapshot(&w);
+    assert!(w.prove_inventory_control(c).is_err());
+    assert_eq!(control_snapshot(&w), before);
+}
