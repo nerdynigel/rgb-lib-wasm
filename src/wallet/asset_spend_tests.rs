@@ -511,12 +511,37 @@ fn inventory_control_signs_exact_standard_rgb_inputs_without_stock_or_artifact_c
     let id = issue(&w, &[(a, 3), (b, 7)], "Fake control proof");
     allocation(&w, a, &id, 3);
     allocation(&w, b, &id, 7);
-    let c = control_challenge(&w, &[a, b], Some(&id));
+    let mut c = control_challenge(&w, &[a, b], Some(&id));
+    let hash =
+        |text: &str| <sha256::Hash as bitcoin::hashes::Hash>::hash(text.as_bytes()).to_string();
+    c.origin_sha256 = hash("https://market.example");
+    c.session_sha256 = hash(&"b".repeat(64));
+    c.owner_sha256 = hash(&"a".repeat(64));
     let before = control_snapshot(&w);
     let p = w.prove_inventory_control(c.clone()).unwrap();
     assert_eq!(p.challenge, c);
     verify_control(&p);
     assert_eq!(control_snapshot(&w), before);
+    #[cfg(unix)]
+    if let Ok(path) = std::env::var("BTCX_TEST_PUBLIC_INVENTORY_VECTOR") {
+        // Explicit test-only export of public signatures/evidence. Never export
+        // keys, wallet databases, backups or private signing recovery records.
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let inventory = w
+            .asset_inventory_proof(id, c.inputs.iter().map(|i| i.outpoint.clone()).collect())
+            .unwrap();
+        let value = serde_json::json!({"scope":"PUBLIC_NATIVE_BDK_STANDARD_SIGNATURE_VECTOR_LOCAL_GRAPH_NOT_LAB_OR_CORE", "proof":p,"inventory":inventory});
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(&serde_json::to_vec_pretty(&value).unwrap())
+            .unwrap();
+        file.sync_all().unwrap();
+    }
 }
 
 #[test]
