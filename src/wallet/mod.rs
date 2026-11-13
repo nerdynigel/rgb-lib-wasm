@@ -4,6 +4,7 @@
 
 pub(crate) mod backup;
 pub mod idb_store;
+pub mod storage_context;
 pub(crate) mod memory_store;
 pub(crate) mod offline;
 #[cfg(feature = "esplora")]

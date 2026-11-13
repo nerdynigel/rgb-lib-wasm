@@ -422,7 +422,8 @@ fn snapshot_write_required(
 }
 
 async fn open_db() -> Result<Rexie, String> {
-    let rexie = Rexie::builder(DB_NAME)
+    let name = super::storage_context::browser_storage_database(DB_NAME);
+    let rexie = Rexie::builder(&name)
         .version(DB_VERSION)
         .add_object_store(ObjectStore::new(STORE_NAME))
         .build()
