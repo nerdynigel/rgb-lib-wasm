@@ -33,7 +33,9 @@ fn upstream_public_metadata_has_null_mnemonic_and_preserves_identity() {
         .as_string()
         .unwrap();
     assert!(!text.contains(&keys.mnemonic));
-    let decoded: WalletData = serde_wasm_bindgen::from_value(public).unwrap();
+    // WalletData's numeric compatibility decoder expects JSON, as does the
+    // public constructor. Inspect the actual JS output through that boundary.
+    let decoded: WalletData = serde_json::from_str(&text).unwrap();
     assert_eq!(decoded.master_fingerprint, data.master_fingerprint);
     assert_eq!(decoded.account_xpub_colored, data.account_xpub_colored);
 }
