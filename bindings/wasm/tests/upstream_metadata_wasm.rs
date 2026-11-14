@@ -33,9 +33,9 @@ fn upstream_public_metadata_has_null_mnemonic_and_preserves_identity() {
         .as_string()
         .unwrap();
     assert!(!text.contains(&keys.mnemonic));
-    // WalletData's numeric compatibility decoder expects JSON, as does the
-    // public constructor. Inspect the actual JS output through that boundary.
-    let decoded: WalletData = serde_json::from_str(&text).unwrap();
-    assert_eq!(decoded.master_fingerprint, data.master_fingerprint);
-    assert_eq!(decoded.account_xpub_colored, data.account_xpub_colored);
+    // Public JS metadata is not a restore payload: optional fields may be
+    // undefined. Inspect the public identity without reconstructing keys.
+    let decoded: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(decoded["masterFingerprint"], data.master_fingerprint);
+    assert_eq!(decoded["accountXpubColored"], data.account_xpub_colored);
 }
