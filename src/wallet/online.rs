@@ -1475,6 +1475,14 @@ impl Wallet {
         Ok(())
     }
 
+    // UTEXO 3880d33: retain partial indexer progress even when sync returns an
+    // error, and never acknowledge dependent state before IndexedDB commits.
+    async fn sync_and_save(&mut self, full_scan: bool) -> Result<(), Error> {
+        let result = self.sync_db_txos(full_scan).await;
+        self.flush().await?;
+        result
+    }
+
     /// Incrementally sync the wallet and save new RGB UTXOs to the DB (wasm32 async).
     ///
     /// Re-queries only already-revealed SPKs. To rediscover UTXOs for unrevealed SPKs (e.g. a thin
@@ -1482,7 +1490,7 @@ impl Wallet {
     pub async fn sync(&mut self, online: Online) -> Result<(), Error> {
         info!(self.logger, "Syncing...");
         self.check_online(online)?;
-        self.sync_db_txos(false).await?;
+        self.sync_and_save(false).await?;
         info!(self.logger, "Sync completed");
         Ok(())
     }
@@ -1494,7 +1502,7 @@ impl Wallet {
     pub async fn full_scan(&mut self, online: Online) -> Result<(), Error> {
         info!(self.logger, "Full scanning...");
         self.check_online(online)?;
-        self.sync_db_txos(true).await?;
+        self.sync_and_save(true).await?;
         info!(self.logger, "Full scan completed");
         Ok(())
     }
@@ -2532,7 +2540,7 @@ impl Wallet {
         }
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.flush().await?;
 
         info!(self.logger, "Create UTXOs (end) completed");
         Ok(num_utxos_created)
@@ -3857,7 +3865,19 @@ impl Wallet {
             info!(self.logger, "Refreshing assets...");
         }
         self.check_online(online)?;
+        let result = self
+            .refresh_and_save_inner(asset_id, filter, skip_sync)
+            .await;
+        self.flush().await?;
+        result
+    }
 
+    async fn refresh_and_save_inner(
+        &mut self,
+        asset_id: Option<String>,
+        filter: Vec<RefreshFilter>,
+        skip_sync: bool,
+    ) -> Result<RefreshResult, Error> {
         let mut db_data = self.database.get_db_data(false)?;
 
         if asset_id.is_some() {
@@ -3952,7 +3972,19 @@ impl Wallet {
             "Failing batch transfer with idx {:?}...", batch_transfer_idx
         );
         self.check_online(online)?;
+        let result = self
+            .fail_transfers_and_save_inner(batch_transfer_idx, no_asset_only, skip_sync)
+            .await;
+        self.flush().await?;
+        result
+    }
 
+    async fn fail_transfers_and_save_inner(
+        &mut self,
+        batch_transfer_idx: Option<i32>,
+        no_asset_only: bool,
+        skip_sync: bool,
+    ) -> Result<bool, Error> {
         if !skip_sync {
             self.sync_db_txos(false).await?;
         }
@@ -4361,7 +4393,7 @@ impl Wallet {
         };
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.flush().await?;
 
         info!(self.logger, "Send (end) completed");
         Ok(OperationResult {
@@ -4729,7 +4761,7 @@ impl Wallet {
             })?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.flush().await?;
 
         info!(self.logger, "Drain (end) completed");
         Ok(tx.compute_txid().to_string())
@@ -4925,7 +4957,7 @@ impl Wallet {
         self.database.update_asset(&mut updated_asset)?;
 
         self.update_backup_info(false)?;
-        self.trigger_auto_backup();
+        self.flush().await?;
 
         info!(self.logger, "Inflate (end) completed");
         Ok(OperationResult {
@@ -5070,5 +5102,120 @@ mod refresh_filter_tests {
                 assert!(!refresh_filter_matches(other, incoming, &filter));
             }
         }
+    }
+}
+
+// Real browser storage tests, without an indexer or financial fixture. The online
+// handle below enables only the empty-wallet operations used here; no network
+// response is mocked and no economic settlement is asserted.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod upstream_durability_tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn wallet() -> (Wallet, WalletData, Online) {
+        let keys = crate::keys::generate_keys(BitcoinNetwork::Regtest);
+        let data = WalletData {
+            data_dir: "/upstream-durability".into(),
+            bitcoin_network: BitcoinNetwork::Regtest,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: 5,
+            account_xpub_vanilla: keys.account_xpub_vanilla,
+            account_xpub_colored: keys.account_xpub_colored,
+            mnemonic: Some(keys.mnemonic),
+            master_fingerprint: keys.master_fingerprint,
+            vanilla_keychain: None,
+            supported_schemas: vec![AssetSchema::Nia],
+            reuse_addresses: false,
+        };
+        let mut wallet = Wallet::new(data.clone()).unwrap();
+        let url = "http://127.0.0.1:1".to_string();
+        wallet.online_data = Some(OnlineData {
+            id: 1,
+            indexer_url: url.clone(),
+            indexer: crate::utils::build_indexer(&url).unwrap(),
+        });
+        (
+            wallet,
+            data,
+            Online {
+                id: 1,
+                indexer_url: url,
+            },
+        )
+    }
+
+    async fn stored(wallet: &Wallet) -> super::super::idb_store::WalletSnapshot {
+        super::super::idb_store::load_snapshot(&wallet.idb_key())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[wasm_bindgen_test]
+    async fn upstream_refresh_commits_before_success_and_survives_reload() {
+        let (mut wallet, data, online) = wallet();
+        let original_address = wallet.get_address().unwrap();
+        assert!(
+            wallet
+                .refresh(online, None, vec![], true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let before = stored(&wallet).await;
+        assert!(before.bdk_changeset.is_some());
+        drop(wallet);
+        let mut restored = Wallet::restore(data).await.unwrap();
+        assert_eq!(stored(&restored).await.sequence, before.sequence);
+        assert_ne!(restored.get_address().unwrap(), original_address);
+    }
+
+    #[wasm_bindgen_test]
+    async fn upstream_fail_transfers_keeps_error_and_commits_pending_metadata() {
+        let (mut wallet, _, online) = wallet();
+        wallet.get_address().unwrap();
+        assert!(
+            wallet
+                .fail_transfers(online, Some(i32::MAX), false, true)
+                .await
+                .is_err()
+        );
+        let snapshot = stored(&wallet).await;
+        assert!(snapshot.sequence > 0);
+        assert!(snapshot.bdk_changeset.is_some());
+    }
+
+    #[wasm_bindgen_test]
+    async fn upstream_witness_update_commits_and_storage_failure_is_retryable() {
+        let (mut wallet, _, online) = wallet();
+        wallet
+            .update_witnesses(online.clone(), 0, vec![])
+            .await
+            .unwrap();
+        let sequence = stored(&wallet).await.sequence;
+        // Exhaustion is a real persistence refusal, before any IndexedDB write.
+        wallet
+            .idb_sequence
+            .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            wallet
+                .fail_transfers(online.clone(), None, false, true)
+                .await,
+            Err(Error::Persistence { .. })
+        ));
+        assert_eq!(stored(&wallet).await.sequence, sequence);
+        wallet
+            .idb_sequence
+            .store(sequence, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !wallet
+                .fail_transfers(online, None, false, true)
+                .await
+                .unwrap()
+        );
+        assert!(stored(&wallet).await.sequence > sequence);
     }
 }

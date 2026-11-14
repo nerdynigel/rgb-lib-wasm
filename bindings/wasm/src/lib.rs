@@ -106,11 +106,13 @@ impl WasmWallet {
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    /// Return the WalletData as a JS object.
+    /// Return public WalletData. The mnemonic is always null (UTEXO #114).
     #[wasm_bindgen(js_name = "getWalletData")]
     pub fn get_wallet_data(&self) -> Result<JsValue, JsValue> {
-        let wd = self.inner.borrow().get_wallet_data();
-        to_js(&wd)
+        let wd = self.inner.borrow().get_public_wallet_data();
+        let data = to_js(&wd)?;
+        js_sys::Reflect::set(&data, &JsValue::from_str("mnemonic"), &JsValue::NULL)?;
+        Ok(data)
     }
 
     /// Issue a new NIA (Non-Inflatable Asset).
