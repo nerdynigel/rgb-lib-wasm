@@ -819,6 +819,7 @@ impl Wallet {
         let update_res =
             self.rgb_runtime()?
                 .update_witnesses(&resolver, after_height, force_witnesses)?;
+        self.flush().await?;
 
         info!(self.logger, "Update witnesses completed");
         Ok(update_res)

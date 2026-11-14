@@ -1208,6 +1208,16 @@ impl Wallet {
         self.wallet_data.clone()
     }
 
+    /// Public wallet metadata for browser bindings. Recovery material remains wallet-owned.
+    ///
+    /// Adapted from UTEXO 7843627c7d8fb4b66d74d6935e4fd8107b27dbff. Keep the
+    /// internal getter unchanged: native signing and explicit backup still need it.
+    pub fn get_public_wallet_data(&self) -> WalletData {
+        let mut data = self.get_wallet_data();
+        data.mnemonic = None;
+        data
+    }
+
     /// Return the wallet directory.
     pub fn get_wallet_dir(&self) -> PathBuf {
         self.wallet_dir.clone()
@@ -3293,6 +3303,19 @@ mod address_reuse_tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             u64::MAX
         );
+    }
+
+    #[test]
+    fn public_metadata_redacts_mnemonic_without_changing_signing_material() {
+        let wallet = make_test_wallet(false);
+        let private = wallet.get_wallet_data();
+        assert!(private.mnemonic.is_some());
+        let public = wallet.get_public_wallet_data();
+        assert!(public.mnemonic.is_none());
+        assert_eq!(public.account_xpub_vanilla, private.account_xpub_vanilla);
+        assert_eq!(public.account_xpub_colored, private.account_xpub_colored);
+        assert_eq!(public.master_fingerprint, private.master_fingerprint);
+        assert_eq!(wallet.get_wallet_data().mnemonic, private.mnemonic);
     }
 
     /// Helper: build a minimal Wallet for native tests.
