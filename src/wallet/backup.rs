@@ -2,6 +2,7 @@
 
 use amplify::s;
 use base64::{Engine as _, engine::general_purpose};
+use bdk_wallet::bitcoin::hashes::{Hash, sha256};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::Aead};
 use generic_array::GenericArray;
 use scrypt::{
@@ -266,7 +267,44 @@ pub(crate) fn decode_backup(data: &[u8]) -> Result<(BackupPubData, &[u8]), Error
 
 use strict_encoding::StrictSerialize;
 
+fn backup_state_id(bytes: &[u8]) -> Result<String, Error> {
+    if bytes.len() > 16_777_216 {
+        return Err(Error::InvalidBackup);
+    }
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| Error::InvalidBackup)?;
+    let db = snapshot
+        .pointer_mut("/wallet_state/db")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or(Error::InvalidBackup)?;
+    db.remove("backup_info");
+    db.remove("next_backup_info_idx");
+    let canonical = serde_json::to_vec(&snapshot).map_err(InternalError::from)?;
+    Ok(sha256::Hash::hash(&canonical).to_string())
+}
+
 impl super::Wallet {
+    /// A local freshness check for the exact state carried by an L1 backup.
+    /// Exclude counters written by exporting an otherwise unchanged snapshot.
+    /// The result supplies no signing or restore authority.
+    pub fn l1_backup_state_id(&self) -> Result<String, Error> {
+        backup_state_id(&self.serialize_backup_payload()?)
+    }
+
+    /// Authenticate a file for this wallet without restoring or changing state.
+    pub fn l1_backup_file_state_id(&self, bytes: &[u8], password: &str) -> Result<String, Error> {
+        let (public, ciphertext) = decode_backup(bytes)?;
+        let plaintext = decrypt_payload(ciphertext, password, &public)?;
+        let wallet_state = decode_wallet_payload(&plaintext, Some(public.version))?;
+        self.check_backup_identity(&wallet_state)?;
+        let normalized = serde_json::to_vec(&VersionedWalletBackup {
+            version: BACKUP_VERSION,
+            wallet_state,
+        })
+        .map_err(InternalError::from)?;
+        backup_state_id(&normalized)
+    }
+
     /// Read-only exact-state check for a lost restore acknowledgement. Only
     /// backup bookkeeping timestamps/counters, monotonic public derivations and
     /// the conservative restored barrier are excluded. Original attempts,
@@ -678,6 +716,17 @@ mod tests {
         let bytes = encode_backup(&encrypted, &public).unwrap();
         let decoded =
             decrypt_payload(&encrypted, "unfunded-negative-outcome-test", &public).unwrap();
+        assert_eq!(
+            wallet.l1_backup_state_id().unwrap(),
+            wallet
+                .l1_backup_file_state_id(&bytes, "unfunded-negative-outcome-test")
+                .unwrap(),
+        );
+        assert!(
+            wallet
+                .l1_backup_file_state_id(&bytes, "wrong-backup-password")
+                .is_err()
+        );
         let mut target = super::super::Wallet::new(wallet.wallet_data.clone()).unwrap();
         target
             .install_backup_payload(decode_wallet_payload(&decoded, Some(8)).unwrap())

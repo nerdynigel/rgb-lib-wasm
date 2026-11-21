@@ -8,7 +8,9 @@ use bitcoin::hashes::{Hash as _, sha256};
 
 #[path = "safe_bitcoin.rs"]
 mod safe_bitcoin;
-pub use safe_bitcoin::{BitcoinSpendInput, BitcoinSpendRequest, BitcoinSpendView};
+pub use safe_bitcoin::{
+    BitcoinMaxSpendRequest, BitcoinSpendInput, BitcoinSpendRequest, BitcoinSpendView,
+};
 
 #[path = "bitcoin_recovery.rs"]
 pub(super) mod bitcoin_recovery;

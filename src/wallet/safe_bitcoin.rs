@@ -113,6 +113,22 @@ pub struct BitcoinSpendRequest {
     pub excluded_inputs: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Request to send the native-qualified, unreserved Bitcoin balance minus its fee.
+pub struct BitcoinMaxSpendRequest {
+    /// Explicit request version, currently one.
+    pub version: u8,
+    /// Exact network-checked destination address.
+    pub address: String,
+    /// Whole satoshis per virtual byte.
+    pub fee_rate: String,
+    /// Unix seconds, at most 120 seconds into the future.
+    pub expires_at: String,
+    /// Additional caller-owned durable input reservations.
+    pub excluded_inputs: Vec<String>,
+}
+
 fn refused() -> Error {
     Error::InvalidPsbt {
         details:
@@ -150,28 +166,47 @@ fn unexpired(expires_at: &str) -> Result<(), Error> {
 fn validate_bitcoin_request(
     request: &BitcoinSpendRequest,
 ) -> Result<(u64, u64, HashSet<OutPoint>), Error> {
-    if request.version != 1
-        || request.address.len() > 100
-        || request.address.trim() != request.address
-        || request.excluded_inputs.len() > MAX_INPUTS
+    let amount = integer(&request.amount_sats)?;
+    if amount == 0 || amount > BdkAmount::MAX_MONEY.to_sat() {
+        return Err(refused());
+    }
+    let (rate, excluded) = validate_bitcoin_spend_terms(
+        request.version,
+        &request.address,
+        &request.fee_rate,
+        &request.expires_at,
+        &request.excluded_inputs,
+    )?;
+    Ok((amount, rate, excluded))
+}
+
+fn validate_bitcoin_spend_terms(
+    version: u8,
+    address: &str,
+    fee_rate: &str,
+    expires_at: &str,
+    excluded_inputs: &[String],
+) -> Result<(u64, HashSet<OutPoint>), Error> {
+    if version != 1
+        || address.len() > 100
+        || address.trim() != address
+        || excluded_inputs.len() > MAX_INPUTS
     {
         return Err(refused());
     }
-    let amount = integer(&request.amount_sats)?;
-    let rate = integer(&request.fee_rate)?;
-    if amount == 0 || amount > BdkAmount::MAX_MONEY.to_sat() || !(1..=1000).contains(&rate) {
+    let rate = integer(fee_rate)?;
+    if !(1..=1000).contains(&rate) {
         return Err(refused());
     }
-    unexpired(&request.expires_at)?;
+    unexpired(expires_at)?;
     let mut excluded = HashSet::new();
-    for encoded in &request.excluded_inputs {
+    for encoded in excluded_inputs {
         let point = OutPoint::from_str(encoded).map_err(|_| refused())?;
         if point.to_string() != *encoded || !excluded.insert(point) {
             return Err(refused());
         }
     }
-    unexpired(&request.expires_at)?;
-    Ok((amount, rate, excluded))
+    Ok((rate, excluded))
 }
 
 impl Wallet {
@@ -682,6 +717,43 @@ impl Wallet {
 
     fn build_bitcoin_spend(&mut self, request: BitcoinSpendRequest) -> Result<String, Error> {
         let (amount, rate, excluded) = validate_bitcoin_request(&request)?;
+        self.build_qualified_bitcoin_spend(&request.address, Some(amount), rate, excluded)
+    }
+
+    /// Prepare a single-output spend of all confirmed, native-qualified,
+    /// unreserved Bitcoin. The same independent check also runs before signing.
+    pub async fn prepare_bitcoin_max_spend(
+        &mut self,
+        online: Online,
+        request: BitcoinMaxSpendRequest,
+    ) -> Result<String, Error> {
+        validate_bitcoin_spend_terms(
+            request.version,
+            &request.address,
+            &request.fee_rate,
+            &request.expires_at,
+            &request.excluded_inputs,
+        )?;
+        self.get_script_pubkey(&request.address)?;
+        self.require_wallet_rgb_regtest(&online).await?;
+        self.sync_db_txos(false).await?;
+        let (rate, excluded) = validate_bitcoin_spend_terms(
+            request.version,
+            &request.address,
+            &request.fee_rate,
+            &request.expires_at,
+            &request.excluded_inputs,
+        )?;
+        self.build_qualified_bitcoin_spend(&request.address, None, rate, excluded)
+    }
+
+    fn build_qualified_bitcoin_spend(
+        &mut self,
+        address: &str,
+        amount: Option<u64>,
+        rate: u64,
+        excluded: HashSet<OutPoint>,
+    ) -> Result<String, Error> {
         let view = self.bitcoin_spend_view()?;
         let allowed = view
             .inputs
@@ -694,17 +766,30 @@ impl Wallet {
             .filter(|u| !allowed.contains(&u.outpoint) || excluded.contains(&u.outpoint))
             .map(|u| u.outpoint)
             .collect::<Vec<_>>();
-        let recipient = self.get_script_pubkey(&request.address)?;
-        let change = self
-            ._get_new_address(KeychainKind::Internal)?
-            .script_pubkey();
+        let recipient = self.get_script_pubkey(address)?;
+        let exact = if let Some(sats) = amount {
+            Some((
+                sats,
+                self._get_new_address(KeychainKind::Internal)?
+                    .script_pubkey(),
+            ))
+        } else {
+            let count = allowed.difference(&excluded).count();
+            if count == 0 || count > MAX_PSBT_INPUTS {
+                return Err(refused());
+            }
+            None
+        };
         let fee = self._check_fee_rate(rate)?;
         let mut builder = self.bdk_wallet.build_tx();
-        builder
-            .unspendable(blocked)
-            .add_recipient(recipient, BdkAmount::from_sat(amount))
-            .drain_to(change)
-            .fee_rate(fee);
+        builder.unspendable(blocked).fee_rate(fee);
+        if let Some((amount, change)) = exact {
+            builder
+                .add_recipient(recipient.clone(), BdkAmount::from_sat(amount))
+                .drain_to(change);
+        } else {
+            builder.drain_wallet().drain_to(recipient.clone());
+        }
         let psbt = builder.finish().map_err(|error| match error {
             bdk_wallet::error::CreateTxError::CoinSelection(InsufficientFunds {
                 needed,
@@ -718,6 +803,24 @@ impl Wallet {
             }
             _ => refused(),
         })?;
+        if amount.is_none() {
+            let spending = psbt
+                .unsigned_tx
+                .input
+                .iter()
+                .map(|input| input.previous_output)
+                .collect::<HashSet<_>>();
+            if spending.len() != psbt.unsigned_tx.input.len()
+                || spending.len() != allowed.difference(&excluded).count()
+                || !allowed
+                    .difference(&excluded)
+                    .all(|coin| spending.contains(coin))
+                || psbt.unsigned_tx.output.len() != 1
+                || psbt.unsigned_tx.output[0].script_pubkey != recipient
+            {
+                return Err(refused());
+            }
+        }
         let encoded = psbt.to_string();
         self.checked_bitcoin_psbt(&encoded, false)?;
         self.bdk_wallet.persist(&mut self.bdk_database)?;
@@ -1562,6 +1665,72 @@ pub(super) mod tests {
         assert!(
             wallet.checked_bitcoin_psbt(&prepared, false).is_err(),
             "late actual Stock cannot be omitted by a caller"
+        );
+    }
+
+    #[test]
+    fn backup_state_id_ignores_bookkeeping_and_changes_with_native_state() {
+        let mut wallet = wallet();
+        let before = wallet.l1_backup_state_id().unwrap();
+        assert_eq!(before, wallet.l1_backup_state_id().unwrap());
+        use crate::database::memory_db::DbBackupInfoActMod;
+        wallet
+            .database
+            .set_backup_info(DbBackupInfoActMod {
+                last_backup_timestamp: ActiveValue::Set("2026-11-21T00:00:00Z".into()),
+                last_operation_timestamp: ActiveValue::Set("2026-11-21T00:00:00Z".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(before, wallet.l1_backup_state_id().unwrap());
+        coin(&mut wallet, KeychainKind::Internal, 10_000, true, false);
+        assert_ne!(before, wallet.l1_backup_state_id().unwrap());
+    }
+
+    #[test]
+    fn max_uses_only_confirmed_qualified_and_unreserved_bitcoin() {
+        let recipient = wallet()._get_new_address(KeychainKind::Internal).unwrap();
+        let mut wallet = wallet();
+        let vanilla = coin(&mut wallet, KeychainKind::Internal, 70_000, true, false);
+        let empty_colored = coin(&mut wallet, KeychainKind::External, 20_000, true, false);
+        let reserved = coin(&mut wallet, KeychainKind::Internal, 40_000, true, false);
+        coin(&mut wallet, KeychainKind::Internal, 30_000, false, false);
+        let colored = coin(&mut wallet, KeychainKind::External, 50_000, true, false);
+        assign_stock(&wallet, colored, false);
+        let excluded = HashSet::from([reserved]);
+        let slow = wallet
+            .build_qualified_bitcoin_spend(&recipient.to_string(), None, 1, excluded.clone())
+            .unwrap();
+        let fast = wallet
+            .build_qualified_bitcoin_spend(&recipient.to_string(), None, 10, excluded)
+            .unwrap();
+        let slow = Psbt::from_str(&slow).unwrap();
+        let fast = Psbt::from_str(&fast).unwrap();
+        for psbt in [&slow, &fast] {
+            let inputs = psbt
+                .unsigned_tx
+                .input
+                .iter()
+                .map(|input| input.previous_output)
+                .collect::<HashSet<_>>();
+            assert_eq!(inputs, HashSet::from([vanilla, empty_colored]));
+            assert_eq!(psbt.unsigned_tx.output.len(), 1);
+            assert_eq!(
+                psbt.unsigned_tx.output[0].script_pubkey,
+                recipient.script_pubkey()
+            );
+            assert!(psbt.unsigned_tx.output[0].value.to_sat() < 90_000);
+        }
+        assert!(slow.unsigned_tx.output[0].value > fast.unsigned_tx.output[0].value);
+        assert!(
+            wallet
+                .build_qualified_bitcoin_spend(
+                    &recipient.to_string(),
+                    None,
+                    5,
+                    HashSet::from([vanilla, empty_colored, reserved])
+                )
+                .is_err()
         );
     }
 
